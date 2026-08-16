@@ -1,0 +1,68 @@
+{
+  "gate_id": "GATE-01",
+  "gate_title": "Conformance foundation",
+  "commit_sha": "bf7aa18a21cb4d64dcc13d42c61d02a356384ea3",
+  "commit_message": "GATE-01: conformance foundation — schemas, real vectors, TS+Python runners",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "Created JSON schemas in conformance/schemas/ for NodeId derivation, advertisement vectors, and CBOR vectors",
+    "Created 5 real Ed25519 advertisement vectors (valid, invalid signature, expired, malformed, sequence rollback) with fixed timestamps for reproducibility",
+    "Created TypeScript vector runner (conformance/runners/ts-vector-runner.ts) that reads all vector files and verifies each against the reference implementation — 9/9 pass",
+    "Created independent Python verifier (conformance/runners/py_vector_verifier.py) implementing BLAKE3-256, RFC 4648 base32, Ed25519 verification, and canonical CBOR from scratch — 9/9 pass",
+    "Fixed V-NODEID-003.json (string lengths were wrong from manual counting; regenerated programmatically)",
+    "Created conformance/requirements.txt for Python verifier dependencies (blake3, cbor2, pynacl)",
+    "TypeScript and Python consume IDENTICAL vector files and produce IDENTICAL verification results"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "bun run tools/verify-gate.ts",
+    "bun run conformance/runners/ts-vector-runner.ts",
+    "python3 conformance/runners/py_vector_verifier.py",
+    "JSON parse validation for every conformance/vectors/*.json"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 4, "passed": 4, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "ts_vector_runner": { "total": 9, "passed": 9, "failed": 0 },
+    "py_vector_verifier": { "total": 9, "passed": 9, "failed": 0 },
+    "json_vectors": { "total": 9, "valid": 9, "invalid": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [
+    "conformance/vectors/V-NODEID-001.json",
+    "conformance/vectors/V-NODEID-002.json",
+    "conformance/vectors/V-NODEID-003.json",
+    "conformance/vectors/V-CBOR-001.json",
+    "conformance/vectors/V-ADV-001.json",
+    "conformance/vectors/V-ADV-002.json",
+    "conformance/vectors/V-ADV-003.json",
+    "conformance/vectors/V-ADV-004.json",
+    "conformance/vectors/V-ADV-005.json"
+  ],
+  "vector_files_generated": [
+    "conformance/vectors/V-ADV-001.json",
+    "conformance/vectors/V-ADV-002.json",
+    "conformance/vectors/V-ADV-003.json",
+    "conformance/vectors/V-ADV-004.json",
+    "conformance/vectors/V-ADV-005.json"
+  ],
+  "protocol_adr_references": [
+    "spec/02-identity.md §2.1 (canonical NodeId: BLAKE3-256 + base32)",
+    "spec/03-node-advertisements.md §5 (advertisement verification checks)",
+    "ADR-0003 (NodeId derivation — CANONICAL)",
+    "ADR-0004 (canonical CBOR wire format)",
+    "ADR-0007 (AuthenticatedNodeRecord pipeline)",
+    "ADR-0015 (NodeId authority conflict — RESOLVED)"
+  ],
+  "known_limitations": [
+    "Schemas for link handshake, topology hint, route, circuit, and gateway negotiation are not yet created (the wire formats are not yet ratified — GATE-03+)",
+    "The Python verifier does not yet verify link handshake vectors (ADR-0016 is still a PROPOSAL — no handshake vectors exist)",
+    "Cross-language conformance is proven for NodeId, CBOR, and advertisement vectors only — not for link handshake, routing, or circuit formats (which don't exist yet)",
+    "GATE-03 is BLOCKED on ADR-0016 approval (3-message transcript-binding handshake)"
+  ],
+  "ready_for_next_gate": true
+}
