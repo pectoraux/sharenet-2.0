@@ -1,0 +1,46 @@
+{
+  "gate_id": "GATE-10",
+  "gate_title": "Android north-star",
+  "commit_sha": "3f9927932248e2bd9eda449f7099744098f0b474",
+  "commit_message": "GATE-10: Android north-star — VPNService adapter, permission, reconnect, battery, reproducible test script",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "VpnPermissionManager: Android VPN permission state machine (NOT_REQUESTED→REQUESTING→GRANTED/DENIED/REVOKED)",
+    "NetworkTracker: Android network connectivity (WIFI/MOBILE_DATA/NONE/SHARENET_ONLY, north-star = NONE)",
+    "BatteryManager: battery state (CHARGING/NORMAL/LOW/CRITICAL/DOZE) with adaptive keepalive (30s/60s/120s)",
+    "AndroidVpnLifecycle: extends ProcessLifecycle with permission, network, battery integration",
+    "Permission revocation → CRASHED + kill-switch blocks (safety property)",
+    "Network lost → DEGRADED (reconnect) or STOPPED (critical battery preservation)",
+    "Reconnect attempts bounded (max 5)",
+    "NORTH_STAR_TEST_SCRIPT: 10 reproducible ADB steps (mobile data OFF, Wi-Fi OFF, Chrome HTTPS, repeat 3x)",
+    "NorthStarTestResult type for documenting device test outcomes",
+    "23 unit tests covering all permission/network/battery/lifecycle/script scenarios"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "bun run tools/verify-gate.ts"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 148, "passed": 148, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [],
+  "vector_files_generated": [],
+  "protocol_adr_references": [
+    "spec/16-platforms.md §1 (platform adapters must NOT create protocol semantics)",
+    "spec/16-platforms.md §3 (Android VPNService/TUN adapter)",
+    "spec/00 §11 (Development Phase 11: Android)",
+    "spec/00 §39 (North-star: Android mobile data OFF + Wi-Fi OFF + Chrome → ShareNet → real HTTPS)"
+  ],
+  "known_limitations": [
+    "Actual device test (mobile data OFF + Wi-Fi OFF + Chrome reaches real HTTPS through ShareNet) is DEFERRED — it requires a physical Android device with the ShareNet app installed, ADB access, and the full real-process stack (3-message handshake → circuit → gateway forwarding → VPNService → Chrome). The unit tests prove the adapter abstraction and lifecycle correctness. The NORTH_STAR_TEST_SCRIPT is a reproducible 10-step procedure ready for execution on a real device.",
+    "The AndroidVpnLifecycle is an abstraction in reference/platform/ — it does not call real Android APIs (VpnService, ConnectivityManager, BatteryManager). A platform/android/ implementation would bridge these to the real Android SDK.",
+    "The NORTH_STAR_TEST_SCRIPT uses ADB commands that require root or developer-mode access on the device. On non-rooted devices, some steps (svc data disable) may require manual toggling via Settings."
+  ],
+  "ready_for_next_gate": true
+}
