@@ -26,14 +26,29 @@ account. Statements like "this node is operated by Alice" MUST be
 carried by a separate attestation object signed by Alice's `UserId`
 key, never inferred from the `NodeId` alone.
 
-## 2. NodeId Derivation (FROZEN)
+## 2. NodeId Derivation (INTERIM — pending ADR-0015)
+
+> **⚠️ STATUS CORRECTION (2026-08-16, corrective milestone):**
+> The derivation was previously labeled `FROZEN` in this section and in
+> ADR-0003. That label is **retracted**. The build orchestrator
+> unilaterally selected BLAKE2b-256 without Principal-Architect approval.
+> Per spec/00 §3 (Protocol-First Rule) and §35 (Stop Conditions —
+> cryptographic primitive substitution), the algorithm choice is now
+> under formal review in **ADR-0015 (PROPOSAL)**.
+>
+> Until ADR-0015 is resolved, the derivation is labeled **INTERIM**:
+> - The current implementation uses BLAKE2b-256 with domain
+>   `sharenet-node-id-v1`.
+> - This is the behavior the reference implementation produces today.
+> - It is NOT ratified as the permanent ShareNet NodeId derivation.
+> - A change in algorithm will require recomputing all golden vectors,
+>   purging all NodeRecord + SequenceFloor rows, and bumping the
+>   domain string to `sharenet-node-id-v2`.
 
 A node's identity is its Ed25519 signing public key. The NodeId is a
 **deterministic, collision-resistant** derivation of that public key.
-The derivation algorithm is **frozen** and MUST NOT be changed without
-a new spec version and a new derivation domain string.
 
-### 2.1 Algorithm
+### 2.1 Algorithm (INTERIM — see ADR-0015)
 
 Given an Ed25519 public key `pk` (32 raw bytes):
 

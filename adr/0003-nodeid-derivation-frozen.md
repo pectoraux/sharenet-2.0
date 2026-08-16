@@ -1,15 +1,36 @@
-# ADR 0003 — NodeId Derivation (Frozen)
+# ADR 0003 — NodeId Derivation (INTERIM — pending ADR-0015)
 
 Date: 2024-Q3 (first deliverable)
 Decision Maker: ShareNet 2.0 build orchestrator
 
 ## Status
 
-**Accepted.** This decision records the freezing of the NodeId
-derivation algorithm. The algorithm itself is frozen in
-`spec/02-identity.md` §2.1; this ADR records WHY the algorithm is
-the way it is, and makes the freeze contractually binding on every
-future contributor.
+**⚠️ RETRACTED as a frozen decision (2026-08-16, corrective milestone).**
+
+This ADR previously claimed `Accepted` status as a binding freeze of the
+NodeId derivation algorithm (BLAKE2b-256 with domain `sharenet-node-id-v1`).
+That claim is **retracted**. The build orchestrator is not the Principal
+Architect and did not have authority to freeze a cryptographic primitive
+choice unilaterally.
+
+Per spec/00 §3 (Protocol-First Rule) and §35 (Stop Conditions — cryptographic
+primitive substitution), the algorithm choice is now under formal review in
+**ADR-0015 (PROPOSAL)**. Until ADR-0015 is resolved by the Principal
+Architect:
+
+- The current implementation uses BLAKE2b-256 with domain
+  `sharenet-node-id-v1` (the code in `reference/identity/keys.ts` is
+  unchanged — this ADR does NOT modify code).
+- The derivation is labeled **INTERIM**, not FROZEN.
+- The golden vector in `reference/identity/golden-vectors.ts` remains
+  valid for the INTERIM algorithm but is NOT ratified as a permanent
+  conformance vector.
+- Any change in algorithm will require recomputing all golden vectors,
+  purging all NodeRecord + SequenceFloor rows, and bumping the domain
+  string to `sharenet-node-id-v2`.
+
+The original "Decision" rationale is preserved below for historical context
+and as input to ADR-0015's impact inventory.
 
 The freeze means: the domain string `sharenet-node-id-v1` MUST NOT
 be changed without a new spec version, a new derivation domain

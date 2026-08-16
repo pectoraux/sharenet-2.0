@@ -1,7 +1,24 @@
 # ADR-0014: LinkId Derivation Frozen + Two-Message Handshake
 
 **Date:** 2026-08-16
-**Status:** Accepted
+**Status:** INTERIM — LinkId derivation pending ADR-0015 transitive resolution; two-message handshake pending ADR-0016 (replay defect).
+
+> **⚠️ STATUS CORRECTION (2026-08-16, corrective milestone):**
+>
+> 1. The **LinkId derivation** portion of this ADR was labeled `FROZEN`. That
+>    label is retracted — LinkId transitively depends on NodeId (the local
+>    and remote NodeId strings are hash inputs), so LinkId cannot be frozen
+>    until ADR-0015 resolves the NodeId algorithm. Until then, the LinkId
+>    derivation is **INTERIM**.
+>
+> 2. The **two-message handshake** portion of this ADR was described as
+>    producing an "authenticated directed link." That description is
+>    **retracted** — see ADR-0016 (PROPOSAL) for the replay defect. The
+>    handshake verifies signed advertisements but does NOT prove fresh
+>    possession of the signing key bound to the connection transcript. A
+>    captured advertisement is replayable. Until ADR-0016 is resolved, the
+>    exchange is an "advertisement-verification exchange," NOT an
+>    authenticated link.
 
 ## Context
 

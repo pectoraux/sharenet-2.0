@@ -34,6 +34,14 @@ yarn-error.log*
 .env*
 !.env.example
 
+# --- ShareNet node-link private key material (NEVER commit) ---
+# Per ADR-0015-companion corrective + spec/00 §5: secret values must never
+# appear in git history. The mini-service keypair files contain Ed25519
+# secret keys — they are runtime-generated for local development only.
+mini-services/node-link/data/*/
+mini-services/node-link/data/*-keypair.json
+!mini-services/node-link/data/README.md
+
 # vercel
 .vercel
 

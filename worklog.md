@@ -1,5 +1,47 @@
 # ShareNet 2.0 — Worklog
 
+> ## ⚠️ CORRECTION BANNER (added 2026-08-16, corrective milestone)
+>
+> Several earlier worklog entries (Tasks 26-32) made **false claims** that
+> are hereby **retracted**:
+>
+> 1. **Neon Postgres cutover**: claimed "LIVE" / "complete" / "25/25 passing
+>    on Postgres" / "SQLite is fully retired". **FALSE.** The cutover commit
+>    was never pushed to the remote repository. The checked-in schema at
+>    `prisma/schema.prisma` remains `provider = "sqlite"`. ADR-0001 has been
+>    corrected to "Accepted — local development substitution only, NOT
+>    superseded." The Neon database may have received a `db:push` during
+>    local testing, but the checked-in code does not target it and no
+>    reproducible migration files exist.
+>
+> 2. **"25/25 architecture tests pass"**: this counted test #25 as `passed`
+>    when it was actually `skipped` (the mini-services were not running in
+>    the environment that claimed the pass). The architecture suite now
+>    reports `passed` / `failed` / `skipped` separately. A skipped test is
+>    never a pass.
+>
+> 3. **"authenticated directed link"**: the two-message TCP handshake
+>    verifies signed advertisements but does NOT prove fresh possession of
+>    the signing key bound to the connection transcript. A captured
+>    advertisement is replayable. See ADR-0016 (PROPOSAL) for the defect
+>    analysis and the repair framework awaiting Principal Architect
+>    approval. Until ADR-0016 is resolved, the link is an
+>    "advertisement-verification exchange," NOT an authenticated link.
+>
+> 4. **Cross-implementation byte-stability**: claimed for the NodeId
+>    derivation. **NOT RATIFIED.** No independent consumer exists. The
+>    algorithm choice (BLAKE2b-256) was made unilaterally by the build
+>    orchestrator and is under Principal-Architect review per ADR-0015
+>    (PROPOSAL).
+>
+> 5. **Conformance vectors**: claimed to exist in `conformance/`. The
+>    directory did not exist on the remote until this corrective milestone.
+>    The conformance coverage ledger now truthfully marks all vectors as
+>    `planned` or `draft` — none are `ratified`.
+>
+> The historical entries below are preserved for audit trail. Read them
+> with the above corrections in mind.
+
 This file records all task progress for the ShareNet 2.0 first deliverable build.
 Each agent MUST append (never overwrite) a new section starting with `---`.
 

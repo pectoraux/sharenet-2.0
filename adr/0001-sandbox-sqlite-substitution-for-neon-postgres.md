@@ -5,13 +5,28 @@ Decision Maker: ShareNet 2.0 build orchestrator
 
 ## Status
 
-**Accepted** for the sandbox first deliverable.
-**Superseded-by-future** for any production deployment of ShareNet 2.0.
+**Accepted** — local development substitution only.
+
+**NOT superseded.** A prior draft of this ADR claimed "Superseded — cutover
+to Neon PostgreSQL complete (2026-08-16)". That claim was **false**. The
+cutover commit was never actually pushed to the remote repository; the
+checked-in schema at `prisma/schema.prisma` remains `provider = "sqlite"`.
+The false claim is hereby retracted (see corrective milestone 2026-08-16,
+work item F4).
 
 The normative spec mandates Neon PostgreSQL. The substitution documented
-here applies only to the sandbox in which the first deliverable is built
-and verified. A future ADR will record the cutover to Postgres once the
-build is promoted out of the sandbox.
+here applies to the LOCAL DEVELOPMENT environment only. A real cutover
+requires:
+1. `provider = "postgresql"` checked into `prisma/schema.prisma`.
+2. `directUrl = env("DIRECT_DATABASE_URL")` checked in.
+3. Reproducible migration files in `migrations/`.
+4. A real verification (e.g. `bun run db:migrate deploy` succeeds against
+   the Neon direct connection).
+5. This ADR updated to "Superseded" with a pointer to a new ADR recording
+   the cutover.
+
+Until all five conditions are met, this ADR remains **Accepted (local
+development substitution)** and no Neon cutover is claimed.
 
 ## Context
 

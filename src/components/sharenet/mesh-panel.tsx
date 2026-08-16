@@ -109,9 +109,18 @@ export function MeshPanel() {
             )}
           </CardTitle>
           <CardDescription>
-            Per spec/00 §37: <strong>real independent processes</strong> establishing authenticated
-            directed links over a real TCP socket. No simulator, no shared in-memory graph, no fake transport.
-            Each node is a separate Bun process with its own Ed25519 keypair + NodeId.
+            Per spec/00 §37: <strong>real independent processes</strong> establishing an
+            advertisement-verification exchange over a real TCP socket. No simulator, no shared
+            in-memory graph, no fake transport. Each node is a separate Bun process with its own
+            Ed25519 keypair + NodeId.
+            <br />
+            <span className="text-xs text-amber-400">
+              ⚠ Truthful labeling (corrective milestone 2026-08-16): the current two-message
+              exchange verifies signed advertisements but does NOT prove fresh possession of the
+              signing key bound to the connection transcript. A captured advertisement is replayable.
+              See ADR-0016 (PROPOSAL) for the defect + repair framework. This is an
+              &quot;advertisement-verification exchange,&quot; NOT yet an &quot;authenticated link.&quot;
+            </span>
             <br />
             <span className="text-xs text-muted-foreground">
               Auto-refreshes every 3s. Node A: control=3001 wire=7788 · Node B: control=3002 wire=7789.

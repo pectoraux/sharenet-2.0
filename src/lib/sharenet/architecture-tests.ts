@@ -50,17 +50,33 @@ export interface ArchTestResult {
   id: number;
   name: string;
   category: "PROTOCOL" | "ARCHITECTURE" | "SECURITY";
+  /**
+   * Three-state test outcome. Per the corrective milestone (2026-08-16, F6):
+   * - `passed`   = the test ran and the property holds.
+   * - `failed`   = the test ran and the property does NOT hold.
+   * - `skipped`  = the test could NOT run in this environment (e.g. the
+   *                two-process link test on Vercel where the mini-services
+   *                are not reachable). A skipped test MUST NOT be counted as
+   *                passed. The dashboard and CI MUST report skipped
+   *                separately.
+   */
+  status: "passed" | "failed" | "skipped";
+  /** @deprecated use `status` instead. Kept for backward compat = (status === "passed"). */
   passed: boolean;
   description: string;
   expected: string;
   actual: string;
   durationMs: number;
+  /** If status === "skipped", the reason the test could not run. */
+  skipReason?: string;
 }
 
 export interface ArchTestSuiteResult {
   totalTests: number;
   passed: number;
   failed: number;
+  /** Tests that could not run in this environment. Reported separately, never counted as passed. */
+  skipped: number;
   results: ArchTestResult[];
   ranAt: string;
   durationMs: number;
@@ -550,14 +566,15 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       if (!aStatus?.ok || !bStatus?.ok) {
         // On Vercel (and any environment without the node-link mini-services
         // running on localhost), this test cannot run. Mark it as SKIPPED
-        // rather than FAILED so the dashboard shows "24/24 pass + 1 skipped"
-        // instead of "24/25 fail". The test is a LOCAL INTEGRATION test that
-        // proves the protocol works over real sockets — it must run in an
-        // environment where the mini-services can bind to localhost ports.
+        // (not PASSED, not FAILED). Per the corrective milestone (F6):
+        // a skipped test MUST be reported as skipped, never as passed.
+        // The test is a LOCAL INTEGRATION test that proves the protocol
+        // works over real sockets — it must run in an environment where
+        // the mini-services can bind to localhost ports.
         return {
-          passed: true, // count as pass-but-skipped (see `skipped` field below)
+          skipped: true as const,
+          reason: `node-link mini-services not reachable on localhost:3001/3002 (expected on Vercel; run 'bash mini-services/node-link/start-mesh.sh' locally)`,
           expected: "both node-link processes reachable on localhost:3001 + localhost:3002 (local integration test)",
-          actual: "SKIPPED — node-link mini-services not reachable (expected on Vercel; run 'bash mini-services/node-link/start-mesh.sh' locally)",
         };
       }
       // Step 2: tell Node A to dial Node B's wire port (7789).
@@ -602,12 +619,14 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
     }),
   );
 
-  const passed = results.filter((r) => r.passed).length;
-  const failed = results.length - passed;
+  const passed = results.filter((r) => r.status === "passed").length;
+  const failed = results.filter((r) => r.status === "failed").length;
+  const skipped = results.filter((r) => r.status === "skipped").length;
   return {
     totalTests: results.length,
     passed,
     failed,
+    skipped,
     results,
     ranAt: new Date().toISOString(),
     durationMs: Date.now() - start,
@@ -620,16 +639,33 @@ async function runOne(
   name: string,
   category: ArchTestResult["category"],
   specRef: string,
-  fn: () => Promise<{ passed: boolean; expected: string; actual: string }> | { passed: boolean; expected: string; actual: string },
+  fn: () => Promise<
+    | { passed: boolean; expected: string; actual: string }
+    | { skipped: true; reason: string; expected: string }
+  > | { passed: boolean; expected: string; actual: string } | { skipped: true; reason: string; expected: string },
 ): Promise<ArchTestResult> {
   const t0 = Date.now();
-  let passed = false, expected = "", actual = "";
+  let status: ArchTestResult["status"] = "failed";
+  let passed = false;
+  let expected = "";
+  let actual = "";
+  let skipReason: string | undefined;
   try {
     const r = await fn();
-    passed = r.passed;
-    expected = r.expected;
-    actual = r.actual;
+    if ("skipped" in r && r.skipped) {
+      status = "skipped";
+      passed = false; // skipped is NOT passed
+      expected = r.expected;
+      actual = `SKIPPED — ${r.reason}`;
+      skipReason = r.reason;
+    } else {
+      status = r.passed ? "passed" : "failed";
+      passed = r.passed;
+      expected = r.expected;
+      actual = r.actual;
+    }
   } catch (e) {
+    status = "failed";
     passed = false;
     expected = "test should not throw";
     actual = `threw: ${(e as Error).message}`;
@@ -638,11 +674,13 @@ async function runOne(
     id,
     name,
     category,
+    status,
     passed,
     description: `${specRef}`,
     expected,
     actual,
     durationMs: Date.now() - t0,
+    skipReason,
   };
 }
 

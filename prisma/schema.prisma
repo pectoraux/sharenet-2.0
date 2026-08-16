@@ -1,8 +1,31 @@
 // ShareNet 2.0 — Prisma schema for the web/control-plane components.
 //
-// Per ADR-0001, the sandbox uses SQLite as a substitution for the normative
-// Neon PostgreSQL. The schema shape mirrors the production Postgres schema so
-// the migration is mechanical (swap provider + adjust type-specific operators).
+// *** LOCAL DEVELOPMENT SUBSTITUTION — DO NOT CLAIM A NEON CUTOVER ***
+//
+// The normative spec (spec/00 §6) requires Neon PostgreSQL with both a
+// pooled connection (`DATABASE_URL`) and a direct connection
+// (`DIRECT_DATABASE_URL`) for migrations. This checked-in schema uses
+// SQLite as a LOCAL DEVELOPMENT SUBSTITUTION only.
+//
+// A Neon Postgres cutover was previously CLAIMED in the worklog and in
+// a draft of ADR-0001, but the cutover commit was never actually pushed
+// to the remote repository. The claim was false and is hereby retracted
+// (see corrective milestone 2026-08-16, work item F4).
+//
+// The schema SHAPE mirrors the production Postgres schema so the
+// migration is intended to be mechanical (swap `provider` to
+// `postgresql`, add `directUrl`). But "intended to be mechanical" is NOT
+// the same as "verified". Until a real cutover is performed AND verified
+// AND the schema is checked in as `postgresql` with reproducible
+// migration files in `migrations/`, this schema remains a local
+// development substitution.
+//
+// Per spec/00 §6:
+//   - Hosted database persistence is NOT a dependency of the portable
+//     protocol core (`reference/`). The protocol core is DB-free
+//     (enforced by architecture test #23).
+//   - The database is only used by the web/control-plane components
+//     (`src/lib/sharenet/`, `src/lib/auth/`).
 //
 // Models here cover:
 //   - Waitlist (spec/00 §7, ADR-0008)
@@ -22,7 +45,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "sqlite" // LOCAL DEVELOPMENT SUBSTITUTION — see ADR-0001 (corrected)
   url      = env("DATABASE_URL")
 }
 
