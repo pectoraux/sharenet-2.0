@@ -16,7 +16,7 @@ Advance only when `ready_for_next_gate: true` and CI verifies the gate evidence.
 | GATE-08 | Recovery | ✅ COMPLETE | `38c38b0` | `evidence/GATE-08.json` |
 | GATE-09 | Linux transparent networking | ✅ COMPLETE | `4213295` | `evidence/GATE-09.json` |
 | GATE-10 | Android north-star | ✅ COMPLETE | `3f99279` | `evidence/GATE-10.json` |
-| GATE-11 | Contribution proofs | ⏳ PENDING | — | — |
+| GATE-11 | Contribution proofs | ✅ COMPLETE | `7d418a7` | `evidence/GATE-11.json` |
 | GATE-12 | Civic Points | ⏳ PENDING | — | — |
 | GATE-13 | Content, external crypto, compute | ⏳ PENDING | — | — |
 

@@ -1,0 +1,43 @@
+{
+  "gate_id": "GATE-11",
+  "gate_title": "Contribution proofs",
+  "commit_sha": "7d418a79740600239e4649189420bf291ea22749",
+  "commit_message": "GATE-11: contribution proofs — bilateral receipts, append-only ledger, self-report forbidden",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "BilateralReceipt: mutually-signed attestation (gateway + peer both sign over measured service)",
+    "createBilateralReceipt: both parties sign the receipt body (domain-separated canonical CBOR)",
+    "verifyBilateralReceipt: BOTH signatures must verify (unilateral = no credit)",
+    "ContributionProof: derived ONLY from a verified bilateral receipt (BLAKE3 receipt hash for dedup)",
+    "createContributionProof: verifies the receipt first, then creates the proof — self-reported traffic CANNOT create a proof",
+    "ContributionLedger: append-only (no remove/delete), dedup by receipt hash, replay protection",
+    "SELF_REPORTED_CONTRIBUTION_FORBIDDEN: architecture guard (spec/00 §31)",
+    "14 unit tests covering all fraud/replay/duplicate/self-report scenarios"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "bun run tools/verify-gate.ts"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 162, "passed": 162, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [],
+  "vector_files_generated": [],
+  "protocol_adr_references": [
+    "spec/11-contribution.md (contribution pipeline: session → measurement → receipt → proof → ledger → Civic Points)",
+    "spec/00 §2 (Economics: Contribution ≠ ContributionProof ≠ CivicPoints ≠ Settlement ≠ ExternalCryptocurrency)",
+    "spec/00 §31 (forbidden: self-reported contribution → Civic Points)"
+  ],
+  "known_limitations": [
+    "The contribution ledger is in-memory only. A production implementation would persist to an append-only store (e.g. SQLite append-only table or a log file).",
+    "The bilateral receipt does not include the circuit ID or route ID binding. A follow-up should bind the receipt to the specific circuit that provided the service.",
+    "The contribution proof does not yet feed into Civic Points (GATE-12). The ledger tracks proofs but does not compute point values."
+  ],
+  "ready_for_next_gate": true
+}
