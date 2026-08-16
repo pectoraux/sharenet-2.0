@@ -1,0 +1,51 @@
+{
+  "gate_id": "GATE-05",
+  "gate_title": "Service negotiation and route commitment",
+  "commit_sha": "9004c0ee71d9aae7fe4671a2ef75915a468a267a",
+  "commit_message": "GATE-05: service negotiation and route commitment — distinct route types + acceptance signatures",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "ServiceRequirement (what the initiator needs: capability, destination, maxHops, bandwidth, expiry)",
+    "CapabilityOffer (node declares it CAN do — ≠ available ≠ authorized per spec/00 §21)",
+    "checkPolicy() with all spec/09 §3 guards: LINK_UP required, ADV_VERIFIED rejected, SSRF/loopback/private/allowlist checks, peer revocation, capability match, expiry",
+    "checkCapacity() with connections, global/per-peer quota, bandwidth checks",
+    "ServiceAgreement (result of successful policy + capacity checks; binds node to providing service)",
+    "RouteHop (requires nodeId, capability, endpoint, linkUp=true, serviceAgreement)",
+    "RouteProposal (initiator proposes path; source signature ≠ participant acceptance per spec/00 §23)",
+    "RouteAcceptance (each hop independently signs; binds routeId, hopIndex, acceptorNodeId, expiry)",
+    "RouteCommitment (ALL hops accepted → commit; validates every hop has acceptance, correct acceptor, LINK_UP, not expired)",
+    "CommittedRoute (ONLY from RouteCommitment; the ONLY object that can create a circuit)",
+    "TOPOLOGY_TO_ROUTE_FORBIDDEN architecture guard (topology/Dijkstra → route is forbidden per spec/00 §31)",
+    "PROPOSAL_TO_CIRCUIT_FORBIDDEN architecture guard (RouteProposal → circuit without commitment is forbidden)",
+    "20 unit tests covering all policy/capacity/route scenarios"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "bun run tools/verify-gate.ts"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 47, "passed": 47, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [],
+  "vector_files_generated": [],
+  "protocol_adr_references": [
+    "spec/07-routing.md (routing pipeline: discovery → proposal → acceptance → commitment → circuit)",
+    "spec/09-internet-gateway.md §2 (gateway model: capability ≠ policy ≠ authorization ≠ capacity)",
+    "spec/00 §21 (capabilities: ≠ available ≠ authorized)",
+    "spec/00 §22 (routing: discovery ≠ path validation ≠ route ≠ circuit)",
+    "spec/00 §23 (route objects: proposal, acceptance, commitment, committed route)",
+    "spec/00 §31 (forbidden transitions: topology→route, proposal→circuit)"
+  ],
+  "known_limitations": [
+    "Real-process A → Relay → Gateway integration test is deferred — the unit tests prove the protocol-core correctness with in-memory keypairs. The integration test will exercise the mini-services once they support the 3-message handshake and route negotiation.",
+    "ServiceAgreement.requirementDigest and RouteProposal.agreementDigest are currently placeholder random values. A follow-up should compute them as BLAKE3-256 hashes of the actual ServiceRequirement and hop service agreements.",
+    "Route commitment does not yet verify acceptance signatures cryptographically (only checks structural validity). A follow-up should add verifyRouteAcceptance calls in createRouteCommitment."
+  ],
+  "ready_for_next_gate": true
+}
