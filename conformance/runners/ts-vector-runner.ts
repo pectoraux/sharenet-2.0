@@ -25,6 +25,18 @@ import {
 } from "@reference/advertisement/advertisement";
 import { checkSequence } from "@reference/advertisement/sequence-floor";
 import { canonicalEncode, canonicalDecode, isCanonical, toHex, fromHex } from "@reference/encoding/cbor";
+import {
+  computeTranscriptHash,
+  computeLinkIdBytes,
+  buildPossessionPayload,
+  signPossessionProof,
+  verifyPossessionProof,
+  decodeMessage,
+  POSSESSION_DOMAIN_INITIATOR,
+  POSSESSION_DOMAIN_RESPONDER,
+  ROLE_INITIATOR,
+  ROLE_RESPONDER,
+} from "@reference/transport/auth-handshake";
 
 interface VectorResult {
   id: string;
@@ -159,6 +171,72 @@ function verifyAdvVector(data: any): VectorResult {
   }
 }
 
+function verifyHandshakeVector(data: any): VectorResult {
+  const input = data.input;
+  const expected = data.expected;
+
+  // Parse the wire messages
+  const initiateBytes = fromHex(input.initiateMessageHex);
+  const acceptBytes = fromHex(input.acceptMessageHex);
+  const confirmBytes = input.confirmMessageHex ? fromHex(input.confirmMessageHex) : null;
+
+  // Parse keys
+  const pubKeyA = hexToBytes(input.initiatorPublicKeyHex);
+  const pubKeyB = hexToBytes(input.responderPublicKeyHex);
+  const nodeIdA = input.initiatorNodeId;
+  const nodeIdB = input.responderNodeId;
+  const linkNonceA = hexToBytes(input.linkNonceAHex);
+  const linkNonceB = hexToBytes(input.linkNonceBHex);
+  const challengeForB = hexToBytes(input.challengeForBHex);
+  const challengeForA = hexToBytes(input.challengeForAHex);
+
+  // Compute LinkId bytes (from responder's perspective: local=B, remote=A)
+  const linkIdBytes = computeLinkIdBytes(nodeIdB, nodeIdA, linkNonceB, linkNonceA);
+
+  // Compute transcript hashes
+  const transcriptHashAfterInitiate = computeTranscriptHash([initiateBytes]);
+  const transcriptHashAfterAccept = computeTranscriptHash([initiateBytes, acceptBytes]);
+
+  // Decode Accept message to get proofB
+  const acceptMsg = decodeMessage(acceptBytes) as any;
+  const proofB = acceptMsg.proofB ? new Uint8Array(acceptMsg.proofB) : new Uint8Array(64);
+
+  // Verify proofB (B signs challengeForB with RESPONDER role)
+  const proofBOk = verifyPossessionProof(
+    pubKeyB, proofB, POSSESSION_DOMAIN_RESPONDER,
+    transcriptHashAfterInitiate, linkIdBytes, challengeForB, ROLE_RESPONDER,
+  );
+
+  if (expected.result === "LINK_UP") {
+    // Also need to verify proofA
+    if (!confirmBytes) {
+      return { id: data.id, passed: false, expected: "LINK_UP", actual: "missing confirmMessageHex" };
+    }
+    const confirmMsg = decodeMessage(confirmBytes) as any;
+    const proofA = confirmMsg.proofA ? new Uint8Array(confirmMsg.proofA) : new Uint8Array(64);
+    const proofAOk = verifyPossessionProof(
+      pubKeyA, proofA, POSSESSION_DOMAIN_INITIATOR,
+      transcriptHashAfterAccept, linkIdBytes, challengeForA, ROLE_INITIATOR,
+    );
+    const passed = proofBOk && proofAOk;
+    return {
+      id: data.id,
+      passed,
+      expected: `LINK_UP (proofB=${expected.proofBValid}, proofA=${expected.proofAValid})`,
+      actual: `proofB=${proofBOk}, proofA=${proofAOk}`,
+    };
+  } else {
+    // Expected fail
+    const passed = !proofBOk;
+    return {
+      id: data.id,
+      passed,
+      expected: `fail/${expected.errorCode}`,
+      actual: passed ? `proofB invalid (as expected)` : `proofB valid (unexpected — should have failed)`,
+    };
+  }
+}
+
 // Main
 const files = walkJsonFiles(vectorsDir);
 const results: VectorResult[] = [];
@@ -181,6 +259,8 @@ for (const file of files) {
     result = verifyCborVector(data);
   } else if (data.id?.startsWith("V-ADV-")) {
     result = verifyAdvVector(data);
+  } else if (data.id?.startsWith("V-LINK-HANDSHAKE-")) {
+    result = verifyHandshakeVector(data);
   } else {
     result = { id: data.id ?? file, passed: false, expected: "known vector type", actual: "unknown vector type" };
   }

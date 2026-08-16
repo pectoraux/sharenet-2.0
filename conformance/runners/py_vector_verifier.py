@@ -377,12 +377,117 @@ def verify_vector(data: dict) -> dict:
             return {"id": vid, "passed": False, "expected": expected_code or "ok",
                     "actual": f"threw: {e}"}
 
+    elif vid.startswith("V-LINK-HANDSHAKE-"):
+        return verify_handshake_vector(data)
+
     return {"id": vid, "passed": False, "expected": "known type", "actual": "unknown type"}
 
 
 # -----------------------------------------------------------------------
 # Main: read all vector files and verify
 # -----------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# Handshake vector verification (added for GATE-03)
+# -----------------------------------------------------------------------
+
+def verify_handshake_vector(data: dict) -> dict:
+    """Verify a V-LINK-HANDSHAKE-* vector."""
+    vid = data.get("id", "unknown")
+    inp = data.get("input", {})
+    exp = data.get("expected", {})
+
+    # Parse keys
+    pub_key_a = bytes.fromhex(inp["initiatorPublicKeyHex"])
+    pub_key_b = bytes.fromhex(inp["responderPublicKeyHex"])
+    node_id_a = inp["initiatorNodeId"]
+    node_id_b = inp["responderNodeId"]
+    link_nonce_a = bytes.fromhex(inp["linkNonceAHex"])
+    link_nonce_b = bytes.fromhex(inp["linkNonceBHex"])
+    challenge_for_b = bytes.fromhex(inp["challengeForBHex"])
+    challenge_for_a = bytes.fromhex(inp["challengeForAHex"])
+
+    # Compute LinkId bytes (responder perspective: local=B, remote=A)
+    link_id_bytes = _compute_link_id_bytes(node_id_b, node_id_a, link_nonce_b, link_nonce_a)
+
+    # Parse wire messages
+    initiate_bytes = bytes.fromhex(inp["initiateMessageHex"])
+    accept_bytes = bytes.fromhex(inp["acceptMessageHex"])
+    confirm_hex = inp.get("confirmMessageHex")
+    confirm_bytes = bytes.fromhex(confirm_hex) if confirm_hex else None
+
+    # Compute transcript hashes
+    transcript_after_initiate = _compute_transcript_hash([initiate_bytes])
+    transcript_after_accept = _compute_transcript_hash([initiate_bytes, accept_bytes])
+
+    # Decode Accept to get proofB
+    accept_msg = cbor2.loads(accept_bytes)
+    proof_b = bytes(accept_msg.get(5, b""))  # key 5 = proofB
+
+    # Verify proofB (B signs challengeForB with RESPONDER role)
+    proof_b_ok = _verify_possession_proof(
+        pub_key_b, proof_b, b"SHARENET/LINK/POSSESSION/RESPONDER/1",
+        transcript_after_initiate, link_id_bytes, challenge_for_b, 0x02,
+    )
+
+    if exp.get("result") == "LINK_UP":
+        if not confirm_bytes:
+            return {"id": vid, "passed": False, "expected": "LINK_UP", "actual": "missing confirm"}
+        confirm_msg = cbor2.loads(confirm_bytes)
+        proof_a = bytes(confirm_msg.get(2, b""))  # key 2 = proofA
+        proof_a_ok = _verify_possession_proof(
+            pub_key_a, proof_a, b"SHARENET/LINK/POSSESSION/INITIATOR/1",
+            transcript_after_accept, link_id_bytes, challenge_for_a, 0x01,
+        )
+        passed = proof_b_ok and proof_a_ok
+        return {"id": vid, "passed": passed, "expected": "LINK_UP",
+                "actual": f"proofB={proof_b_ok}, proofA={proof_a_ok}"}
+    else:
+        passed = not proof_b_ok
+        return {"id": vid, "passed": passed, "expected": f"fail/{exp.get('errorCode')}",
+                "actual": "proofB invalid (expected)" if passed else "proofB valid (unexpected!)"}
+
+
+def _compute_link_id_bytes(local_node_id: str, remote_node_id: str,
+                           local_nonce: bytes, remote_nonce: bytes) -> bytes:
+    h = blake3.blake3()
+    h.update(b"sharenet-link-id-v1")
+    h.update(local_node_id.encode())
+    h.update(remote_node_id.encode())
+    h.update(local_nonce)
+    h.update(remote_nonce)
+    return h.digest(length=32)
+
+
+def _compute_transcript_hash(messages: list) -> bytes:
+    h = blake3.blake3()
+    h.update(b"SHARENET/LINK/TRANSCRIPT/1")
+    for msg in messages:
+        h.update(struct.pack(">I", len(msg)))
+        h.update(msg)
+    return h.digest(length=32)
+
+
+def _build_possession_payload(domain_tag: bytes, transcript_hash: bytes,
+                              link_id_bytes: bytes, peer_challenge: bytes,
+                              role_byte: int) -> bytes:
+    return domain_tag + transcript_hash + link_id_bytes + peer_challenge + bytes([role_byte])
+
+
+def _verify_possession_proof(public_key: bytes, signature: bytes,
+                              domain_tag: bytes, transcript_hash: bytes,
+                              link_id_bytes: bytes, peer_challenge: bytes,
+                              role_byte: int) -> bool:
+    if len(signature) != 64 or len(public_key) != 32:
+        return False
+    payload = _build_possession_payload(domain_tag, transcript_hash, link_id_bytes, peer_challenge, role_byte)
+    try:
+        vk = VerifyKey(public_key)
+        vk.verify(payload, signature)
+        return True
+    except (BadSignatureError, Exception):
+        return False
+
 
 def main():
     vectors_dir = Path(__file__).parent.parent / "vectors"
@@ -422,3 +527,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
