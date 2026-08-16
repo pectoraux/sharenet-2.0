@@ -576,6 +576,17 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
   };
 }
 
+/**
+ * Per-test timeout. Per the corrective milestone (2026-08-16, F2): an
+ * unexpected hang must become a failed named test, not an indefinitely
+ * blocked command. Each test MUST complete within 10 seconds; if it
+ * exceeds the timeout, it is recorded as FAILED with reason="timeout".
+ *
+ * 10 seconds is generous (the full suite normally completes in <100ms)
+ * but bounded — a hung test cannot block the command indefinitely.
+ */
+export const ARCH_TEST_TIMEOUT_MS = 10_000;
+
 async function runOne(
   id: number,
   name: string,
@@ -592,8 +603,23 @@ async function runOne(
   let expected = "";
   let actual = "";
   let skipReason: string | undefined;
+
+  // Print the test name BEFORE execution so a hang is diagnosable.
+  // (Per F2: "Add direct runner diagnostics that identify the current
+  // test before execution".)
+  if (process.env.ARCH_TEST_VERBOSE !== "0") {
+    process.stderr.write(`  [arch] running #${id} ${name}...\n`);
+  }
+
   try {
-    const r = await fn();
+    // Enforce a per-test timeout. If the test fn does not resolve within
+    // ARCH_TEST_TIMEOUT_MS, we record it as FAILED with reason="timeout"
+    // instead of hanging forever.
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(`timeout after ${ARCH_TEST_TIMEOUT_MS}ms`)), ARCH_TEST_TIMEOUT_MS);
+    });
+    const r = await Promise.race([fn(), timeoutPromise]);
+
     if ("skipped" in r && r.skipped) {
       status = "skipped";
       passed = false; // skipped is NOT passed
@@ -609,7 +635,7 @@ async function runOne(
   } catch (e) {
     status = "failed";
     passed = false;
-    expected = "test should not throw";
+    expected = "test should not throw or time out";
     actual = `threw: ${(e as Error).message}`;
   }
   return {
