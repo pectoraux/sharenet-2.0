@@ -1,0 +1,35 @@
+name: ShareNet 2.0 Gate CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  gate-verification:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Unit tests
+        run: bun run test:unit
+
+      - name: Architecture tests (deterministic, no network/DB/mesh)
+        run: bun run test:arch
+
+      - name: JSON vector validation
+        run: bun -e "const fs=require('fs'),path=require('path');const dir=path.join('conformance','vectors');function walk(d){const out=[];for(const e of fs.readdirSync(d)){const f=path.join(d,e);if(fs.statSync(f).isDirectory())out.push(...walk(f));else if(e.endsWith('.json'))out.push(f)}return out}const files=walk(dir);let bad=0;for(const f of files){try{JSON.parse(fs.readFileSync(f,'utf-8'))}catch(e){console.error('INVALID:',f,e.message);bad++}}console.log('Checked',files.length,'vector(s),',bad,'invalid');if(bad>0)process.exit(1)"
+
+      - name: Gate verifier
+        run: bun run tools/verify-gate.ts
