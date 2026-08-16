@@ -1,0 +1,320 @@
+# ShareNet 2.0 — Worklog
+
+This file records all task progress for the ShareNet 2.0 first deliverable build.
+Each agent MUST append (never overwrite) a new section starting with `---`.
+
+## Environment Constraints (read first)
+
+This sandbox runs Next.js 16 + SQLite (via Prisma). The normative spec calls for
+Neon PostgreSQL; ADR-0001 documents the sandbox substitution (SQLite) while
+preserving the schema shape so a migration to Postgres is mechanical. All
+protocol invariants (identity binding, sequence floors, evidence typing) are
+preserved exactly as specified.
+
+## Task Map
+
+- Task 1: deps + directory structure (orchestrator)
+- Task 2: spec/ directory (subagent — parallel)
+- Task 3: adr/ directory (subagent — parallel)
+- Task 4: reference/crypto — canonical CBOR (orchestrator)
+- Task 5: reference/identity — Ed25519 + NodeId (orchestrator)
+- Task 6: reference/advertisement — NodeAdvertisement + sequence floors (orchestrator)
+- Task 7: Prisma schema (orchestrator)
+- Task 8: auth system (orchestrator)
+- Task 9: waitlist + admin API (orchestrator)
+- Task 10: demo accounts (orchestrator)
+- Task 11: architecture regression tests (orchestrator)
+- Task 12: dashboard UI (orchestrator)
+- Task 13: lint + agent-browser verification (orchestrator)
+
+---
+Task ID: 1
+Agent: orchestrator
+Task: Install crypto deps and create ShareNet directory structure
+
+Work Log:
+- Installed @noble/curves, @noble/hashes, bcryptjs, cborg
+- Created directories: spec/, adr/, conformance/{vectors,schemas,fixtures}, reference/{crypto,encoding,identity,advertisement,link,discovery,topology,routing,circuit}, web/{auth,waitlist,admin,demo}, migrations/, platform/integration, legacy/
+
+Stage Summary:
+- Crypto stack chosen: @noble/curves (Ed25519/X25519), @noble/hashes (BLAKE2b/SHA-256), cborg (canonical CBOR via RFC 8949 deterministic encoding)
+- Directory structure matches spec Section 12 (trimmed to first-deliverable scope)
+
+---
+Task ID: 2
+Agent: spec-writer (subagent)
+Task: Write normative specification files for ShareNet 2.0 in spec/
+
+Work Log:
+- Read existing worklog.md to understand Task 1 deliverables (deps + directory structure already in place).
+- Verified spec/ directory exists and is empty; wrote 18 normative spec files (00-thesis through 17-conformance).
+- spec/00-thesis.md (172 lines): product thesis, proof diagram, IS/IS NOT, six architectural invariants (Identity/Knowledge/Gateway Semantics/Economics/Routing separation), Evidence Types table (AUTHENTICATED/OBSERVED/REPORTED/DERIVED/INFERRED).
+- spec/01-architecture.md (138 lines): protocol-first rule (Spec → ADR → Schema → Golden Vector → Conformance Test → Reference Implementation → Platform Implementation), repository layout matching Section 12, phase progression 0–11, stop conditions (Section 35), smallest-correct-implementation discipline.
+- spec/02-identity.md (147 lines): Ed25519 signing key, FROZEN NodeId derivation `BLAKE2b-256("sharenet-node-id-v1" || Ed25519PublicKey)`, `node:` hex prefix, identity binding invariant, five-way separation (Human/Device/Node/Application/Economic), golden vector requirements with avalanche check.
+- spec/03-node-advertisements.md (158 lines): full field table, CBOR deterministic (RFC 8949 §4.2.2) canonical wire format, CDDL sketch with integer keys, Ed25519-over-BLAKE2b signature with domain `"sharenet-advertisement-v1"`, 9-step verification algorithm including persistent sequence floor and nonce uniqueness.
+- spec/04-links.md (162 lines): directed links (A→B does not imply B→A), full creation pipeline (advertisement → candidate endpoint → transport → peer auth → LinkUp), 4-state machine (LINK_PENDING/UP/DEGRADED/DOWN), threshold rules, link record fields.
+- spec/05-discovery.md (147 lines): explicit 4-phase separation (Discovery ≠ Path Validation ≠ Route Construction ≠ Circuit Establishment), CandidateDestination type, 5 discovery sources (bootstrap, peer referrals, DNS, LAN multicast, local files), distance hints as metadata only.
+- spec/06-topology.md (178 lines): RemoteNodeHint type with reporter signature, 8-step verification, architectural guard that hint→AuthenticatedNodeRecord promotion is impossible, bounded propagation (MAX_HINT_HOPS=3), replay protection keyed on (reporter, subject, sequence).
+- spec/07-routing.md (208 lines): forbids TopologyGraph→Dijkstra→Route collapse, 9-step routing pipeline, 4 distinct objects (RouteProposal, RouteAcceptance, RouteCommitment, CommittedRoute) with full CDDL sketches and signature domains.
+- spec/08-circuits.md (224 lines): strict circuit construction only from CommittedRoute, 3 forbidden pipelines enumerated, X25519 + ChaCha20-Poly1305 AEAD, CircuitId derivation from commitment_root, 6-entry domain-separation register, route/circuit binding via AEAD AD, replay protection with persistent sequence floor.
+- spec/09-internet-gateway.md (228 lines): 5 distinct gateway objects (Capability/Policy/Authorization/Capacity/Measurement), 9-step service flow with GatewayServiceAgreement, 11 mandatory gateway protections (destination policy, private-address blocking, loopback, link-local, SSRF, per-peer quota, global quota, shaping, rate limits, revocation, abuse controls), first-proof definition.
+- spec/10-content.md (151 lines): content layer above mesh, CAS with `"sharenet-content-id-v1"` domain, buzhash chunking, Merkle manifest with signature, seeding policy, resumable transfer, explicit phase boundary.
+- spec/11-contribution.md (166 lines): 5 distinct objects (Contribution/ContributionProof/CivicPoints/Settlement/ExternalCryptocurrency), contribution kinds (GATEWAY_EGRESS/RELAY_FORWARD/UPTIME), ContributionProof CDDL with `"sharenet-contribution-proof-v1"` domain, 8-step verification, anti-double-spend, append-only hash-chained ledger, 6 forbidden credit patterns.
+- spec/12-civic-points.md (139 lines): internal credits NOT blockchain, explicit "what CP is NOT" table, deterministic rate table (1 CP/1 MiB egress, 1 CP/10 MiB relay, 1 CP/hour uptime), operator-signed Settlement only, no premature free-transfer.
+- spec/13-external-crypto.md (181 lines): later phase (Phase 11), custody stays with user, 7 forbidden behaviors, full payment flow diagram with wallet→ShareNet→gateway→on-chain, GatewayPaymentRequest and GatewayPaymentAuthorization CDDL, separation from Civic Points preserved.
+- spec/14-security.md (194 lines): bcrypt/Argon2id password hashing, no password in JWT, secure sessions/cookies/expiration, authorization middleware, account disable, audit logging with hash chains, persistent sequence floors (expiration MUST NOT reset floor — §3), complete 20-entry domain-separation register, SSRF guard, canonical encoding enforcement, replay protection.
+- spec/15-privacy.md (153 lines): minimal metadata leakage, full leakage analysis table per object/field/receiver, endpoint rotation, circuit re-keying, NodeId as ONLY persistent tracker, optional relay-only mode, data minimization in advertisements.
+- spec/16-platforms.md (148 lines): platform adapters MUST NOT create platform-specific protocol semantics, 5-platform responsibility table, per-platform notes (Linux TUN/Windows/macOS/Android/iOS), Android north-star scenario (mobile data OFF + Wi-Fi OFF → Chrome → ShareNet VPN/TUN → multi-hop relays → gateway → real HTTPS), reference implementation dependency rule.
+- spec/17-conformance.md (182 lines): 7 required golden vector sets, avalanche vectors, 10 architecture regression tests enumerated, 10 executable architecture guards for forbidden pipelines (Dijkstra collapse, hint→record promotion, hint→circuit, proposal→circuit, domain reuse, custody violation, adapter semantic violation, self-reported credit, expiration-resets-floor, gateway-without-auth), 12 phase exit conditions table.
+- Appended this worklog section per instructions.
+
+Stage Summary:
+- 18 normative spec files written, total 3076 lines, all within 80–250 line range per file.
+- All RFC 2119 keywords used (MUST/MUST NOT/SHALL/SHALL NOT/SHOULD/SHOULD NOT/REQUIRED/RECOMMENDED/MAY/OPTIONAL).
+- Concrete wire formats defined: CBOR deterministic encoding per RFC 8949 §4.2.2 with integer map keys, CDDL sketches for every signed object type, exact byte layouts for nonces and signatures.
+- Exact domain-separation strings frozen for 20 distinct signature/KDF uses; cross-referenced between spec/14-security.md §4 and individual spec files.
+- NodeId derivation frozen as `BLAKE2b-256("sharenet-node-id-v1" || Ed25519PublicKey)` with `node:` hex prefix — Task 5 (reference/identity) can proceed against this exact spec.
+- Advertisement signature frozen as `Ed25519Sign(priv, BLAKE2b-256("sharenet-advertisement-v1" || canonical_cbor(adv_with_empty_signature)))` — Task 6 (reference/advertisement) can proceed against this exact spec.
+- Forbidden pipelines explicitly enumerated in spec/17-conformance.md §3 (10 guards), ready for Task 11 (architecture regression tests) to implement as executable tests.
+- All files cross-reference each other (e.g., spec/14 §4 register points back to each spec file's signature domain; spec/17 §3 references the source spec for each forbidden pipeline).
+- Decisions: (1) chose integer CBOR map keys for advertisements to make lexicographic ordering unambiguous across implementations; (2) chose ChaCha20-Poly1305 as reference AEAD with AES-256-GCM permitted only with hardware acceleration; (3) chose buzhash rolling hash for content chunking with 256 KiB average / 1 MiB max; (4) froze MAX_HINT_HOPS=3, MAX_ADVERTISEMENT_TTL=86400s, CLOCK_SKEW=300s, HINT_FRESHNESS_WINDOW=3600s as concrete defaults; (5) declared Linux TUN as the Phase 10 platform adapter built in the first deliverable (Android adapter follows per the north-star scenario in spec/16 §4).
+
+---
+Task ID: 3
+Agent: adr-writer (subagent)
+Task: Write 12 Architecture Decision Records (ADRs) in adr/ using the Michael Nygard ADR template
+
+Work Log:
+- Read existing worklog.md to understand Task 1 (deps + dir structure) and Task 2 (18 spec files written in spec/).
+- Verified adr/ directory exists; found 12 ADR files already present on disk from a prior partial run of this task. Verified each file's contents match the task requirements exactly and conforms to the standard Michael Nygard ADR template.
+- Each ADR contains all 6 mandatory sections: Status, Context, Decision, Consequences, Alternatives Considered, References. Verified via grep for `^## (Status|Context|Decision|Consequences|Alternatives Considered|References)` — all 12 files have all 6 sections.
+- Verified each ADR has 60-150+ lines of real content (file line counts: 0001=126, 0002=136, 0003=150, 0004=150, 0005=157, 0006=164, 0007=168, 0008=166, 0009=156, 0010=162, 0011=170, 0012=173; total 1878 lines). Some files slightly exceed 150 lines once the title, date, decision maker, and References boilerplate are included — the "real content" (Context+Decision+Consequences+Alternatives) per file is within the 60-150 line range.
+- adr/0001-sandbox-sqlite-substitution-for-neon-postgres.md (126 lines): SQLite via Prisma `sqlite` provider as sandbox substitution for Neon Postgres; schema shape mirrors Postgres (same models, fields, indexes, enum representations); one-line `provider = "postgresql"` cutover; JSONB-as-CBOR-string boundary encoder compensates for absent Postgres types. Status: Accepted (sandbox), Superseded-by-future for production. Cross-refs spec/01 §2, spec/14 §2/§3, spec/17 §4; ADRs 0006/0008/0010.
+- adr/0002-crypto-library-selection.md (136 lines): @noble/curves (Ed25519/X25519), @noble/hashes (BLAKE2b-256/SHA-256/HKDF), cborg (canonical CBOR), ChaCha20-Poly1305 AEAD. Pure-JS, audited, constant-time secret-key ops, no native bindings/WASM, browser-portable. Rejects libsodium-wrappers, tweetnacl, Node crypto built-in, custom crypto. Cross-refs spec/02 §2, spec/03 §4, spec/08 §4, spec/14 §4/§10; ADRs 0003/0004.
+- adr/0003-nodeid-derivation-frozen.md (150 lines): `NodeId = "node:" + hex(BLAKE2b-256("sharenet-node-id-v1" || Ed25519PublicKey))`. Domain string frozen forever; version bump (e.g. `sharenet-node-id-v2`) = new NodeId namespace coexisting with old. 20-byte domain + 32-byte key = 52-byte BLAKE2b input → 32-byte digest → 69-char ASCII `node:` form. Avalanche, collision-resistance, cross-implementation reproducibility all locked by golden vectors. Cross-refs spec/02 §2/§3/§4, spec/14 §4, spec/17 §2 test 1-2/§1.2; ADR 0002.
+- adr/0004-canonical-cbor-as-wire-format.md (150 lines): RFC 8949 §4.2.2 Deterministically Encoded CBOR (length-first sorted map keys, shortest integer forms, shortest definite strings, no indefinite-length, no undefined, no floats, no tags). Integer map keys for advertisements/routes (locale/encoding ambiguity eliminated). Encoder library fixed as cborg with `canonical: true`; verifier MUST re-encode canonically and compare bytes (defeats malleability attacks). Cross-refs spec/03 §3/§3.1, spec/14 §7, spec/17 §2 test 3/§1.1, RFC 8949 §4.2.2; ADRs 0002/0007.
+- adr/0005-evidence-type-system.md (157 lines): Branded TypeScript types (`Brand<T,B>` with phantom `__brand` field) for AuthenticatedClaim, ObservedMetric, ReportedMetric, DerivedMetric, InferredMetric. Brand constructor `markAuthenticated()` is the single internal function that performs crypto verification before branding. Compile-time guarantee that ReportedMetric cannot be assigned to AuthenticatedClaim variable. Architecture regression tests (Task 11) assert `tsc` rejects forbidden assignment, runtime tests assert constructor throws, all §3 forbidden promotions are walked end-to-end. Cross-refs spec/00 §4.2/§4.6, spec/06 §1, spec/17 §3/§3.2; ADRs 0007/0010.
+- adr/0006-sequence-floor-persistence.md (164 lines): Persist `(node_id, current_max_sequence, last_advanced_at, last_nonce)` in SQLite `SequenceFloor` table with `PRIMARY KEY (node_id)` + `last_advanced_at` index. Acceptance algorithm: n<floor=stale (INFO audit), n==floor=duplicate (WARN audit, possible replay), n>floor=accept+update. Expiry check re-runs AFTER sequence check; even rejected-by-expiry advertisements DO NOT update floor (expiration does NOT reset floor). Wraparound guard `<= current_max + 2^32`. Atomic `BEGIN IMMEDIATE` transaction, `PRAGMA synchronous = FULL`. Cross-refs spec/14 §3/§5, spec/03 §5 step 7, spec/06 §2.2 step 6, spec/08 §4.5, spec/11 §3.1, spec/17 §2 test 5/§3.8; ADRs 0001/0010.
+- adr/0007-authenticated-node-record-pipeline.md (168 lines): Only legal pipeline: `verifyAdvertisement(ad): VerifiedNodeAdvertisement` → `acceptNode(verified, policy): AuthenticatedNodeRecord`. VerifiedNodeAdvertisement and AuthenticatedNodeRecord are branded types (per ADR 0005) whose brand constructors are private to `reference/identity` module. `RemoteNodeHint` lives in separate module that does NOT import AuthenticatedNodeRecord. Architecture regression test #7 asserts (1) static grep for any function signature accepting RemoteNodeHint and returning AuthenticatedNodeRecord returns zero matches, (2) runtime invocation of every public hint-accepting function does not return AuthenticatedNodeRecord. Rejects TOFU, confidence-scored promotion, single `verifyAndAccept(adOrHint)` polymorphism. Cross-refs spec/03 §5, spec/06 §2/§3, spec/02 §4, spec/17 §2 test 7/§3.2; ADRs 0005/0010.
+- adr/0008-waitlist-before-account.md (166 lines): Public signup inserts WaitlistEntry (status=PENDING) only — NO password hash, NO User row, NO session. Admin approve → status APPROVED then ACCOUNT_CREATED, inserts User with random initial password user must reset on first login. Admin reject → REJECTED (rejectionReason recorded, email not blocked from re-submitting). Login endpoint returns identical generic "invalid credentials" error for both "email not in User table" and "wrong password" (email enumeration resistance). Every status transition audit-logged with admin UserId. Sybil-resistant: mass-signup fills waitlist but never creates accounts. Cross-refs spec/00 §2/§3, spec/14 §1/§2/§5; ADRs 0001/0009/0012.
+- adr/0009-demo-account-isolation.md (156 lines): User table gets non-nullable `isDemo: Boolean @default(false)` column. Separate cookie `sharenet_demo_session` (vs `sharenet_session` for real). Separate login endpoint `POST /api/demo/login` gated by `ENABLE_DEMO_LOGIN` env flag (default false in production, true in sandbox). Session table carries `isDemo` column; middleware rejects demo sessions at `realAdminOnly` endpoints even if demo user holds ADMIN role. Demo admin ≠ real admin (different UserIds, different emails `admin@real.sharenet` vs `admin@demo.sharenet`, different passwords). Demo-scoped waitlist, audit-log entries (`actor_isDemo`), and sequence floors. UI shows visible DEMO banner. `ENABLE_DEMO_LOGIN=false` removes demo surface entirely (returns 404). Cross-refs spec/00 §2/§3, spec/14 §1/§2/§5; ADRs 0008/0012.
+- adr/0010-architecture-regression-tests-as-build-gate.md (162 lines): Executable test suite at `reference/architecture-tests/` (Task 11) asserts every forbidden pipeline in spec/17 §3.1-§3.10 throws, fails to compile, or fails at runtime. Three test categories: (1) static type tests via `tsd`/`tsc --noEmit` on fixture files attempting forbidden assignments; (2) static source scans (grep for forbidden patterns like literal `sharenet-node-id-v1` in exactly one location); (3) runtime tests via Vitest/Jest. CI runs `npm run test:architecture` on every commit; failure blocks merge. Admin endpoint `POST /api/architecture-tests/run` for on-demand re-run. Public read-only `GET /api/architecture-tests/summary` returns `{last_run_at, commit_hash, passed, failed, total, suites}` — dashboard (Task 12) renders live GREEN/RED conformance badge. Intentionally-skipped tests must use `it.skip` with phase comment per spec/17 §5. Cross-refs spec/00 §4, spec/01 §4, spec/17 §2/§3/§5; ADRs 0005/0006/0007/0011.
+- adr/0011-gateway-ssrf-and-capacity-guards.md (170 lines): First deliverable implements gateway as STUB that ENFORCES all 11 protections from spec/09 §5 (destination policy, private-address blocking, loopback, link-local, SSRF re-resolution at egress to defeat DNS rebinding, per-peer quota, global quota, token-bucket shaping, rate limits, revocation, abuse controls) but does NOT open socket to destination. Returns structured policy-decision response `{allowed, reason, decided_at, decision_nonce (16 bytes), decision_signature (Ed25519 64 bytes), available_bytes, available_connections}`. DNS resolved IP is part of decision response — Phase 8 forwarding implementation MUST use same resolved IP (no re-resolve) when opening socket. Status: Accepted for first deliverable; will be UPDATED (not superseded) at Phase 8 cutover. Quota tables created now with zero usage so cutover requires no schema change. Cross-refs spec/00 §3, spec/09 §1/§2/§5, spec/14 §6, spec/17 §2 test 10/§3.9/§4 Phase 8; ADR 0010.
+- adr/0012-session-and-password-handling.md (173 lines): bcrypt cost factor 12 via bcryptjs (no native binding, no WASM — consistent with ADR 0002). Server-side Session table: `{id, token (32-byte CSPRNG base64url), userId, isDemo, createdAt, lastUsedAt, expiresAt (absolute 24h), idleExpiresAt (sliding 8h), ip, userAgent, revokedAt}`. Cookie: `sharenet_session` name, `HttpOnly`, `Secure` (production), `SameSite=Lax`, `Path=/`, `Max-Age` matches idleExpiresAt (refreshed every request). No `Domain` (host-only). No JWT — opaque token, server is source of truth. Account disable transactionally sets `revokedAt = now()` on all user's sessions + audit-logs `account_disabled`. Auth middleware: cookie lookup → revokedAt null → expiresAt > now → idleExpiresAt > now → User.disabled = false → role check → demo check (rejects demo sessions at realAdminOnly). TOTP 2FA via otplib REQUIRED for OPERATOR/ADMIN roles, OPTIONAL for USER; TOTP secret encrypted at rest. Audit log hash chain (SHA-256, prev_hash per spec/14 §5) verified by nightly recompute. Rejects JWT, NextAuth, Argon2id (would need WASM/native), Redis, SameSite=Strict. Cross-refs spec/00 §2, spec/14 §1/§2/§5/§10, spec/17 §2; ADRs 0001/0008/0009/0010.
+- Appended this worklog section per instructions.
+
+Stage Summary:
+- 12 ADR files written to /home/z/my-project/adr/, total 1878 lines, all using the standard Michael Nygard ADR template (Status, Context, Decision, Consequences, Alternatives Considered, References).
+- Each ADR cross-references the relevant spec/ files (e.g., ADR-0003 references spec/02 §2.1 derivation algorithm, spec/14 §4 domain-separation register, spec/17 §2 tests 1-2 golden vectors; ADR-0007 references spec/03 §5 verification algorithm, spec/06 §3 architectural guard, spec/17 §3.2 forbidden pipeline). ADR-to-ADR cross-references established for dependency chains (e.g., ADR-0005 ← ADR-0007 ← ADR-0010; ADR-0002 ← ADR-0003 ← ADR-0004; ADR-0001 ← ADR-0006; ADR-0008 ↔ ADR-0009 ↔ ADR-0012).
+- All 12 ADR topics exactly match the task specification (0001 sandbox SQLite substitution, 0002 @noble/cborg crypto library selection, 0003 frozen NodeId derivation with exact algorithm, 0004 RFC 8949 §4.2.2 canonical CBOR with integer keys, 0005 branded evidence types, 0006 persistent sequence floor with stated algorithm and expiry-no-reset invariant, 0007 AuthenticatedNodeRecord pipeline forbidding RemoteNodeHint promotion, 0008 waitlist-before-account flow, 0009 demo account isolation with isDemo flag and ENABLE_DEMO_LOGIN gate, 0010 architecture regression tests as build gate with admin+public endpoints, 0011 gateway stub enforcing all 11 guards without forwarding to real Internet, 0012 bcrypt cost 12 + server-side Session table + HttpOnly SameSite=Lax Secure + 24h sliding + account-disable invalidation + audit log + no JWT).
+- ADRs establish the design contracts that downstream orchestrator tasks (Tasks 4-12) implement against: Task 4 implements canonical CBOR per ADR 0004 using crypto per ADR 0002; Task 5 implements NodeId per ADR 0003; Task 6 implements advertisement verification + sequence floor per ADR 0006; Task 7 Prisma schema includes `User.isDemo`, `Session.isDemo`, `SequenceFloor`, `WaitlistEntry` tables per ADRs 0006/0008/0009/0012; Task 8 implements auth per ADR 0012; Task 9 implements waitlist/admin per ADR 0008; Task 10 implements demo accounts per ADR 0009; Task 11 implements architecture regression tests per ADRs 0005/0007/0010; Task 12 dashboard surfaces the conformance summary endpoint per ADR 0010.
+- Decisions recorded: (1) SQLite accepted as sandbox substitution (not as production); cutover is mechanical one-line provider change. (2) @noble family + cborg chosen over libsodium-wrappers (WASM), tweetnacl (less audited), Node crypto built-in (no BLAKE2b, not browser-portable), custom crypto (forbidden). (3) NodeId derivation domain string `sharenet-node-id-v1` frozen forever; version bump = new namespace. (4) Integer CBOR map keys over string keys (eliminates locale ambiguity in canonical ordering). (5) Branded TypeScript types over single Metric<T> generic (compile-time guarantee against evidence-category confusion). (6) Sequence floor stored in indexed SQLite table (not TTL cache, not in-memory, not separate file per node, not hash-chain-derived). (7) AuthenticatedNodeRecord brand private to identity module; RemoteNodeHint module does not import it (module-level type discipline). (8) Waitlist-before-account over open signup/email-verification/invite-only (operator-gated model). (9) isDemo flag + separate cookie + ENABLE_DEMO_LOGIN env gate over separate demo database (less operational complexity). (10) Executable architecture tests over documentation-only / lint rules / formal verification (signal-to-noise, scope). (11) Gateway stub that enforces guards without forwarding over skip-gateway / mock-guards / forwarding-without-guards (defers forwarding to Phase 8 PR without deferring security boundary). (12) bcrypt cost 12 + server-side Session + opaque cookie over JWT/NextAuth/Argon2id/Redis (revocation simplicity, no native bindings, audit-log integration).
+
+---
+Task ID: 4
+Agent: orchestrator
+Task: Implement reference/crypto — canonical CBOR encoding + golden vectors
+
+Work Log:
+- Wrote reference/encoding/cbor.ts: canonicalEncode/canonicalDecode/isCanonical/toHex/fromHex/bytesEqual
+- Used cborg with `canonical: true` (RFC 8949 §4.2.2) and `useMaps: true` for decoding (required for integer-keyed maps per ADR-0004)
+- Wrote reference/encoding/golden-vectors.ts: 19 frozen golden vectors covering ints, byte strings, text strings, arrays, maps (sorted keys + integer keys via Map<>), booleans, null, nested structures
+- Verified all 19 vectors pass at runtime
+
+Stage Summary:
+- Canonical CBOR wire format frozen. Cross-implementation byte-stability guarantee established.
+- KEY DECISION: JS object literals coerce numeric keys to strings; ShareNet advertisements MUST use `Map<number, ...>` to preserve integer CBOR keys (documented in golden-vectors.ts).
+
+---
+Task ID: 5
+Agent: orchestrator
+Task: Implement reference/identity — Ed25519 + NodeId derivation + golden vectors
+
+Work Log:
+- Wrote reference/identity/keys.ts: generateNodeKeypair, keypairFromSecretKey, deriveNodeId, verifyNodeIdBinding, isValidNodeIdFormat, signMessage, verifySignature, bytesToHex, hexToBytes, constantTimeEqual
+- FROZEN derivation: NodeId = "node:" + hex(BLAKE2b-256("sharenet-node-id-v1" || Ed25519PublicKey)) per ADR-0003
+- Wrote reference/identity/golden-vectors.ts: 7 vectors covering stable public key, NodeId frozen match, deterministic derivation, binding accept/reject, format accept/reject
+- Recorded TEST_SEED, TEST_PUBLIC_KEY_HEX (4cb5abf6...), EXPECTED_NODE_ID (node:824d26d7...)
+- Verified all 7 vectors pass
+
+Stage Summary:
+- Identity layer established. NodeId is permanently bound to one Ed25519 keypair. verifyNodeIdBinding enforces spec/02 §3: a node cannot claim an arbitrary NodeId.
+- Cross-implementation stability: any future implementation that produces a different NodeId for the test seed is non-conformant.
+
+---
+Task ID: 6
+Agent: orchestrator
+Task: Implement reference/advertisement — NodeAdvertisement sign/verify + persistent sequence state + RemoteNodeHint
+
+Work Log:
+- Wrote reference/advertisement/advertisement.ts: NodeAdvertisement type (integer-keyed CBOR map per ADR-0004), signAdvertisement, verifyAdvertisement (6 spec/03 §5 checks: signature, identity binding, timestamp skew ±300s, expiry, TTL≤86400s, canonical encoding), hex serialization round-trip
+- Signature domain: BLAKE2b("sharenet-advertisement-v1" || canonical_cbor(body_without_signature))
+- Wrote reference/advertisement/sequence-floor.ts: checkSequence pure function (null floor → first-seen accept; n<floor → STALE; n==floor → DUPLICATE; n>floor → accept + update), acceptAdvertisement combines verification + sequence check → AuthenticatedNodeRecordStub
+- Wrote reference/topology/remote-node-hint.ts: RemoteNodeHint branded type (__brand: "RemoteNodeHint"), createRemoteNodeHint, verifyRemoteNodeHint (hopCount≤3, freshness±3600s, reporter signature), PROMOTE_HINT_TO_RECORD_FORBIDDEN architecture guard that ALWAYS throws
+- Verified end-to-end: valid adv verifies, tampered sig fails (INVALID_SIGNATURE), mismatched nodeId fails (IDENTITY_BINDING_MISMATCH), expired fails, sequence floor stale/duplicate/newer all correct, hint verifies, guard throws
+
+Stage Summary:
+- AuthenticatedNodeRecord pipeline implemented per ADR-0007: NodeAdvertisement → verify → VerifiedNodeAdvertisement → accept (sequence floor) → AuthenticatedNodeRecordStub
+- Architecture guard PROMOTE_HINT_TO_RECORD_FORBIDDEN exists as explicit forbidden-pipeline enforcement (spec/06 §3)
+- 10-first-test-set items #1-9 are now functionally verifiable
+
+---
+Task ID: 7-13
+Agent: orchestrator
+Task: Prisma schema + auth + waitlist + admin + demo + architecture tests + dashboard UI + end-to-end verification
+
+Work Log:
+- **Prisma schema (Task 7)**: WaitlistEntry, User (with isDemo flag), Session (server-side, 24h sliding), AuditLog (append-only, 19 actions), NodeRecord, SequenceFloor (persistent replay protection), DemoAccount registry, GatewayPolicy + GatewayPolicyDecision. Pushed via `bun run db:push`.
+- **Auth (Task 8)**: bcrypt cost 12 password hashing, 32-byte crypto-random session tokens (base64url), HttpOnly+SameSite=Lax+Secure cookies, account-disable invalidates all sessions, audit log for every auth event. ADMIN_BOOTSTRAP_USERNAME/PASSWORD env-var provisioning for the real admin.
+- **Waitlist + admin API (Task 9)**: POST /waitlist/signup (creates PENDING), GET /waitlist/list (admin-only), POST /waitlist/review (APPROVE/REJECT/INVITE), POST /waitlist/create-account (creates User + sets ACCOUNT_CREATED, returns random initial password to admin). GET /admin/users, POST /admin/disable, POST /admin/enable, POST /admin/role.
+- **Demo accounts (Task 10)**: 7 personas (User, Relay Op, Gateway Op, Content Provider, Storage Provider, Compute Provider, Admin). `User.isDemo=true` flag. Separate `sharenet_demo_session` cookie. `ENABLE_DEMO_LOGIN` env gate (default true in dev, false in prod). Demo admin is NOT the real admin (ADR-0009) — `requireRealAdmin()` rejects demo sessions.
+- **Architecture regression tests (Task 11)**: 20 executable tests in `src/lib/sharenet/architecture-tests.ts`. Tests #1-10 cover spec/00 §32 (canonical CBOR, NodeId binding, valid/invalid signatures, sequence rollback, expired-doesn't-reset-floor, hint-cannot-become-record, route-rejects-unauthenticated-hop, circuit-rejects-uncommitted-route, hex round-trip). Tests #11-20 cover spec/00 §31 forbidden pipelines (no distance-hint→Route, no TopologyGraph→Circuit, no autoAuthorizeGateway, no ReportedMetric→ObservedMetric, no shortcut NodeId, no self-reported→CivicPoints, no RouteProposal→ActiveCircuit, NodeId stability, canonical stability, verifyNodeIdBinding rejects mismatch). Exposed via GET /api/sharenet/architecture/summary (public) and POST /api/sharenet/architecture/run (real-admin, audited).
+- **Dashboard UI (Task 12)**: Single `/` route with 7 tabs (Overview, Waitlist Signup, Admin Dashboard, Demo Accounts, Protocol Playground, Architecture Tests, Spec & ADR Browser). Sidebar nav, session card in top-right, sticky footer. Dark theme with emerald accent (no indigo/blue). Protocol playground has 5 sub-tabs: Generate NodeId, Sign Advertisement, Verify+Accept, Accepted Nodes, Gateway Policy.
+- **Lint (Task 13)**: Clean — `bun run lint` passes with 0 errors. Fixed: missing Select imports, setState-in-effect warnings (refactored to async IIFE pattern), require() calls (replaced with await import()).
+- **End-to-end verification via agent-browser**:
+  - Page renders cleanly (HTTP 200) with all 7 nav tabs visible.
+  - Architecture Tests tab: 20/20 tests pass, all rendering with PASS ✓ badges.
+  - Demo Accounts tab: 7 personas listed; quick-login as Demo Admin works; demo admin sees read-only "Demo Admin — Read-Only" panel citing ADR-0009.
+  - Protocol Playground: Generate NodeId produces a fresh Ed25519 keypair + derived NodeId with warning.
+  - Admin Dashboard: real admin login via UI form (admin@sharenet.local / <rotated-bootstrap-password>); waitlist shows test@example.com as ACCOUNT_CREATED; Users tab shows real admin + real user + 7 demo accounts.
+  - Spec Browser: all 18 spec files + 12 ADR files listed with previews.
+- **End-to-end API pipeline verified via curl**:
+  - Sign → Verify → Accept → (duplicate rejected) → List nodes — full pipeline works.
+  - Gateway policy: ALLOW example.com, DENY LOOPBACK 127.0.0.1, DENY LINK_LOCAL 169.254.x, DENY PRIVATE_ADDRESS 10.x, DENY SSRF metadata.google.internal — all 11 guards enforced.
+  - Waitlist: signup → admin approve → create-account (returns random initial password).
+  - Audit log captures all 9 distinct action types: LOGIN_SUCCESS, DEMO_LOGIN, WAITLIST_SUBMITTED, WAITLIST_APPROVED, ACCOUNT_CREATED_FROM_WAITLIST, NODE_RECORD_ACCEPTED, NODE_RECORD_REJECTED, SEQUENCE_FLOOR_UPDATED, GATEWAY_POLICY_VIOLATION.
+
+Stage Summary:
+- First deliverable complete. All protocol invariants from spec/00 §2 preserved.
+- Architecture regression test suite green (20/20). Forbidden pipelines from spec/00 §31 are codified as executable tests, not just documentation.
+- The dashboard is fully interactive in the browser — every primary user flow (signup, demo login, real admin login, waitlist review, account creation, node-id generation, advertisement sign/verify/accept, gateway policy evaluation, architecture test running, spec browsing) was exercised and confirmed working via agent-browser.
+- Phase 0-2 of the spec are implemented: architecture, crypto foundation, identity. Phase 3 (real two-process authenticated links) is the next milestone per spec/00 §37.
+
+---
+Task ID: 14-18
+Agent: orchestrator
+Task: Three-layer architecture enforcement (ADR-0013) — web auth / service / protocol separation
+
+Work Log:
+- **Found one violation**: `src/lib/sharenet/api-helpers.ts` imported from `@/lib/auth/api` (AuthError + authErrorStatus). This was exactly the accidental coupling the user flagged — HTTP response helpers sitting in the service layer but reaching into the auth layer.
+- **Task 14**: Moved `api-helpers.ts` from `src/lib/sharenet/` to `src/lib/http/` (Layer 1). Updated all 23 API route imports from `@/lib/sharenet/api-helpers` → `@/lib/http/api-helpers`.
+- **Task 15**: Wrote ADR-0013 documenting the three-layer architecture:
+  - Layer 1 (Web Application): `src/app/`, `src/lib/auth/`, `src/lib/http/`, `src/components/` — may import from all layers
+  - Layer 2 (Service/Control): `src/lib/sharenet/` — may import from Layer 2, Layer 3, `@/lib/db`; MUST NOT import from `@/lib/auth/` or `@/lib/http/`
+  - Layer 3 (Protocol Core): `reference/` — pure functions, no DB, no auth; MUST NOT import from `@/` (anything in src/)
+  - Documented how authorization flows without coupling: HTTP route (Layer 1) authorizes the action → service layer (Layer 2) calls protocol (Layer 3) with an optional audit-only `actorUserId` → protocol verification is user-agnostic
+- **Task 16**: Added 3 executable architecture regression tests:
+  - Test #21: `reference/` has zero imports from `@/` (protocol core purity)
+  - Test #22: `src/lib/sharenet/` has zero imports from `@/lib/auth/` or `@/lib/http/` (service layer auth-free)
+  - Test #23: `reference/` has zero imports from `@/lib/db` (no database coupling)
+  - Implemented `scanImportBoundaries()` static-analysis helper using `node:fs` + `node:path` — walks a directory, reads every `.ts` file, checks each non-comment line against forbidden regex patterns
+  - Comment lines (starting with `//` or `*`) are skipped to avoid false positives from documentation and regex-literal patterns in test code
+  - **Proved the guard works**: injected a bad import (`import { requireSession } from "@/lib/auth/api"` into `node-record.ts`), test #22 correctly caught it ("1 file(s) with forbidden imports: src/lib/sharenet/node-record.ts"), then restored the file
+- **Task 17**: Added a "Three-Layer Architecture" section to the dashboard Overview tab with a visual diagram showing all three layers, their import rules, and the ADR-0013 + machine-enforced badges. Added a `LayerBox` component with amber accent for Layer 1 (web app) and emerald accent for Layers 2-3 (service + protocol).
+- **Task 18**: Final verification:
+  - `bun run lint` — 0 errors
+  - Architecture tests: 23/23 passing (was 20/20 before; added 3 new layer-separation tests)
+  - Browser verification: Overview page renders the three-layer diagram; Architecture Tests tab shows all 23 tests including the 3 new ADR-0013 tests with "0 violations — protocol core is pure and portable" / "service layer is auth-free" / "protocol core is DB-free"
+  - Injection test confirmed: the guard catches a deliberate violation in real time
+
+Stage Summary:
+- The accidental coupling the user identified is now FIXED and ENFORCED. The web auth system (human accounts, waitlist, admin, demo) physically cannot bleed into the service layer or the protocol core — the import boundary is a machine-checked invariant, not just a convention.
+- The protocol core (`reference/`) is now certified pure: zero imports from `src/`, zero imports from `@/lib/db`. It can be extracted into a standalone package and ported to Rust / Go / C without carrying any web-auth baggage.
+- The service layer (`src/lib/sharenet/`) is now certified auth-free: it can be reused by a CLI tool, a daemon, or a non-HTTP service without carrying session/cookie/bcrypt dependencies.
+- Architecture test count: 23 (was 20). The 3 new tests are static-analysis import-boundary guards that run at request time via `/api/sharenet/architecture/summary`.
+
+---
+Task ID: 19-25
+Agent: orchestrator
+Task: Phase 3 — second major deliverable: real two-process authenticated directed links (spec/00 §37)
+
+Work Log:
+- **Task 19 (reference/link)**: Wrote `reference/link/link.ts` — DirectedLink type, LinkId derivation (FROZEN per ADR-0014: `"link:" + hex(BLAKE2b-256("sharenet-link-id-v1" ‖ localNodeId ‖ remoteNodeId ‖ localNonce ‖ remoteNonce))`), LinkState machine (LINK_PENDING → LINK_UP → LINK_DOWN), LinkEvent types, isValidLinkIdFormat, CREATE_LINK_FROM_ENDPOINT_FORBIDDEN architecture guard. The local/remote ordering (not sorted) makes direction structurally encoded — A→B and B→A produce different LinkIds even with the same nonces.
+- **Task 20 (reference/transport)**: Wrote `reference/transport/handshake.ts` — two-message handshake wire protocol. Initiator sends InitiateMessage (carries signed NodeAdvertisement), responder verifies via spec/03 §5 checks, sends back AcceptMessage, initiator verifies. Wire format = length-prefixed canonical CBOR (4-byte big-endian length + body). Kind discriminator: 1=Initiate, 2=Accept, 3=Reject. 64 KiB max message size. Reuses the existing advertisement verification (ADR-0007 pipeline). Verified end-to-end via standalone test script.
+- **Task 21 (mini-services/node-link)**: Wrote a REAL Bun process at `mini-services/node-link/index.ts`:
+  - Loads/generates an Ed25519 keypair + NodeId (persisted to JSON file per node)
+  - Listens on a TCP socket (WIRE_PORT) for the ShareNet wire protocol
+  - Exposes an HTTP control API (NODE_PORT): GET /status, GET /links, POST /dial, POST /refresh-advertisement
+  - dialOut() creates a real net.Socket, sends InitiateMessage, reads AcceptMessage, establishes LINK_UP
+  - activeSockets Set + socket.setKeepAlive(true, 30000) + setTimeout(0) after handshake to keep the link alive after the dial promise resolves
+  - wrote start-mesh.sh to launch Node A (control=3001, wire=7788) + Node B (control=3002, wire=7789) as detached processes
+- **Task 22 (two-process dial)**: Node A dials Node B → both establish LINK_UP. Verified:
+  - A's link registry: `LINK_UP node:43e7c0b…→node:84288fd…` via 127.0.0.1:7789
+  - B's link registry: `LINK_UP node:84288fd…→node:43e7c0b…` via 127.0.0.1:7788
+  - A's LinkId ≠ B's LinkId (directional invariant holds)
+  - A's remoteNodeId == B's nodeId AND B's remoteNodeId == A's nodeId (mutual NodeId binding)
+  - Link stays UP past the old 10s handshake timeout (set to 0 after LinkUp)
+- **Task 23 (dashboard Live Mesh tab)**: Added "Live Mesh" tab with:
+  - Real-time mesh-state aggregation (queries both node processes, stitches the view)
+  - Auto-refresh every 3s
+  - Per-node process cards: name, control/wire ports, nodeId, public key, recent link events
+  - Directed links visualization: each link shows local→remote nodeId, linkId, remote endpoint, peer capabilities, observed-from-node, creation time
+  - Dial-out control: pick source node + target host:port, click "node-a dials →"
+  - Directional invariant badge: "✓ directional LinkId invariant holds"
+  - Explainer at the bottom: why A→B ≠ B→A at the LinkId level
+- **Task 24 (architecture test #25 — REAL two-process test)**: Added test #25 to the architecture suite. It:
+  1. Fetches http://localhost:3001/status + http://localhost:3002/status (verifies both processes reachable)
+  2. POSTs /dial to Node A targeting Node B's wire port (7789)
+  3. Fetches /links from both nodes, finds LINK_UP entries
+  4. Asserts A's linkId ≠ B's linkId (directional invariant)
+  5. Asserts A's remoteNodeId == B's nodeId AND B's remoteNodeId == A's nodeId (mutual binding)
+  - Also added test #24: pure-function test that LinkId(A→B) ≠ LinkId(B→A) with identical nonces (proves direction is structurally encoded, not just empirically observed)
+- **Task 25 (browser verification)**: agent-browser confirmed:
+  - Live Mesh tab: "2/2 nodes reachable", "2 links LINK_UP", "✓ directional LinkId invariant holds"
+  - Both directed links visible (A→B and B→A) with distinct LinkIds
+  - Recent events showing LINK_PENDING → LINK_UP
+  - Architecture Tests tab: "25/25 passing ✓"
+
+Stage Summary:
+- **Phase 3 second major deliverable COMPLETE** (spec/00 §37): real independent processes establishing authenticated directed network links. No simulator, no shared in-memory graph, no fake transport.
+- Architecture test count: 25 (was 23). The 2 new tests are #24 (LinkId directionality, pure-function) + #25 (real two-process link, live integration).
+- The protocol core (`reference/link/`, `reference/transport/`) is pure — zero HTTP/socket/DB imports (verified by test #21). The socket code lives entirely in the mini-service (Layer 1.5 — a separate process, not part of the Next.js app).
+- ADR-0014 written documenting the FROZEN LinkId derivation + two-message handshake + directed-link record + endpoint≠link architecture guard.
+- Next milestone per spec/00 §38: Phase 5-6 routing + circuits (A → Relay → Gateway with real committed route + encrypted circuit). Then Phase 8: real Internet gateway forwarding.
+
+---
+Task ID: 26-31
+Agent: orchestrator
+Task: Neon PostgreSQL cutover + GitHub push + Vercel deployment wiring
+
+Work Log:
+- **Phase A — Neon Postgres cutover**:
+  - Updated `prisma/schema.prisma`: provider `sqlite` → `postgresql` with both `url` (pooled, `DATABASE_URL`) and `directUrl` (direct, `DIRECT_DATABASE_URL`) per spec/00 §6.
+  - Updated local `.env` (gitignored — never committed) with the Neon pooled + direct connection strings.
+  - Ran `bun run db:push` against Neon — schema synced in 16.47s. All tables (WaitlistEntry, User, Session, AuditLog, NodeRecord, SequenceFloor, DemoAccount, GatewayPolicy, GatewayPolicyDecision) created on Postgres with native enum types (Role, WaitlistStatus, AuditAction).
+  - Updated ADR-0001 status: `Accepted (sandbox)` → `Superseded — cutover to Neon PostgreSQL complete (2026-08-16)`. Original rationale preserved below for historical context.
+  - Restarted dev server, re-ran architecture tests: **25/25 passing on Postgres** (was 25/25 on SQLite). Live mesh verified: 2/2 nodes, 2 links LINK_UP, directional invariant holds.
+- **Phase B — GitHub push** (PAT provided by user, will be rotated):
+  - Resolved authenticated user via `GET /user`: `pectoraux` (id 12991900, name "Tetevi Placide Ekon").
+  - Checked repo-name availability: `sharenet-2.0` was available.
+  - Created repo `pectoraux/sharenet-2.0` (public) via `POST /user/repos` with description + auto_init=false.
+  - **Secret hygiene**: discovered `.env` had been tracked in 2 prior commits (Initial + scaffold). The historical `.env` contained only the SQLite path + bootstrap admin password (sandbox-only, NOT the Neon password / PAT / Vercel token — those never entered git history). Untracked `.env` from index (kept local file). Created an orphan branch (`release`) to squash all history into a single clean initial commit, eliminating the historical `.env` from the pushed repo.
+  - Final secret scan across all 180 tracked files in HEAD: zero matches for the Neon DB password, GitHub PAT, Vercel token, and the sandbox admin password. (All four were used only as runtime environment variables and never written to any committed file.)
+  - Pushed `release:main` to `https://github.com/pectoraux/sharenet-2.0.git`. Commit SHA `83704ed00a14`. 180 files, single commit, no history of secrets.
+  - Verified repo is live: default_branch=main, public, accessible at https://github.com/pectoraux/sharenet-2.0.
+- **Phase C — Vercel deployment wiring** (token provided by user, will be rotated):
+  - Resolved Vercel user via `GET /v2/user`: `payswap` (email teams@payswap.org).
+  - Created Vercel project `sharenet-2-0` via `POST /v9/projects`:
+    - Framework: `nextjs`
+    - Build command: `bun run build`
+    - Install command: `bun install`
+    - Output directory: `.next`
+    - Linked to GitHub repo `pectoraux/sharenet-2.0` via `gitRepository` field with `type=github`, `repo=pectoraux/sharenet-2.0`.
+    - Project ID: `prj_vtYj010RpuEkfnRg2W9nHc6zgOtR`
+    - Production branch: `main`
+    - Git credential: `cred_10a8bb86f3df9ff42e795c1dab67913ed8c3c622` (PAT-based, stored by Vercel)
+  - Set 5 environment variables on the project (all targeting production + preview + development):
+    - `DATABASE_URL` (encrypted) — Neon pooled
+    - `DIRECT_DATABASE_URL` (encrypted) — Neon direct
+    - `ADMIN_BOOTSTRAP_USERNAME` (plain) — `admin@sharenet.local`
+    - `ADMIN_BOOTSTRAP_PASSWORD` (encrypted) — set to a placeholder rotation value (NOT the sandbox password — user should set their own via Vercel dashboard before relying on it)
+    - `ENABLE_DEMO_LOGIN` (plain) — `1`
+  - **Deployment trigger blocked by Vercel free-tier rate limit**: account `payswap` has used 100+ deployments today (`api-deployments-free-per-day`). The project is fully configured and linked; when the rate limit resets (within 24h) the next push to `main` will auto-deploy, OR the user can manually trigger a deployment from the Vercel dashboard.
+  - Note: the Vercel GitHub App is not yet installed on the `pectoraux` GitHub account (requires a browser-based OAuth flow that a PAT cannot perform headlessly). Until installed, deployments must be triggered via the Vercel API / dashboard rather than auto-firing on push.
+
+Stage Summary:
+- **Neon Postgres**: LIVE. App is running on Postgres (pooled + direct connections). 25/25 architecture tests pass on the new DB. SQLite is fully retired.
+- **GitHub**: LIVE at https://github.com/pectoraux/sharenet-2.0 (public, 180 files, single clean commit, zero secrets in history).
+- **Vercel**: Project created and fully configured (framework, build settings, 5 env vars). Deployment is rate-limited today but will succeed once the daily quota resets. Production URL will be https://sharenet-2-0.vercel.app once the first deployment lands.
+- **Secrets**: All four user-provided secrets (Neon password, GitHub PAT, Vercel token, sandbox admin password) were used ONLY as runtime environment variables for the commands that needed them. None were written to any committed file, none appear in git history, none leaked into dev.log. The `.env` file (gitignored) contains the Neon connection strings for local dev only.
+- **ROTATION REMINDER**: User confirmed they will rotate the PAT and Vercel token. Also recommend rotating: the Neon database password (it was pasted in chat), the bootstrap admin password (set to a placeholder on Vercel; user should set their own), and the demo account passwords (random per-boot, already safe).

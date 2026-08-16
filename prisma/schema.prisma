@@ -1,0 +1,323 @@
+// ShareNet 2.0 — Prisma schema for the web/control-plane components.
+//
+// Per ADR-0001, the sandbox uses SQLite as a substitution for the normative
+// Neon PostgreSQL. The schema shape mirrors the production Postgres schema so
+// the migration is mechanical (swap provider + adjust type-specific operators).
+//
+// Models here cover:
+//   - Waitlist (spec/00 §7, ADR-0008)
+//   - User + Role (spec/00 §9)
+//   - Session (spec/00 §11, ADR-0012)
+//   - AuditLog (spec/00 §11, spec/14 §6)
+//   - NodeRecord — accepted AuthenticatedNodeRecords (ADR-0007)
+//   - SequenceFloor — persistent sequence state (spec/14 §3, ADR-0006)
+//   - DemoAccount — isolated demo identities (spec/00 §10, ADR-0009)
+//   - GatewayPolicyRecord — gateway guard policy stub (ADR-0011)
+//
+// IMPORTANT: human accounts (User) are NOT node identities (NodeRecord).
+// They are separate concepts per spec/00 §2 "Identity" invariant.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------
+// Roles
+// ---------------------------------------------------------------------
+
+/// Application authorization role. Per spec/00 §9 these are application
+/// authorization concepts, NOT node capabilities. A user role does not
+/// imply a node capability, and vice versa.
+enum Role {
+  USER
+  RELAY_OPERATOR
+  GATEWAY_OPERATOR
+  CONTENT_PROVIDER
+  STORAGE_PROVIDER
+  COMPUTE_PROVIDER
+  ADMIN
+}
+
+// ---------------------------------------------------------------------
+// Waitlist
+// ---------------------------------------------------------------------
+
+/// Per spec/00 §7: public signup does NOT create an active user account.
+/// Signup creates a PENDING WaitlistEntry. Admin review decides whether
+/// to create a User (ACCOUNT_CREATED) or reject.
+enum WaitlistStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  INVITED
+  ACCOUNT_CREATED
+}
+
+/// Per spec/00 §7 a waitlist entry contains at minimum:
+/// id, email, name, requested_user_type, status, created_at, reviewed_at,
+/// reviewed_by, notes.
+model WaitlistEntry {
+  id                String         @id @default(cuid())
+  email             String         @unique
+  name              String?
+  requestedUserType Role           @default(USER)
+  status            WaitlistStatus @default(PENDING)
+  notes             String?
+  createdAt         DateTime       @default(now())
+  reviewedAt        DateTime?
+  reviewedById      String? // FK to User.id (the admin who reviewed)
+  reviewedBy        User?          @relation("WaitlistReviewer", fields: [reviewedById], references: [id])
+  /// Once an account is created, link to it for audit traceability.
+  /// A waitlist entry can have at most one created user (1:1).
+  createdUserId     String? @unique
+  createdUser       User?          @relation("WaitlistCreatedUser", fields: [createdUserId], references: [id])
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------
+// User
+// ---------------------------------------------------------------------
+
+/// Application user. Distinct from NodeRecord (spec/00 §2 Identity invariant).
+/// A human account is not a node identity.
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  /// bcrypt password hash. Per ADR-0012, cost factor 12.
+  /// NEVER store plaintext. NEVER place in JWT payload.
+  passwordHash  String
+  role          Role      @default(USER)
+  /// Account disable (spec/00 §11). Disabled accounts cannot authenticate.
+  /// All sessions for a disabled user are invalidated.
+  disabled      Boolean   @default(false)
+  disabledAt    DateTime?
+  disabledById  String?
+  disabledBy    User?     @relation("UserDisabledBy", fields: [disabledById], references: [id])
+  isDemo        Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // Relations
+  sessions      Session[]
+  reviewedWaitlist    WaitlistEntry[] @relation("WaitlistReviewer")
+  createdFromWaitlist WaitlistEntry?  @relation("WaitlistCreatedUser")
+  disabledUsers       User[]          @relation("UserDisabledBy")
+  demoAccount        DemoAccount?
+  auditActions       AuditLog[]
+
+  @@index([role])
+  @@index([isDemo])
+}
+
+// ---------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------
+
+/// Per ADR-0012: server-side session store. Token = 32-byte crypto-random,
+/// base64url-encoded. Cookie name `sharenet_session` (HttpOnly, SameSite=Lax,
+/// Secure in production). 24h sliding expiry.
+model Session {
+  id           String   @id @default(cuid())
+  /// base64url(32 random bytes) — the cookie value.
+  token        String   @unique
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
+  /// Last activity timestamp for sliding expiry.
+  lastActivityAt DateTime @default(now())
+  /// IP + user-agent for audit / abuse detection.
+  ip           String?
+  userAgent    String?
+  /// True if this session was issued via demo quick-login (ADR-0009).
+  isDemo       Boolean  @default(false)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ---------------------------------------------------------------------
+// Audit Log
+// ---------------------------------------------------------------------
+
+/// Per spec/00 §11 + spec/14 §6: every auth event, role change, account
+/// disable, waitlist decision, and node acceptance is recorded.
+/// Audit log is append-only — no UPDATE/DELETE.
+enum AuditAction {
+  LOGIN_SUCCESS
+  LOGIN_FAILURE
+  LOGOUT
+  SESSION_EXPIRED
+  ACCOUNT_DISABLED
+  ACCOUNT_ENABLED
+  ROLE_CHANGED
+  PASSWORD_RESET
+  WAITLIST_SUBMITTED
+  WAITLIST_APPROVED
+  WAITLIST_REJECTED
+  WAITLIST_INVITED
+  ACCOUNT_CREATED_FROM_WAITLIST
+  DEMO_LOGIN
+  NODE_RECORD_ACCEPTED
+  NODE_RECORD_REJECTED
+  SEQUENCE_FLOOR_UPDATED
+  ARCHITECTURE_TEST_RUN
+  GATEWAY_POLICY_VIOLATION
+}
+
+model AuditLog {
+  id           String       @id @default(cuid())
+  action       AuditAction
+  actorUserId  String? // null for system-initiated actions
+  actorUser    User?        @relation(fields: [actorUserId], references: [id])
+  targetUserId String?
+  targetEmail  String?
+  targetNodeId String?
+  detail       String? // JSON string with structured context
+  ip           String?
+  userAgent    String?
+  createdAt    DateTime     @default(now())
+
+  @@index([action])
+  @@index([actorUserId])
+  @@index([createdAt])
+}
+
+// ---------------------------------------------------------------------
+// Node Records (AuthenticatedNodeRecord persistence)
+// ---------------------------------------------------------------------
+
+/// Accepted AuthenticatedNodeRecords. Per ADR-0007, the ONLY legal pipeline
+/// to construct one of these is:
+///   NodeAdvertisement → verifyAdvertisement → acceptAdvertisement → here
+/// A RemoteNodeHint MUST NOT be promotable to this table.
+model NodeRecord {
+  /// The NodeId string ("node:" + 64 hex chars).
+  nodeId        String   @id
+  /// Hex of the 32-byte Ed25519 public key.
+  publicKeyHex  String   @unique
+  /// JSON array of capabilities.
+  capabilities  String
+  /// Last accepted sequence number (the current floor).
+  sequence      Int
+  /// Raw hex of the most-recently-accepted advertisement (canonical CBOR).
+  /// Useful for re-broadcast and for offline re-verification.
+  advertisementHex String
+  firstSeenAt   DateTime @default(now())
+  acceptedAt    DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  expiresAt     DateTime
+
+  @@index([expiresAt])
+  @@index([acceptedAt])
+}
+
+// ---------------------------------------------------------------------
+// Sequence Floors (persistent replay protection)
+// ---------------------------------------------------------------------
+
+/// Per spec/14 §3 + ADR-0006: persistent sequence floor per node.
+/// Expiration does NOT reset the floor. Tombstone retains the floor.
+model SequenceFloor {
+  /// NodeId this floor applies to.
+  nodeId            String   @id
+  /// The current maximum accepted sequence number. n <= floor is rejected.
+  currentMaxSequence Int
+  /// Last nonce observed (for duplicate-nonce detection at the floor boundary).
+  lastNonceHex      String?
+  lastAdvancedAt    DateTime @default(now())
+  firstSeenAt       DateTime @default(now())
+
+  @@index([lastAdvancedAt])
+}
+
+// ---------------------------------------------------------------------
+// Demo Account Registry
+// ---------------------------------------------------------------------
+
+/// Per spec/00 §10 + ADR-0009: demo accounts are isolated from real accounts.
+/// This table is a registry of available demo personas with their role
+/// assignments. The User rows themselves carry isDemo=true.
+model DemoAccount {
+  id          String   @id @default(cuid())
+  /// Stable slug used in quick-login URLs (e.g. "relay-operator").
+  slug        String   @unique
+  /// Display name shown on the demo landing page.
+  label       String
+  /// Description of what this demo persona represents.
+  description String
+  /// The role this demo account exercises.
+  role        Role
+  /// The actual User row backing this demo account.
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// Order on the demo landing page.
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------
+// Gateway Policy (stub — ADR-0011)
+// ---------------------------------------------------------------------
+
+/// Per ADR-0011: the first deliverable implements a gateway stub that
+/// ENFORCES all policy/capacity/quota/SSRF guards but does NOT yet forward
+/// to the real Internet (that is Phase 8). This table records the policy.
+model GatewayPolicy {
+  id              String   @id @default(cuid())
+  /// NodeId of the gateway operator's node.
+  gatewayNodeId   String
+  /// Per-peer request quota (requests per window).
+  perPeerQuota    Int      @default(100)
+  /// Global request quota (requests per window).
+  globalQuota     Int      @default(10000)
+  /// Bandwidth limit in bytes per second (0 = unlimited — discouraged).
+  bandwidthBps    Int      @default(1048576)
+  /// Rate limit in requests per second.
+  rateLimitPerSec Int      @default(10)
+  /// Block private IPv4/IPv6 ranges (RFC 1918, loopback, link-local).
+  blockPrivateAddresses Boolean @default(true)
+  /// Block loopback (127.0.0.0/8, ::1).
+  blockLoopback   Boolean  @default(true)
+  /// Block link-local (169.254.0.0/16, fe80::/10).
+  blockLinkLocal  Boolean  @default(true)
+  /// Allowed destination host patterns (JSON array of glob patterns).
+  /// Empty array = deny all (the secure default).
+  allowedDestinationsJson String @default("[]")
+  /// Revoked peer NodeIds (JSON array).
+  revokedPeersJson String   @default("[]")
+  enabled         Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([gatewayNodeId])
+}
+
+/// Records every gateway policy decision (allow / deny + reason) so the
+/// guard layer is auditable. Append-only.
+model GatewayPolicyDecision {
+  id              String   @id @default(cuid())
+  gatewayNodeId   String
+  peerNodeId      String
+  /// The destination the peer requested.
+  destination     String
+  /// ALLOW or DENY.
+  decision        String
+  /// Human-readable reason for the decision.
+  reason          String
+  /// Which guard triggered (e.g. "SSRF", "RATE_LIMIT", "REVOKED_PEER").
+  guard           String?
+  createdAt       DateTime @default(now())
+
+  @@index([gatewayNodeId])
+  @@index([peerNodeId])
+  @@index([createdAt])
+}
