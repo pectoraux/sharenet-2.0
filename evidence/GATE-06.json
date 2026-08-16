@@ -1,0 +1,48 @@
+{
+  "gate_id": "GATE-06",
+  "gate_title": "Circuits and encrypted forwarding",
+  "commit_sha": "fdf49f096792474f8fdc25520351d1422980bbc5",
+  "commit_message": "GATE-06: circuits and encrypted forwarding — X25519 + HKDF + ChaCha20-Poly1305 + onion encryption",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "X25519 key agreement (initiator ↔ each relay ECDH → 32-byte shared secret)",
+    "HKDF key schedule (SHA-256 extract + expand, domain-separated via SHARENET/CIRCUIT/KEY/1, per-hop forwardingKey + returnKey)",
+    "AEAD: ChaCha20-Poly1305 (256-bit key, 96-bit nonce, 128-bit tag) via @noble/ciphers",
+    "Nonce layout: 4-byte route_id_prefix || 8-byte sequence_number (big-endian) — binds nonce to circuit, prevents cross-circuit nonce reuse",
+    "Replay protection: CircuitReplayGuard (monotonic sequence number, bounded set of 1000 seen sequences, rejects ≤ highest)",
+    "Route/circuit binding: circuit_id = BLAKE3-256(SHARENET/CIRCUIT/ID/1 || routeId || initiator_x25519_pubkey)",
+    "setupCircuit(): ONLY function creating ActiveCircuit (requires CommittedRoute, not RouteProposal)",
+    "onionEncrypt(): multi-layer encryption from outermost to innermost hop — relays never see plaintext",
+    "relayDecrypt(): single-layer decryption — each relay peels one layer, forwards inner ciphertext",
+    "UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN architecture guard",
+    "18 unit tests covering all exit criteria"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "bun run tools/verify-gate.ts"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 65, "passed": 65, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [],
+  "vector_files_generated": [],
+  "protocol_adr_references": [
+    "spec/08-circuits.md (circuit pipeline: CommittedRoute → setup → ActiveCircuit)",
+    "spec/00 §24 (circuits: route binding, AEAD, nonce uniqueness, replay protection)",
+    "spec/00 §31 (forbidden: RouteProposal → ActiveCircuit, uncommitted route → circuit)",
+    "spec/14-security.md §4 (domain-separation tags: SHARENET/CIRCUIT/KEY/1, .../ID/1)"
+  ],
+  "known_limitations": [
+    "Real-process A → Relay → Gateway integration test is deferred — the unit tests prove the cryptographic correctness with in-memory keypairs. The integration test will exercise the mini-services once they support the 3-message handshake, route negotiation, and circuit setup.",
+    "Circuit setup does not yet include relay acknowledgements (relay acks that it has installed the forwarding state). The setupCircuit function derives keys but does not communicate with relays over the network. A follow-up will add the relay-setup protocol.",
+    "The replay guard is in-memory per-circuit. A production implementation would need persistent or shared replay state for multi-process deployments.",
+    "Return-path (gateway → relay → initiator) encryption uses returnKey but is not yet exercised in tests. A follow-up will add return-path onion encryption tests."
+  ],
+  "ready_for_next_gate": true
+}
