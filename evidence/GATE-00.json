@@ -1,0 +1,59 @@
+{
+  "gate_id": "GATE-00",
+  "gate_title": "Stabilize the repository",
+  "commit_sha": "19ac4715e386d361d1c0a6ddf700050dad9c876f",
+  "commit_message": "GATE-00: gate infrastructure — verify-gate.ts, CI workflow, MILESTONES.md",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "Fixed every failing unit/architecture test (prior corrective PRs cce207f, 4946b51, 1f6ad58)",
+    "test:unit has no network, database, process, or browser dependency (uses only node:fs, node:child_process for git ls-files, node:path)",
+    "test:arch has no network, database, localhost, mesh, or web-server dependency (uses only @reference/ pure protocol core + node:fs static file reads; gateway check #13 is a static source-text scan, not a runtime import)",
+    "test:integration:mesh owns all sockets/processes (test #25 moved entirely to integration-mesh-tests.ts; never runs in test:arch)",
+    "All conformance vectors are valid JSON (V-NODEID-001, V-NODEID-002, V-NODEID-003, V-CBOR-001)",
+    "Secret scanner covers all tracked files semantically (context-aware patterns: JSON fields, TS properties, dot-access assignments, body extraction; not prose mentions)",
+    "bun install --frozen-lockfile, lint, unit, architecture tests all complete in a clean checkout",
+    "Created tools/verify-gate.ts with 6 checks: valid JSON vectors, no secret material, gate evidence, no skipped-as-passed, no localhost/DB in unit/arch tests, no forbidden transitions",
+    "Created .github/workflows/ci.yml CI workflow running all gate checks",
+    "Created MILESTONES.md tracking all gates GATE-00..GATE-13"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "JSON parse validation for every conformance/vectors/*.json",
+    "bun run tools/verify-gate.ts"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 4, "passed": 4, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "json_vectors": { "total": 4, "valid": 4, "invalid": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [
+    "conformance/vectors/V-NODEID-001.json",
+    "conformance/vectors/V-NODEID-002.json",
+    "conformance/vectors/V-NODEID-003.json",
+    "conformance/vectors/V-CBOR-001.json"
+  ],
+  "vector_files_generated": [],
+  "protocol_adr_references": [
+    "spec/00 §1-40 (thesis, architecture, phases, gates)",
+    "ADR-0001 (local dev SQLite substitution — NOT superseded)",
+    "ADR-0003 (NodeId derivation — CANONICAL, BLAKE3+base32)",
+    "ADR-0013 (three-layer separation: web auth / service / protocol)",
+    "ADR-0014 (LinkId derivation + two-message handshake — INTERIM)",
+    "ADR-0015 (NodeId authority conflict — RESOLVED)",
+    "ADR-0016 (link handshake replay defect + transcript binding — PROPOSAL, not implemented)"
+  ],
+  "known_limitations": [
+    "GATE-01 is BLOCKED: requires an independent Python verifier consuming the same conformance vectors (no such implementation exists yet)",
+    "GATE-03 is BLOCKED: requires Principal Architect approval of ADR-0016 (3-message transcript-binding handshake) before LINK_UP can be achieved",
+    "The current two-message exchange establishes ADV_VERIFIED only, NOT LINK_UP (per spec/04 §4 corrected state machine)",
+    "No reproducible database migrations exist (prisma db push is used, not prisma migrate); the schema is a local development substitution (ADR-0001)",
+    "No cross-language conformance is claimed (only one TypeScript implementation exists)",
+    "The node-link mini-services are local-only (localhost TCP); no real Internet gateway forwarding exists (Phase 8 / GATE-07)"
+  ],
+  "ready_for_next_gate": true
+}
