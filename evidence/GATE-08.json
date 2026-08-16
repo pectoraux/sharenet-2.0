@@ -1,0 +1,43 @@
+{
+  "gate_id": "GATE-08",
+  "gate_title": "Recovery",
+  "commit_sha": "38c38b05f618a85fc7626e125d38b5edbe2908f6",
+  "commit_message": "GATE-08: recovery — link failure detection, route invalidation, alternative gateway discovery, new route/circuit (no TCP migration)",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "Link degradation/down detection (handleLinkEvent with DOWN/DEGRADED status)",
+    "Affected-route invalidation (invalidateRoutesUsingLink → invalidateRoute → invalidate circuit)",
+    "Gateway disappearance handling (handleGatewayDisappearance: all links DOWN + all routes through gateway invalidated)",
+    "Alternative gateway discovery (discoverAlternativeGateways: LINK_UP + capability match + exclude failed + sort by latency)",
+    "Recovery plan creation (createRecoveryPlan: DISCOVER_NEW_GATEWAY / WAIT_FOR_LINK_RECOVERY / NO_RECOVERY_POSSIBLE)",
+    "No claim of arbitrary TCP migration (TCP_MIGRATION_FORBIDDEN architecture guard + recommendation text)",
+    "Full recovery flow: Gateway A disappears → Gateway B discovered → new route → new circuit → new flow (test #10)",
+    "12 unit tests covering all recovery scenarios"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "bun run tools/verify-gate.ts"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 104, "passed": 104, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [],
+  "vector_files_generated": [],
+  "protocol_adr_references": [
+    "spec/00 §9 (Recovery: gateway disappears → route invalidated → gateway discovered → new route → new circuit → new flow)",
+    "spec/00 §22 (Routing: discovery ≠ path validation ≠ route ≠ circuit)",
+    "spec/00 §31 (forbidden: topology → route, proposal → circuit)"
+  ],
+  "known_limitations": [
+    "Real-process recovery integration test is deferred — the unit tests prove the recovery state machine with in-memory state. The integration test will exercise the mini-services (gateway process killed → alternative discovered → new route → new circuit → new flow succeeds).",
+    "The RecoveryManager is in-memory only. A production implementation would need to persist route/circuit health across restarts.",
+    "Link health detection (how DEGRADED is determined — latency thresholds, packet loss) is not yet implemented. The RecoveryManager accepts health events but does not generate them — that's the transport layer's responsibility."
+  ],
+  "ready_for_next_gate": true
+}
