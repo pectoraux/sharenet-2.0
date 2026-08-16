@@ -13,7 +13,7 @@
     "db:reset": "prisma migrate reset",
     "test:unit": "bun test tests/",
     "test:arch": "bun run src/lib/sharenet/run-arch-tests.ts",
-    "test:integration:mesh": "bash mini-services/node-link/start-mesh.sh && sleep 2 && bun run src/lib/sharenet/run-arch-tests.ts"
+    "test:integration:mesh": "bash mini-services/node-link/start-mesh.sh && sleep 2 && bun run src/lib/sharenet/integration-mesh-tests.ts; exit_code=$?; if [ $exit_code -eq 2 ]; then echo '(skipped — mesh unavailable)'; fi; exit $exit_code"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

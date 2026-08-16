@@ -44,9 +44,9 @@ Where:
 
 - `BLAKE3-256` is the BLAKE3 hash function with a 32-byte (256-bit) output.
 - `"SHARENET/NODEID/1"` is the **domain-separation tag**, encoded as
-  ASCII (16 bytes, no NUL terminator). The bytes are
+  ASCII (17 bytes, no NUL terminator). The bytes are
   `53484152454e45542f4e4f444549442f31` in hex.
-- `||` is byte concatenation. The input to BLAKE3 is exactly `16 + 32 = 48` bytes.
+- `||` is byte concatenation. The input to BLAKE3 is exactly `17 + 32 = 49` bytes.
 - `lowercase_unpadded_base32` is RFC 4648 base32 with the lowercase alphabet
   `abcdefghijklmnopqrstuvwxyz234567` and no `=` padding.
 
@@ -100,7 +100,7 @@ scheme and MUST be rejected.
 import { blake3 } from "@noble/hashes/blake3";
 import { utf8ToBytes } from "@noble/hashes/utils";
 
-const DOMAIN_TAG = utf8ToBytes("SHARENET/NODEID/1");  // 16 bytes
+const DOMAIN_TAG = utf8ToBytes("SHARENET/NODEID/1");  // 17 bytes
 
 export function deriveNodeIdBytes(ed25519PublicKey: Uint8Array): Uint8Array {
   if (ed25519PublicKey.length !== 32) {

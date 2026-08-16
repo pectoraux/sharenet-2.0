@@ -356,17 +356,19 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
   // G3: GatewayCapability → automatic authorization impossible
   results.push(
     await runOne(13, "GatewayCapability does NOT grant automatic authorization (spec/00 §31)", "ARCHITECTURE", "spec/00 §31 + spec/09 + ADR-0011", async () => {
-      // The gateway stub enforces policy + quota + SSRF + revocation guards.
-      // A gateway with INTERNET_GATEWAY capability cannot bypass them.
-      // We assert that evaluateGatewayPolicy is the ONLY entry point and
-      // that it always runs the guards (never short-circuits on capability).
-      const gatewayModule: Record<string, unknown> = await import("@/lib/sharenet/gateway");
-      const hasAutoAuthorize = typeof gatewayModule.autoAuthorizeGateway === "function";
-      const hasEvaluatePolicy = typeof gatewayModule.evaluateGatewayPolicy === "function";
+      // STATIC check (no runtime import of @/lib/sharenet/gateway, which
+      // transitively imports @/lib/db / Prisma). Per the corrective milestone
+      // (2026-08-16, B4): test:arch must not initialize Prisma or a database
+      // client. We read the gateway module source as text and assert:
+      //   (a) it exports `evaluateGatewayPolicy` (the guard-enforcing entry point)
+      //   (b) it does NOT export `autoAuthorizeGateway` (a capability-bypass fn)
+      const gatewaySource = readFileSync(join(process.cwd(), "src/lib/sharenet/gateway.ts"), "utf-8");
+      const hasEvaluatePolicy = /export\s+(async\s+)?function\s+evaluateGatewayPolicy\b/.test(gatewaySource);
+      const hasAutoAuthorize = /export\s+(async\s+)?function\s+autoAuthorizeGateway\b/.test(gatewaySource);
       return {
         passed: !hasAutoAuthorize && hasEvaluatePolicy,
-        expected: "no autoAuthorizeGateway function exists; evaluateGatewayPolicy enforces guards",
-        actual: `autoAuthorize exists=${hasAutoAuthorize}, evaluateGatewayPolicy exists=${hasEvaluatePolicy}`,
+        expected: "no autoAuthorizeGateway export exists; evaluateGatewayPolicy export enforces guards",
+        actual: `autoAuthorize export=${hasAutoAuthorize}, evaluateGatewayPolicy export=${hasEvaluatePolicy}`,
       };
     }),
   );
@@ -553,72 +555,11 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
     }),
   );
 
-  // G15: Two real node-link processes complete an advertisement-verification exchange (spec/00 §37)
-  // This is the REAL two-process test. It queries the live node-link mini-services
-  // (ports 3001 + 3002) and asserts that an advertisement-verification exchange can be
-  // established between them via the TCP handshake.
-  results.push(
-    await runOne(25, "two real node-link processes complete advertisement-verification exchange (spec/00 §37)", "ARCHITECTURE", "spec/00 §37 + spec/04 §3.2 + ADR-0014", async () => {
-      // Step 1: check both node processes are reachable.
-      const [aStatus, bStatus] = await Promise.all([
-        fetch("http://localhost:3001/status", { signal: AbortSignal.timeout(2000) }).then((r) => r.json() as Promise<{ ok: boolean; node?: { nodeId: string } }>).catch(() => null),
-        fetch("http://localhost:3002/status", { signal: AbortSignal.timeout(2000) }).then((r) => r.json() as Promise<{ ok: boolean; node?: { nodeId: string } }>).catch(() => null),
-      ]);
-      if (!aStatus?.ok || !bStatus?.ok) {
-        // On Vercel (and any environment without the node-link mini-services
-        // running on localhost), this test cannot run. Mark it as SKIPPED
-        // (not PASSED, not FAILED). Per the corrective milestone (F6):
-        // a skipped test MUST be reported as skipped, never as passed.
-        // The test is a LOCAL INTEGRATION test that proves the protocol
-        // works over real sockets — it must run in an environment where
-        // the mini-services can bind to localhost ports.
-        return {
-          skipped: true as const,
-          reason: `node-link mini-services not reachable on localhost:3001/3002 (expected on Vercel; run 'bash mini-services/node-link/start-mesh.sh' locally)`,
-          expected: "both node-link processes reachable on localhost:3001 + localhost:3002 (local integration test)",
-        };
-      }
-      // Step 2: tell Node A to dial Node B's wire port (7789).
-      const dialRes = await fetch("http://localhost:3001/dial", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ host: "127.0.0.1", port: 7789 }),
-        signal: AbortSignal.timeout(15000),
-      }).then((r) => r.json() as Promise<{ ok: boolean; linkId?: string; reason?: string }>).catch((e) => ({ ok: false, reason: e.message }));
-      if (!dialRes.ok || !dialRes.linkId) {
-        return {
-          passed: false,
-          expected: "Node A dials Node B and establishes ADV_VERIFIED",
-          actual: `dial failed: ${dialRes.reason ?? "no linkId"}`,
-        };
-      }
-      // Step 3: query both nodes' link registries — both should report ADV_VERIFIED.
-      const [aLinks, bLinks] = await Promise.all([
-        fetch("http://localhost:3001/links", { signal: AbortSignal.timeout(2000) }).then((r) => r.json() as Promise<{ links: Array<{ state: string; localNodeId: string; remoteNodeId: string; linkId: string }> }>).catch(() => ({ links: [] })),
-        fetch("http://localhost:3002/links", { signal: AbortSignal.timeout(2000) }).then((r) => r.json() as Promise<{ links: Array<{ state: string; localNodeId: string; remoteNodeId: string; linkId: string }> }>).catch(() => ({ links: [] })),
-      ]);
-      const aUp = aLinks.links.find((l) => l.state === "ADV_VERIFIED");
-      const bUp = bLinks.links.find((l) => l.state === "ADV_VERIFIED");
-      if (!aUp || !bUp) {
-        return {
-          passed: false,
-          expected: "both Node A and Node B report at least one ADV_VERIFIED link",
-          actual: `node-a has ${aLinks.links.length} link(s), node-b has ${bLinks.links.length} link(s)`,
-        };
-      }
-      // Step 4: assert the directional invariant — A's linkId ≠ B's linkId
-      // (A's link is A→B, B's link is B→A — different directions, different IDs).
-      const directional = aUp.linkId !== bUp.linkId;
-      // Step 5: assert mutual NodeId binding — A's link points to B's nodeId, B's to A's.
-      const aSeesB = aUp.remoteNodeId === bStatus.node!.nodeId;
-      const bSeesA = bUp.remoteNodeId === aStatus.node!.nodeId;
-      return {
-        passed: directional && aSeesB && bSeesA,
-        expected: "both nodes ADV_VERIFIED, LinkIds differ (directional), each sees the other's correct NodeId",
-        actual: `directional=${directional}, A→B sees B=${aSeesB}, B→A sees A=${bSeesA}`,
-      };
-    }),
-  );
+  // NOTE: Test #25 (two-process advertisement-verification exchange) has been
+  // MOVED to `src/lib/sharenet/integration-mesh-tests.ts` per the corrective
+  // milestone (2026-08-16, B4). It is a localhost-network integration test
+  // and MUST NOT run in `test:arch` (which must be deterministic, no HTTP,
+  // no localhost, no DB). It runs only under `test:integration:mesh`.
 
   const passed = results.filter((r) => r.status === "passed").length;
   const failed = results.filter((r) => r.status === "failed").length;

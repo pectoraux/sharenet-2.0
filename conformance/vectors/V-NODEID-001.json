@@ -8,7 +8,7 @@
     "name": "BLAKE3-256 + base32",
     "domainTag": "SHARENET/NODEID/1",
     "domainTagBytesHex": "53484152454e45542f4e4f444549442f31",
-    "domainTagEncoding": "ASCII (16 bytes, no NUL terminator)",
+    "domainTagEncoding": "ASCII (17 bytes, no NUL terminator)",
     "hashFunction": "BLAKE3",
     "hashOutputBytes": 32,
     "encoding": "RFC 4648 base32, lowercase, unpadded",
@@ -16,12 +16,11 @@
     "outputLengthChars": 52
   },
   "input": {
-    "ed25519SecretKeyHex": "0000000000000000000000000000000000000000000000000000000000000001",
     "ed25519PublicKeyHex": "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29"
   },
   "intermediate": {
     "hashInputHex": "53484152454e45542f4e4f444549442f314cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29",
-    "hashInputDescription": "utf8(\"SHARENET/NODEID/1\") || Ed25519PublicKey (16 + 32 = 48 bytes)",
+    "hashInputDescription": "utf8(\"SHARENET/NODEID/1\") || Ed25519PublicKey (17 + 32 = 49 bytes)",
     "nodeIdBytesHex": "c577f2e11e5b21067ccadc94619259169a61a4fa8d08d628add0c5a5666051d0"
   },
   "expected": {
@@ -49,5 +48,5 @@
   "computedAt": "2026-08-16",
   "computedBy": "reference/identity/keys.ts (BLAKE3 from @noble/hashes v2.3.0, base32 encoder in reference/identity/keys.ts)",
   "verification": "reference/identity/golden-vectors.ts runIdentityGoldenVectors() asserts all 8 sub-vectors at module load and on every test run.",
-  "notes": "The TEST_SEED is a fixed published test vector. It MUST NOT be used in production. It exists solely so conformance test runners can verify the derivation is byte-stable across implementations (TypeScript, Rust, Go, C, Python)."
+  "notes": "This vector contains ONLY the Ed25519 public key and expected NodeId. It does NOT contain any secret key, seed, or private material. The public key was derived from a fixed test seed for reproducibility, but the seed itself is not included here — conformance vectors must not carry private key material."
 }

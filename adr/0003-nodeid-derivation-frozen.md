@@ -37,7 +37,7 @@ NodeIdText  = lowercase_unpadded_base32( NodeIdBytes )   // RFC 4648
 The canonical NodeId derivation is:
 
 - **Hash function:** BLAKE3-256 (32-byte output)
-- **Domain-separation tag:** `SHARENET/NODEID/1` (ASCII, 16 bytes, no NUL)
+- **Domain-separation tag:** `SHARENET/NODEID/1` (ASCII, 17 bytes, no NUL)
 - **Encoding:** RFC 4648 base32, lowercase, unpadded (no `=` fill)
 - **Output length:** exactly 52 characters from the alphabet `[a-z2-7]`
 - **No prefix:** the retired `node:` prefix is REMOVED. There is no prefix.

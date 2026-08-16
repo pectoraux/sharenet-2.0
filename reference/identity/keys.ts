@@ -33,7 +33,7 @@ export { randomBytes };
 /**
  * Domain-separation tag for NodeId derivation. FROZEN per ADR-0015
  * (Principal-Architect-approved canonical scheme). The tag is the ASCII
- * bytes of "SHARENET/NODEID/1" — 16 bytes, no NUL terminator.
+ * bytes of "SHARENET/NODEID/1" — 17 bytes, no NUL terminator.
  *
  * Per spec/14-security.md §4, this tag is registered and MUST NOT be
  * reused for any other signature/KDF domain.
