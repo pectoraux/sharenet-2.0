@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sharenet.dev/schemas/nodeid-derivation.json",
+  "title": "ShareNet NodeId Derivation Schema",
+  "description": "Canonical NodeId derivation from an Ed25519 public key. Per spec/02-identity.md §2.1 (APPROVED canonical scheme, ADR-0015 RESOLVED).",
+  "type": "object",
+  "required": ["algorithm", "input", "expected"],
+  "properties": {
+    "algorithm": {
+      "type": "object",
+      "required": ["name", "domainTag", "domainTagBytesHex", "domainTagEncoding", "hashFunction", "hashOutputBytes", "encoding", "alphabet", "outputLengthChars"],
+      "properties": {
+        "name": { "type": "string", "const": "BLAKE3-256 + base32" },
+        "domainTag": { "type": "string", "const": "SHARENET/NODEID/1" },
+        "domainTagBytesHex": { "type": "string", "pattern": "^[0-9a-f]{34}$" },
+        "domainTagEncoding": { "type": "string", "const": "ASCII (17 bytes, no NUL terminator)" },
+        "hashFunction": { "type": "string", "const": "BLAKE3" },
+        "hashOutputBytes": { "type": "integer", "const": 32 },
+        "encoding": { "type": "string", "const": "RFC 4648 base32, lowercase, unpadded" },
+        "alphabet": { "type": "string", "const": "abcdefghijklmnopqrstuvwxyz234567" },
+        "outputLengthChars": { "type": "integer", "const": 52 }
+      }
+    },
+    "input": {
+      "type": "object",
+      "required": ["ed25519PublicKeyHex"],
+      "properties": {
+        "ed25519PublicKeyHex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "intermediate": {
+      "type": "object",
+      "properties": {
+        "hashInputHex": { "type": "string", "pattern": "^[0-9a-f]+$" },
+        "hashInputDescription": { "type": "string" },
+        "nodeIdBytesHex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "required": ["nodeIdText", "nodeIdTextLength", "nodeIdTextAlphabet", "nodeIdTextPrefix"],
+      "properties": {
+        "nodeIdText": { "type": "string", "pattern": "^[a-z2-7]{52}$" },
+        "nodeIdTextLength": { "type": "integer", "const": 52 },
+        "nodeIdTextAlphabet": { "type": "string", "const": "[a-z2-7]" },
+        "nodeIdTextPrefix": { "type": "string", "const": "none" }
+      }
+    }
+  }
+}

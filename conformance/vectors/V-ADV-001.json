@@ -1,0 +1,17 @@
+{
+  "id": "V-ADV-001",
+  "status": "ratified",
+  "spec": "spec/03-node-advertisements.md §5",
+  "description": "Valid NodeAdvertisement: correct Ed25519 signature, valid NodeId binding, valid timestamps, canonical CBOR.",
+  "referenceNow": 1786876545,
+  "input": {
+    "advertisementHex": "aa010102783479763337667969366c6d71716d37676b33736b676465737a63326e67646a68327275656e6d6b666e326463326b7a74616b6869610358204cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba2904826a4d4553485f52454c415969444953434f564552590581a30163746370026831302e302e302e3103191e6c0801091a6a8192810a1a6a81a0910b50a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d60c58404507fb45aac73557eaee3d41a416c0bf419c551f94799baec954f08e18810fa5084918f36aec8a4a05e0d95ef8fc3cf8e70eb518f374907710404e2135373802",
+    "expectedNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+    "publicKeyHex": "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29"
+  },
+  "expected": {
+    "verificationResult": "ok",
+    "errorCode": null,
+    "reason": "all checks pass"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "id": "V-ADV-005",
+  "status": "ratified",
+  "spec": "spec/03-node-advertisements.md §5.5",
+  "description": "Sequence rollback: seq=0 after seq=1 accepted.",
+  "referenceNow": 1786876545,
+  "input": {
+    "advertisementHex": "aa010102783479763337667969366c6d71716d37676b33736b676465737a63326e67646a68327275656e6d6b666e326463326b7a74616b6869610358204cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba2904826a4d4553485f52454c415969444953434f564552590581a30163746370026831302e302e302e3103191e6c0800091a6a8192810a1a6a81a0910b50c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f80c58407362937f1bd576004aed39fd1aaf764da6c4a19f06b32e7fd9ee60ada821d3001c6864cef9ce8d027fbe3329f3b81f758aa8b2c0b94e371097718c07b29fc10f",
+    "expectedNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+    "publicKeyHex": "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29",
+    "currentSequenceFloor": 1
+  },
+  "expected": {
+    "verificationResult": "fail",
+    "errorCode": "STALE",
+    "reason": "sequence 0 < floor 1"
+  }
+}

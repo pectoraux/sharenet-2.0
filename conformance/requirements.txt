@@ -1,0 +1,6 @@
+# Python dependencies for the independent conformance vector verifier.
+# Per GATE-01: at least one independent Python verifier for NodeId/CBOR/advertisement vectors.
+# These are the ONLY Python dependencies required to verify conformance vectors.
+blake3>=1.0.0
+cbor2>=5.6.0
+pynacl>=1.5.0

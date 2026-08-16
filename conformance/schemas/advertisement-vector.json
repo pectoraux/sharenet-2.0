@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sharenet.dev/schemas/advertisement-vector.json",
+  "title": "ShareNet NodeAdvertisement Vector Schema",
+  "description": "Conformance vector for NodeAdvertisement verification. Per spec/03-node-advertisements.md and ADR-0007.",
+  "type": "object",
+  "required": ["id", "status", "spec", "description", "input", "expected"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^V-ADV-" },
+    "status": { "type": "string", "enum": ["ratified", "draft", "planned"] },
+    "spec": { "type": "string" },
+    "description": { "type": "string" },
+    "input": {
+      "type": "object",
+      "required": ["advertisementHex"],
+      "properties": {
+        "advertisementHex": { "type": "string", "pattern": "^[0-9a-f]+$" },
+        "expectedNodeId": { "type": "string", "pattern": "^[a-z2-7]{52}$" },
+        "publicKeyHex": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "required": ["verificationResult"],
+      "properties": {
+        "verificationResult": { "type": "string", "enum": ["ok", "fail"] },
+        "errorCode": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

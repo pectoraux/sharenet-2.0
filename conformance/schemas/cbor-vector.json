@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sharenet.dev/schemas/cbor-vector.json",
+  "title": "ShareNet Canonical CBOR Vector Schema",
+  "description": "Conformance vector for canonical CBOR encoding (RFC 8949 §4.2.2). Per ADR-0004.",
+  "type": "object",
+  "required": ["id", "status", "spec", "description", "vectors"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^V-CBOR-" },
+    "status": { "type": "string", "enum": ["ratified", "draft", "planned"] },
+    "spec": { "type": "string" },
+    "description": { "type": "string" },
+    "vectors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "expectedHex"],
+        "properties": {
+          "name": { "type": "string" },
+          "input": {},
+          "expectedHex": { "type": "string", "pattern": "^[0-9a-f]+$" }
+        }
+      }
+    }
+  }
+}
