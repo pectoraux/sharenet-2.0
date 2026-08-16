@@ -12,7 +12,7 @@ Advance only when `ready_for_next_gate: true` and CI verifies the gate evidence.
 | GATE-04 | Discovery and topology hints | ✅ COMPLETE | `26eda87` | `evidence/GATE-04.json` |
 | GATE-05 | Service negotiation and route commitment | ✅ COMPLETE | `9004c0e` | `evidence/GATE-05.json` |
 | GATE-06 | Circuits and encrypted forwarding | ✅ COMPLETE | `fdf49f0` | `evidence/GATE-06.json` |
-| GATE-07 | Mode A Internet gateway | ⏳ PENDING | — | — |
+| GATE-07 | Mode A Internet gateway | ✅ COMPLETE | `997b0a0` | `evidence/GATE-07.json` |
 | GATE-08 | Recovery | ⏳ PENDING | — | — |
 | GATE-09 | Linux transparent networking | ⏳ PENDING | — | — |
 | GATE-10 | Android north-star | ⏳ PENDING | — | — |
