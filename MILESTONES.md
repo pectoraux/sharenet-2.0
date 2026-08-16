@@ -7,7 +7,7 @@ Advance only when `ready_for_next_gate: true` and CI verifies the gate evidence.
 |------|-------|--------|--------|----------|
 | GATE-00 | Stabilize the repository | ✅ COMPLETE | `cac00cc` | `evidence/GATE-00.json` |
 | GATE-01 | Conformance foundation | ✅ COMPLETE | `73eada1` | `evidence/GATE-01.json` |
-| GATE-02 | Identity and persistent advertisement state | ⏳ PENDING | — | — |
+| GATE-02 | Identity and persistent advertisement state | ✅ COMPLETE | `2c6ac24` | `evidence/GATE-02.json` |
 | GATE-03 | Secure authenticated directed links | ⏳ BLOCKED (requires ADR-0016 approval) | — | — |
 | GATE-04 | Discovery and topology hints | ⏳ PENDING | — | — |
 | GATE-05 | Service negotiation and route commitment | ⏳ PENDING | — | — |

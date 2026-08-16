@@ -1,0 +1,63 @@
+{
+  "gate_id": "GATE-02",
+  "gate_title": "Identity and persistent advertisement state",
+  "commit_sha": "2c6ac24537583118037da834bdbb04f6a2d98c3f",
+  "commit_message": "GATE-02: identity and persistent advertisement state — atomic persistence + restart tests",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "Canonical CBOR advertisement encoding (reference/advertisement/advertisement.ts)",
+    "Ed25519 verification (verifyAdvertisement with spec/03 §5 checks: signature, identity binding, timestamp, expiry, canonical encoding)",
+    "Timestamp/TTL/nonce validation (CLOCK_SKEW ±300s, MAX_TTL 86400s, nonce 16 bytes)",
+    "Persistent monotonic peer sequence floors (InMemorySequenceFloorStore with serialize/restore/restart)",
+    "Atomic local persistence abstraction (SequenceFloorStore interface — protocol-core, no hosted DB dependency)",
+    "VerifiedNodeAdvertisement and AuthenticatedNodeRecordStub as distinct types (reference/advertisement/advertisement.ts + sequence-floor.ts)",
+    "No hosted database dependency in reference/ (verified by architecture test #23)",
+    "Restart test: expired advertisements never reset sequence floors (test #7 in gate-02-identity-persistence.test.ts)",
+    "Bad signature, wrong NodeId binding, replay (duplicate), expiry, sequence rollback all fail (tests #1-5)"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "bun run tools/verify-gate.ts",
+    "bun run conformance/runners/ts-vector-runner.ts",
+    "python3 conformance/runners/py_vector_verifier.py",
+    "JSON parse validation for every conformance/vectors/*.json"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 15, "passed": 15, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "ts_vector_runner": { "total": 9, "passed": 9, "failed": 0 },
+    "py_vector_verifier": { "total": 9, "passed": 9, "failed": 0 },
+    "json_vectors": { "total": 9, "valid": 9, "invalid": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [
+    "conformance/vectors/V-NODEID-001.json",
+    "conformance/vectors/V-NODEID-002.json",
+    "conformance/vectors/V-NODEID-003.json",
+    "conformance/vectors/V-CBOR-001.json",
+    "conformance/vectors/V-ADV-001.json",
+    "conformance/vectors/V-ADV-002.json",
+    "conformance/vectors/V-ADV-003.json",
+    "conformance/vectors/V-ADV-004.json",
+    "conformance/vectors/V-ADV-005.json"
+  ],
+  "vector_files_generated": [],
+  "protocol_adr_references": [
+    "spec/02-identity.md §2 (canonical NodeId)",
+    "spec/03-node-advertisements.md §5 (verification checks)",
+    "spec/14-security.md §3 (persistent sequence floors)",
+    "ADR-0006 (sequence floor persistence — expiration does NOT reset)",
+    "ADR-0007 (AuthenticatedNodeRecord pipeline)",
+    "ADR-0013 (three-layer separation — reference/ is DB-free)"
+  ],
+  "known_limitations": [
+    "GATE-03 is BLOCKED: requires Principal Architect approval of ADR-0016 (3-message transcript-binding handshake) before LINK_UP can be achieved",
+    "The InMemorySequenceFloorStore is suitable for tests and single-process reference implementations; production multi-process deployments need the Prisma-backed implementation in src/lib/sharenet/sequence-floor.ts",
+    "No reproducible database migrations exist yet (prisma db push is used, not prisma migrate); the schema is a local development substitution (ADR-0001)"
+  ],
+  "ready_for_next_gate": true
+}
