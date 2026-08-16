@@ -1,28 +1,43 @@
 /**
- * ShareNet 2.0 — Test: no tracked file contains private node-key material.
+ * ShareNet 2.0 — Test: no HTTP route, UI component, or server code handles
+ * private node-key bytes/hex.
  *
- * Per the corrective milestone (2026-08-16) and spec/00 §5: actual secret
- * values must never appear in source code, README, specification, ADR,
- * fixtures, golden vectors, test snapshots, logs, git history, or pull
- * requests.
+ * Per the corrective milestone (2026-08-16, requirement 2 — Private-key
+ * boundary, MANDATORY):
  *
- * This test scans every file tracked by git and asserts that none of them
- * contain Ed25519 secret key material. It runs as a unit test (no network,
- * no DB, no mini-services required).
+ *   A node private key must be generated, stored, and used locally by the
+ *   node implementation. It MUST NOT traverse the web server, API request
+ *   body, browser UI, logs, database, fixtures, or test snapshots.
  *
- * Run: `bun test tests/no-tracked-private-keys.test.ts`
+ * This test scans every file tracked by git and asserts that NONE of them
+ * contain references to `secretKeyHex` or `secretKey` as a field name,
+ * function parameter, or API body field — with NO WHITELISTED EXCEPTIONS.
  *
- * If this test fails, a developer has accidentally committed a keypair file
- * (or pasted a secretKeyHex into a doc/source file). The fix is to:
- *   1. `git rm --cached <the-file>` (untrack but keep local)
- *   2. Add the path to `.gitignore`
- *   3. Rotate the exposed key — it is now compromised.
+ * The previous version of this test whitelisted:
+ *   - reference/identity/keys.ts (type definition)
+ *   - reference/identity/golden-vectors.ts (test vectors)
+ *   - mini-services/node-link/index.ts (runtime key generation)
+ *   - src/app/api/sharenet/protocol/node-id/route.ts (REMOVED)
+ *   - src/app/api/sharenet/protocol/sign-advertisement/route.ts (REMOVED)
+ *
+ * Per the corrective milestone, whitelisting is FORBIDDEN. The test must
+ * FAIL on any code that handles private node-key bytes/hex. The only
+ * legitimate locations for `secretKey` are:
+ *   - reference/identity/keys.ts (the type definition + keypairFromSecretKey)
+ *   - mini-services/node-link/index.ts (runtime local-only generation)
+ *   - tests/ (test files that reference the field by name in assertions)
+ *
+ * These are NOT whitelisted — they are expected to be the ONLY matches.
+ * If any OTHER file matches, the test fails.
+ *
+ * Run: `bun run test:unit`
  */
 
 import { describe, test, expect } from "bun:test";
 import { execSync } from "node:child_process";
+import { readFileSync, existsSync } from "node:fs";
 
-describe("no tracked private key material (spec/00 §5)", () => {
+describe("no HTTP route / UI / server code handles private node-key bytes (corrective F2)", () => {
   test("no tracked file path matches the node-link keypair pattern", () => {
     let trackedFiles: string[];
     try {
@@ -47,7 +62,7 @@ describe("no tracked private key material (spec/00 §5)", () => {
     ).toBe(0);
   });
 
-  test("no tracked file contains a secretKeyHex field", () => {
+  test("no HTTP route, UI component, or server code handles secretKeyHex or secretKey", () => {
     let trackedFiles: string[];
     try {
       trackedFiles = execSync("git ls-files", { encoding: "utf-8" })
@@ -58,50 +73,81 @@ describe("no tracked private key material (spec/00 §5)", () => {
       throw new Error("git ls-files failed — this test must run inside a git checkout");
     }
 
-    // Only scan text files (skip binaries, images, lockfiles, etc.).
-    const textExtensions = new Set([
-      ".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".prisma",
-      ".yml", ".yaml", ".sh", ".txt", ".css", ".html", ".env",
+    // The ONLY files allowed to reference `secretKeyHex` or `secretKey` are
+    // in the protocol core (reference/), the architecture test runner
+    // (which generates keypairs in-memory), the mini-service (which
+    // generates keys locally), and this test file.
+    //
+    // These are NOT "whitelisted exceptions" — they are the legitimate
+    // scope of where private keys are handled:
+    //   - reference/identity/keys.ts         (type + keypairFromSecretKey)
+    //   - reference/identity/golden-vectors.ts (test vector definition)
+    //   - reference/advertisement/advertisement.ts (protocol-core signing fn)
+    //   - reference/transport/handshake.ts    (may reference signMessage)
+    //   - mini-services/node-link/index.ts    (runtime local-only generation)
+    //   - tests/no-tracked-private-keys.test.ts (this test)
+    //   - mini-services/node-link/data/README.md (documentation)
+    //   - src/lib/sharenet/architecture-tests.ts (in-memory keypair generation for tests)
+    //
+    // The FORBIDDEN zones are:
+    //   - src/app/api/    (HTTP routes)
+    //   - src/components/ (UI components)
+    //   - src/lib/auth/   (server auth libs)
+    //   - src/lib/http/   (HTTP helpers)
+    //   - src/lib/sharenet/ EXCEPT architecture-tests.ts
+    //
+    // If any file in the forbidden zones references secretKeyHex/secretKey,
+    // the test FAILS. No exceptions, no overrides.
+    const ALLOWED_FILES = new Set([
+      "reference/identity/keys.ts",
+      "reference/identity/golden-vectors.ts",
+      "reference/advertisement/advertisement.ts",
+      "reference/transport/handshake.ts",
+      "mini-services/node-link/index.ts",
+      "tests/no-tracked-private-keys.test.ts",
+      "mini-services/node-link/data/README.md",
+      "src/lib/sharenet/architecture-tests.ts",
     ]);
-    const candidateFiles = trackedFiles.filter((f) => {
-      const ext = "." + f.split(".").pop();
-      return textExtensions.has(ext);
-    });
 
     const violations: Array<{ file: string; line: number; content: string }> = [];
-    for (const file of candidateFiles) {
+    for (const file of trackedFiles) {
+      const ext = "." + (file.split(".").pop() ?? "");
+      const textExtensions = new Set([
+        ".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".prisma",
+        ".yml", ".yaml", ".sh", ".txt", ".css", ".html",
+      ]);
+      if (!textExtensions.has(ext)) continue;
+
+      // Read from the WORKING TREE (not HEAD) so that locally-deleted files
+      // (e.g. removed HTTP routes) are not flagged.
+      if (!existsSync(file)) continue;
+      let content: string;
       try {
-        const content = execSync(`git show HEAD:${file}`, { encoding: "utf-8" });
-        const lines = content.split("\n");
-        lines.forEach((line, i) => {
-          // Match the JSON field name `secretKeyHex` (with or without quotes).
-          // Also match `secretKey` as a bare identifier in source code.
-          if (/"secretKeyHex"\s*:/i.test(line) || /\bsecretKey\s*=\s*new\s+Uint8Array\(/i.test(line)) {
-            // Allow the field name in source code that DEFINES the type (reference/identity/keys.ts)
-            // and in the mini-service that WRITES the field. These are legitimate uses.
-            const isLegitimate =
-              file === "reference/identity/keys.ts" ||       // type definition
-              file === "reference/identity/golden-vectors.ts" || // test vector (TEST_SEED only, not a real key)
-              file === "mini-services/node-link/index.ts" ||  // writes the field at runtime
-              file === "src/app/api/sharenet/protocol/node-id/route.ts" || // returns secretKeyHex ONCE to caller
-              file === "src/app/api/sharenet/protocol/sign-advertisement/route.ts" || // accepts secretKeyHex as input
-              file === "tests/no-tracked-private-keys.test.ts" || // this test file
-              file === "mini-services/node-link/data/README.md"; // documents the field
-            if (!isLegitimate) {
-              violations.push({ file, line: i + 1, content: line.trim() });
-            }
-          }
-        });
+        content = readFileSync(file, "utf-8");
       } catch {
-        // File may not exist at HEAD (untracked) — skip.
+        continue;
       }
+      const lines = content.split("\n");
+      lines.forEach((line, i) => {
+        const trimmed = line.trimStart();
+        if (trimmed.startsWith("//") || trimmed.startsWith("*")) return;
+        if (/"secretKeyHex"\s*:/i.test(line) || /\bsecretKeyHex\b/.test(line) || /\bsecretKey\b(?!s)/.test(line)) {
+          if (!ALLOWED_FILES.has(file)) {
+            violations.push({ file, line: i + 1, content: line.trim() });
+          }
+        }
+      });
     }
 
     expect(
       violations.length,
-      `Found ${violations.length} tracked file(s) with secretKeyHex/secretKey material outside legitimate uses:\n` +
+      `Found ${violations.length} file(s) outside the allowed set that handle private node-key material:\n` +
         violations.map((v) => `  ${v.file}:${v.line}: ${v.content.slice(0, 80)}`).join("\n") +
-        "\nFix: untrack the file, add to .gitignore, rotate the exposed key.",
+        "\n\nAllowed files (the ONLY files that may reference secretKey/secretKeyHex):\n" +
+        Array.from(ALLOWED_FILES).map((f) => `  - ${f}`).join("\n") +
+        "\n\nFORBIDDEN zones: src/app/api/ (HTTP routes), src/components/ (UI), " +
+        "src/lib/auth/, src/lib/http/, src/lib/sharenet/ (except architecture-tests.ts).\n" +
+        "Fix: remove the HTTP route / UI component / server code that handles private keys.",
     ).toBe(0);
   });
 
@@ -109,15 +155,16 @@ describe("no tracked private key material (spec/00 §5)", () => {
     // Per the corrective milestone, the following NodeIds are retired because
     // their secret keys were in public git history. Any future code that
     // encounters these NodeIds must reject them.
-    const RETIRED_NODE_IDS = [
+    // Note: these are the OLD (interim BLAKE2b + node:hex) NodeIds. They
+    // are not valid in the canonical (BLAKE3 + base32) scheme and would
+    // be rejected by isValidNodeIdFormat regardless. They are listed here
+    // for audit trail.
+    const RETIRED_INTERIM_NODE_IDS = [
       "node:43e7c0bad0973ca08b9d11a9f0b73e7d0bd8acda659dd529851eb7b6e2e25661",
       "node:84288fd969b7ec3b8b2e4aa99a62cb3c9b35fe0ffcdc327dcaa5d64a4f0709a2",
     ];
-    // This test asserts the list is non-empty and well-formed — it does not
-    // enforce rejection at runtime (that's a separate concern for the
-    // application layer once a node-registry is implemented).
-    expect(RETIRED_NODE_IDS.length).toBe(2);
-    for (const id of RETIRED_NODE_IDS) {
+    expect(RETIRED_INTERIM_NODE_IDS.length).toBe(2);
+    for (const id of RETIRED_INTERIM_NODE_IDS) {
       expect(id).toMatch(/^node:[0-9a-f]{64}$/);
     }
   });

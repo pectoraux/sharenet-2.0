@@ -1,14 +1,22 @@
 /**
- * Golden vectors for identity: Ed25519 keypair + NodeId derivation.
+ * ShareNet 2.0 — Canonical NodeId Golden Vectors (BLAKE3 + base32).
  *
- * Per spec/17-conformance.md §2.2, these vectors MUST be reproducible across
- * every ShareNet implementation. The NodeId derivation (spec/02 §2.1, ADR-0003)
- * is FROZEN — any implementation that produces a different NodeId for the
- * same seed is non-conformant.
+ * Per spec/02-identity.md §2.1 (APPROVED canonical scheme, ADR-0015 RESOLVED):
  *
- * The seed below is a fixed, published test vector. It MUST NOT be used in
- * production. It exists solely so that conformance test runners can verify
- * the derivation is byte-stable.
+ *   NodeIdBytes = BLAKE3-256( utf8("SHARENET/NODEID/1") || Ed25519PublicKey )
+ *   NodeIdText  = lowercase unpadded RFC 4648 base32 of NodeIdBytes
+ *
+ * These vectors are FROZEN. Any conformant implementation MUST produce
+ * these exact bytes for these exact inputs. The interim BLAKE2b-256 +
+ * "node:"-hex vectors are RETIRED (see ADR-0015 resolution).
+ *
+ * The TEST_SEED below is a fixed, published test vector. It MUST NOT be
+ * used in production. It exists so that conformance test runners can
+ * verify the derivation is byte-stable.
+ *
+ * These vectors are language-neutral: the same Ed25519 public key +
+ * BLAKE3-256 + RFC 4648 base32 in any conformant implementation (Rust,
+ * Go, C, Python) MUST produce the identical NodeIdText.
  */
 
 import {
@@ -47,14 +55,27 @@ export const TEST_PUBLIC_KEY_HEX =
   "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29";
 
 /**
- * Expected NodeId for the test seed.
+ * Expected NodeIdBytes (BLAKE3-256 output, 32 bytes) for the test seed.
  *
- * FROZEN: computed once via BLAKE2b-256("sharenet-node-id-v1" || TEST_PUBLIC_KEY).
- * Any change indicates a regression in either the derivation domain string
- * (ADR-0003) or the underlying hash/curve libraries.
+ * FROZEN: BLAKE3-256("SHARENET/NODEID/1" || TEST_PUBLIC_KEY).
+ * Any change indicates a regression in the derivation domain tag
+ * (ADR-0015) or the underlying hash library.
+ */
+export const EXPECTED_NODE_ID_BYTES_HEX =
+  "c577f2e11e5b21067ccadc94619259169a61a4fa8d08d628add0c5a5666051d0";
+
+/**
+ * Expected NodeIdText (canonical NodeId) for the test seed.
+ *
+ * FROZEN: lowercase unpadded RFC 4648 base32 of EXPECTED_NODE_ID_BYTES.
+ * Exactly 52 characters [a-z2-7]. No "node:" prefix. No hex. No padding.
+ *
+ * Any change indicates a regression in either the BLAKE3 derivation, the
+ * domain tag, or the base32 encoder. This is the single most important
+ * stability guarantee in the protocol.
  */
 export const EXPECTED_NODE_ID =
-  "node:824d26d78fa3b39119eaedfa513d98b254d788f8b9c22f428c8a0895bbb5fd2d";
+  "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia";
 
 /**
  * Computed-at-load golden keypair. We compute it at module load so that
@@ -66,10 +87,8 @@ export const GOLDEN_KEYPAIR: NodeKeypair = keypairFromSecretKey(TEST_SEED);
 /**
  * Golden NodeId vector — recomputed at module load from TEST_SEED.
  *
- * The expected hex below is frozen: it was computed once using
- * BLAKE2b-256("sharenet-node-id-v1" || publicKey(TEST_SEED)) and recorded.
- * Any change to this value indicates a derivation regression or a
- * crypto library upgrade that MUST be audited.
+ * MUST equal EXPECTED_NODE_ID. The architecture regression test asserts
+ * this at module load and on every test run.
  */
 export const GOLDEN_NODE_ID = GOLDEN_KEYPAIR.nodeId;
 
@@ -86,12 +105,14 @@ export interface IdentityVectorResult {
  *
  * Vectors checked:
  *   1. TEST_SEED produces a stable public key (recorded in TEST_PUBLIC_KEY_HEX).
- *   2. NodeId derivation is deterministic: re-deriving from the same public key
- *      yields the same NodeId.
- *   3. NodeId binding verification accepts the correct binding.
- *   4. NodeId binding verification REJECTS an incorrect binding (different key).
- *   5. NodeId format validation accepts canonical NodeIds.
- *   6. NodeId format validation rejects malformed strings.
+ *   2. NodeIdBytes = BLAKE3-256(tag || publicKey) matches EXPECTED_NODE_ID_BYTES_HEX.
+ *   3. NodeIdText matches EXPECTED_NODE_ID (the FROZEN base32 vector).
+ *   4. NodeId derivation is deterministic (re-deriving yields the same NodeId).
+ *   5. NodeId binding verification accepts the correct binding.
+ *   6. NodeId binding verification REJECTS an incorrect binding (different key).
+ *   7. NodeId format validation accepts canonical NodeIds.
+ *   8. NodeId format validation rejects malformed strings (wrong length, wrong
+ *      alphabet, non-canonical trailing bits, "node:" prefix, hex).
  */
 export function runIdentityGoldenVectors(): IdentityVectorResult[] {
   const results: IdentityVectorResult[] = [];
@@ -109,19 +130,31 @@ export function runIdentityGoldenVectors(): IdentityVectorResult[] {
       "or a test-seed modification — both require audit.",
   });
 
-  // Vector 1b: NodeId derivation MUST match the FROZEN value above.
+  // Vector 1b: NodeIdBytes matches the FROZEN hex.
+  // We re-derive the bytes by decoding the NodeIdText (base32 → bytes).
+  const nodeIdBytesHex = bytesToHex(decodeBase32(GOLDEN_NODE_ID));
   results.push({
-    name: "node-id-matches-frozen-vector",
+    name: "node-id-bytes-match-frozen",
+    passed: nodeIdBytesHex === EXPECTED_NODE_ID_BYTES_HEX,
+    actual: nodeIdBytesHex,
+    expected: EXPECTED_NODE_ID_BYTES_HEX,
+    description:
+      "BLAKE3-256(\"SHARENET/NODEID/1\" || TEST_PUBLIC_KEY) MUST equal the FROZEN " +
+      "NodeIdBytes hex. A change indicates a derivation regression (ADR-0015).",
+  });
+
+  // Vector 2: NodeIdText matches the FROZEN value.
+  results.push({
+    name: "node-id-text-matches-frozen-vector",
     passed: GOLDEN_NODE_ID === EXPECTED_NODE_ID,
     actual: GOLDEN_NODE_ID,
     expected: EXPECTED_NODE_ID,
     description:
-      "BLAKE2b-256(\"sharenet-node-id-v1\" || TEST_PUBLIC_KEY) MUST equal the FROZEN NodeId " +
-      "hex recorded above. A change indicates a derivation regression (ADR-0003) — this is " +
-      "the single most important stability guarantee in the protocol.",
+      "The canonical NodeIdText (52 lowercase base32 chars) MUST equal the FROZEN vector. " +
+      "A change indicates a regression in BLAKE3, the domain tag, or the base32 encoder.",
   });
 
-  // Vector 2: NodeId derivation is deterministic
+  // Vector 3: NodeId derivation is deterministic.
   const derivedAgain = deriveNodeId(GOLDEN_KEYPAIR.publicKey);
   results.push({
     name: "node-id-deterministic",
@@ -132,7 +165,7 @@ export function runIdentityGoldenVectors(): IdentityVectorResult[] {
       "Calling deriveNodeId twice on the same public key MUST yield the same NodeId.",
   });
 
-  // Vector 3: NodeId binding verification accepts correct binding
+  // Vector 4: NodeId binding verification accepts correct binding.
   const bindingOk = verifyNodeIdBinding(GOLDEN_NODE_ID, GOLDEN_KEYPAIR.publicKey);
   results.push({
     name: "node-id-binding-accepts-correct",
@@ -144,7 +177,7 @@ export function runIdentityGoldenVectors(): IdentityVectorResult[] {
       "derivation of the given public key.",
   });
 
-  // Vector 4: NodeId binding verification rejects an incorrect binding
+  // Vector 5: NodeId binding verification rejects an incorrect binding.
   const otherKeypair = generateNodeKeypair();
   const bindingReject = verifyNodeIdBinding(GOLDEN_NODE_ID, otherKeypair.publicKey);
   results.push({
@@ -158,7 +191,7 @@ export function runIdentityGoldenVectors(): IdentityVectorResult[] {
       "spec/02 §3 enforcement: a node cannot claim an arbitrary NodeId.",
   });
 
-  // Vector 5: NodeId format validation accepts canonical NodeIds
+  // Vector 6: NodeId format validation accepts canonical NodeIds.
   const formatOk = isValidNodeIdFormat(GOLDEN_NODE_ID);
   results.push({
     name: "node-id-format-accepts-canonical",
@@ -166,31 +199,44 @@ export function runIdentityGoldenVectors(): IdentityVectorResult[] {
     actual: String(formatOk),
     expected: "true",
     description:
-      "isValidNodeIdFormat accepts strings of form 'node:' + 64 lowercase hex chars.",
+      "isValidNodeIdFormat accepts strings of exactly 52 lowercase base32 chars [a-z2-7] " +
+      "with canonical (zero) trailing bits.",
   });
 
-  // Vector 6: NodeId format validation rejects malformed strings
+  // Vector 7: NodeId format validation rejects malformed strings.
   const malformedExamples = [
     "", // empty
-    "node:", // missing hash
-    "node:abc", // too short
-    "node:ZZZZ0000000000000000000000000000000000000000000000000000000000", // uppercase/non-hex
-    "notnode:abcdef0000000000000000000000000000000000000000000000000000000000", // wrong prefix
-    "node:abcdef0000000000000000000000000000000000000000000000000000000000extra", // too long
+    "a".repeat(51), // too short
+    "a".repeat(53), // too long
+    "A".repeat(52), // uppercase (not lowercase)
+    "1".repeat(52), // '1' is not in base32 alphabet [a-z2-7]
+    "0".repeat(52), // '0' is not in base32 alphabet
+    "8".repeat(52), // '8' is not in base32 alphabet
+    "node:" + "a".repeat(52), // old prefix scheme — MUST be rejected
+    "node:" + "0".repeat(64), // old hex scheme — MUST be rejected
   ];
-  const allMalformedRejected = malformedExamples.every((s) => !isValidNodeIdFormat(s));
+  // A truly non-canonical NodeId: same as GOLDEN but with the last char
+  // replaced by one whose low 4 bits are non-zero. 'b' = 1, so 1 & 0x0f = 1 ≠ 0.
+  const nonCanonical = GOLDEN_NODE_ID.slice(0, 51) + "b";
+  const allMalformedRejected =
+    malformedExamples.every((s) => !isValidNodeIdFormat(s)) &&
+    !isValidNodeIdFormat(nonCanonical);
   results.push({
     name: "node-id-format-rejects-malformed",
     passed: allMalformedRejected,
-    actual: `rejected ${malformedExamples.filter((s) => !isValidNodeIdFormat(s)).length}/${malformedExamples.length}`,
-    expected: `rejected ${malformedExamples.length}/${malformedExamples.length}`,
+    actual: `rejected ${malformedExamples.filter((s) => !isValidNodeIdFormat(s)).length}/${malformedExamples.length} + non-canonical=${!isValidNodeIdFormat(nonCanonical)}`,
+    expected: `rejected ${malformedExamples.length}/${malformedExamples.length} + non-canonical=true`,
     description:
-      "isValidNodeIdFormat MUST reject empty strings, wrong prefixes, wrong lengths, " +
-      "and non-hex characters.",
+      "isValidNodeIdFormat MUST reject: empty, wrong length, uppercase, non-base32 chars, " +
+      "old 'node:' prefix scheme, old hex scheme, and non-canonical trailing bits " +
+      "(last char low 4 bits non-zero).",
   });
 
   return results;
 }
+
+// Local import to avoid circular dependency at module load.
+import { base32ToBytes as decodeBase32 } from "./keys";
 
 /** Re-export keypair for direct use by tests/debugging. */
 export { GOLDEN_KEYPAIR as GOLDEN_IDENTITY };

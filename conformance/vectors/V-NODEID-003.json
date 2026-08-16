@@ -1,0 +1,21 @@
+{
+  "id": "V-NODEID-003",
+  "status": "ratified",
+  "spec": "spec/02-identity.md §2.2 (format)",
+  "description": "NodeId format validation: isValidNodeIdFormat MUST reject malformed NodeId strings. These include the retired 'node:' + hex scheme, wrong length, uppercase, non-base32 characters, and non-canonical trailing bits.",
+  "canonicalTrailingBitsRule": "The last base32 character encodes 5 bits. For a 32-byte (256-bit) input encoded into 52 base32 chars (260 bits), 4 bits are leftover. These 4 leftover bits occupy the LOW 4 bit positions of the last char's 5-bit value; they MUST be zero. The 1 meaningful bit occupies the MSB (bit 4). Valid last-char values: 0 ('a') or 16 ('q'). Any other value indicates a non-canonical NodeId and MUST be rejected.",
+  "cases": [
+    { "input": "", "expected": false, "reason": "empty string" },
+    { "input": "a".repeat(51), "expected": false, "reason": "51 chars (too short)" },
+    { "input": "a".repeat(52), "expected": true, "reason": "52 lowercase base32 chars, last char 'a' = 0 (low 4 bits zero)" },
+    { "input": "a".repeat(51) + "q", "expected": true, "reason": "52 lowercase base32 chars, last char 'q' = 16 (low 4 bits zero, MSB bit set)" },
+    { "input": "a".repeat(53), "expected": false, "reason": "53 chars (too long)" },
+    { "input": "A".repeat(52), "expected": false, "reason": "uppercase (not lowercase)" },
+    { "input": "1".repeat(52), "expected": false, "reason": "'1' is not in base32 alphabet [a-z2-7]" },
+    { "input": "0".repeat(52), "expected": false, "reason": "'0' is not in base32 alphabet [a-z2-7]" },
+    { "input": "8".repeat(52), "expected": false, "reason": "'8' is not in base32 alphabet [a-z2-7]" },
+    { "input": "node:" + "a".repeat(52), "expected": false, "reason": "retired 'node:' prefix scheme — MUST be rejected" },
+    { "input": "node:824d26d78fa3b39119eaedfa513d98b254d788f8b9c22f428c8a0895bbb5fd2d", "expected": false, "reason": "retired 'node:' + hex scheme — MUST be rejected" },
+    { "input": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhib", "expected": false, "reason": "non-canonical trailing bits: last char 'b' = 1, low 4 bits = 0001 ≠ 0" }
+  ]
+}

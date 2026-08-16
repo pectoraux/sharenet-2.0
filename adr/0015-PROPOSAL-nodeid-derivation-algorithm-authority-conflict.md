@@ -1,11 +1,39 @@
-# ADR-0015 — PROPOSAL: NodeId Derivation Algorithm Authority Conflict
+# ADR-0015 — RESOLVED: NodeId Derivation Algorithm Authority Conflict
 
-**Date:** 2026-08-16
-**Status:** PROPOSAL — awaiting Principal Architect decision. **Do not implement.**
+**Date:** 2026-08-16 (PROPOSAL); 2026-08-16 (RESOLVED)
+**Status:** RESOLVED — Principal Architect approved the canonical scheme.
 
-## Context
+## Resolution
 
-The master implementation prompt (spec/00 §13 "Identity") instructs:
+The Principal Architect has reviewed the conflict inventory below and
+**APPROVED** the following canonical NodeId derivation:
+
+```
+NodeIdBytes = BLAKE3-256( utf8("SHARENET/NODEID/1") || Ed25519PublicKey )
+NodeIdText  = lowercase_unpadded_base32( NodeIdBytes )   // RFC 4648
+```
+
+Properties:
+- `Ed25519PublicKey` is exactly 32 raw bytes.
+- `NodeIdText` is exactly 52 lowercase base32 characters `[a-z2-7]`.
+- No `node:` prefix. No hex. No padding.
+- The interim BLAKE2b-256 + `node:` + hex scheme is **RETIRED**.
+- No dual parsing, no fallback derivation, no silent migration.
+- The interim test/development NodeIds are retired.
+
+This ADR is now CLOSED. The canonical scheme is recorded in:
+- `spec/02-identity.md` §2 (normative specification)
+- `adr/0003-nodeid-derivation-frozen.md` (the decision ADR)
+- `conformance/vectors/V-NODEID-001.json` (frozen vector)
+- `reference/identity/keys.ts` (implementation)
+
+---
+
+## Original PROPOSAL (preserved for audit trail)
+
+### Context
+
+The master implementation prompt (spec/00 §13 "Identity") instructed:
 
 > Use: Ed25519 signing key
 > and derive: NodeId
@@ -18,31 +46,15 @@ SHA-3, or another). It delegated that choice to the specification phase but
 required the choice be frozen once made.
 
 In the course of building the first deliverable, the build orchestrator
-**unilaterally selected BLAKE2b-256** and froze it across:
+**unilaterally selected BLAKE2b-256** and froze it across spec/02, ADR-0003,
+reference/identity/keys.ts, golden-vectors.ts, and all dependent code.
 
-- `spec/02-identity.md` §2.1 — "NodeId = BLAKE2b-256(\"sharenet-node-id-v1\" ‖ pk)"
-- `spec/02-identity.md` §2.1 — "BLAKE2b-256 is the only hash permitted for this derivation. SHA-256 is reserved for hash chains"
-- `adr/0003-nodeid-derivation-frozen.md` — "Decision: NodeId = \"node:\" + hex(BLAKE2b-256(...))"
-- `reference/identity/keys.ts` — `import { blake2b } from "@noble/hashes/blake2.js"` + `deriveNodeId()` implementation
-- `reference/identity/golden-vectors.ts` — `EXPECTED_NODE_ID` frozen hex vector computed from BLAKE2b-256
-- `reference/advertisement/advertisement.ts` — signature verification depends on the NodeId binding (which depends on the derivation)
-- `reference/transport/handshake.ts` — peer authentication depends on advertisement verification
-- All persisted `NodeRecord` and `SequenceFloor` rows in the database — keyed by NodeId
-- All accepted links in the mini-service in-memory registries — keyed by NodeId
+This was a **protocol-authority violation** per spec/00 §3 (Protocol-First
+Rule) and §35 (Stop Conditions): the choice of hash algorithm is a
+cryptographic primitive decision that should have been escalated as a
+proposal, not frozen as a decision.
 
-This is a **protocol-authority violation** per spec/00 §3 (Protocol-First Rule)
-and §35 (Stop Conditions):
-
-> STOP and request architectural review if you encounter:
->   ambiguous identity semantics
->   ambiguous canonical encoding
->   cryptographic primitive substitution
-
-The choice of hash algorithm is a cryptographic primitive decision. The
-build orchestrator is not the Principal Architect. The choice should have
-been escalated as a proposal, not frozen as a decision.
-
-## Exact current wire behavior (as implemented)
+### Exact current wire behavior (as implemented, interim)
 
 ```text
 deriveNodeId(publicKey: Uint8Array[32]) -> string
@@ -52,24 +64,12 @@ deriveNodeId(publicKey: Uint8Array[32]) -> string
   return "node:" + lowercase_hex(hash)                  // 71 chars total
 ```
 
-Concrete golden vector (from `reference/identity/golden-vectors.ts`):
+### Affected code, schemas, vectors, persistence, and links
 
-```text
-TEST_SEED (hex)        = 0000000000000000000000000000000000000000000000000000000000000001
-TEST_PUBLIC_KEY (hex)  = 4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29
-EXPECTED_NODE_ID       = node:824d26d78fa3b39119eaedfa513d98b254d788f8b9c22f428c8a0895bbb5fd2d
-```
+If the Principal Architect chose a different algorithm, the following
+must change in lockstep:
 
-Any conformant implementation MUST produce this exact NodeId for this exact
-seed. Any implementation producing a different value is non-conformant with
-the current (possibly illegitimate) frozen derivation.
-
-## Affected code, schemas, vectors, persistence, and links
-
-If the Principal Architect chooses a different algorithm (e.g. SHA-256 or
-SHA-3-256), the following must change in lockstep:
-
-### Code (Layer 3 — protocol core)
+#### Code (Layer 3 — protocol core)
 - `reference/identity/keys.ts` — `deriveNodeId()` body, `NODE_ID_DOMAIN` constant
 - `reference/identity/golden-vectors.ts` — `TEST_PUBLIC_KEY_HEX`, `EXPECTED_NODE_ID`
 - `reference/advertisement/advertisement.ts` — `verifyAdvertisement()` calls `verifyNodeIdBinding()` which calls `deriveNodeId()`
@@ -77,78 +77,69 @@ SHA-3-256), the following must change in lockstep:
 - `reference/link/link.ts` — `deriveLinkId()` uses NodeId strings as input (transitive)
 - `reference/topology/remote-node-hint.ts` — `createRemoteNodeHint()` accepts NodeId strings (transitive)
 
-### Schemas
+#### Schemas
 - `spec/02-identity.md` §2.1 — the algorithm description
-- `spec/02-identity.md` §2.1 — "BLAKE2b-256 is the only hash permitted" (must be removed/relaxed)
 - `spec/03-node-advertisements.md` — references NodeId binding
-- `spec/14-security.md` §4 — domain-separation register entry for `sharenet-node-id-v1`
-- `adr/0003-nodeid-derivation-frozen.md` — the "Decision" section
+- `spec/14-security.md` §4 — domain-separation register entry
+- `adr/0003-nodeid-derivation-frozen.md` — the decision
 
-### Vectors
+#### Vectors
 - `reference/identity/golden-vectors.ts` — `EXPECTED_NODE_ID` frozen hex
-- `reference/encoding/golden-vectors.ts` — not affected (CBOR vectors are algorithm-independent)
-- `conformance/vectors/` (to be created per ADR-0015-companion) — needs the vector once an algorithm is chosen
+- `conformance/vectors/` — needs the vector once an algorithm is chosen
 
-### Persistence
+#### Persistence
 - `prisma/schema.prisma` — `NodeRecord.nodeId` (primary key), `SequenceFloor.nodeId` (primary key), `AuditLog.targetNodeId`
-- All existing rows in these tables would become invalid if the derivation changes (the same Ed25519 public key would map to a different NodeId string)
-- Migration impact: destructive — all node records and sequence floors must be purged and re-accepted
+- All existing rows would become invalid if the derivation changes
+- Migration impact: destructive — all node records and sequence floors must be purged
 
-### Links (Phase 3)
-- `mini-services/node-link/data/*/`-keypair.json files — store NodeId derived from the chosen algorithm
-- All live `DirectedLink` records in mini-service registries — keyed by LinkId which transitively depends on NodeId
-- The two-process test (#25) — verifies NodeId binding; would fail if the algorithm changes without updating the test vectors
+#### Links (Phase 3)
+- `mini-services/node-link/data/`-keypair.json files — store NodeId derived from the chosen algorithm
+- All live `DirectedLink` records — keyed by LinkId which transitively depends on NodeId
 
-## Migration / interoperability consequences
+### Migration / interoperability consequences
 
-### If BLAKE2b-256 is ratified (current behavior)
+#### If BLAKE2b-256 is ratified (current behavior)
 - No code changes.
-- `adr/0003` is upgraded from "Decision" to "Ratified by Principal Architect".
-- This ADR-0015 is closed as "resolved — ratified".
-- All existing NodeIds remain valid.
 
-### If SHA-256 (or another algorithm) is chosen
-- All existing NodeIds become invalid. Every node must re-derive its NodeId and re-advertise.
+#### If SHA-256 (or another algorithm) is chosen
+- All existing NodeIds become invalid. Every node must re-derive and re-advertise.
 - All `NodeRecord` and `SequenceFloor` database rows must be purged.
 - All golden vectors must be recomputed and re-frozen.
-- The mini-service keypair files (already flagged for removal in ADR-0015's sibling corrective) must be regenerated; the old NodeIds are retired.
-- Cross-implementation interoperability: any third-party implementation that already adopted the BLAKE2b-256 derivation would break. (Currently no such implementation exists — the only consumer is this repository.)
-- Spec version bump required: `sharenet-node-id-v1` → `sharenet-node-id-v2`. Per ADR-0003, a version bump creates a new NodeId namespace; old NodeIds and new NodeIds are NOT interchangeable.
+- Spec version bump required.
 
-### If a third option is chosen (SHA-3-256, BLAKE3, etc.)
-- Same as the SHA-256 case, plus a new library dependency.
-
-## Decision required from the Principal Architect
+### Decision required from the Principal Architect
 
 Choose exactly one:
 
-1. **RATIFY BLAKE2b-256** as the permanent NodeId derivation algorithm.
-   - Pro: no migration, no re-freeze, current golden vectors remain valid.
-   - Con: BLAKE2b is less widely standardized than SHA-256 (NIST FIPS 180-4); some auditors prefer NIST curves + hashes.
+1. RATIFY BLAKE2b-256 as the permanent NodeId derivation algorithm.
+2. CHANGE to SHA-256.
+3. CHANGE to another algorithm (specify).
+4. DEFER the decision.
 
-2. **CHANGE to SHA-256** (`BLAKE2b-256` → `SHA-256`).
-   - Pro: NIST-standardized; matches the most common cross-language library availability.
-   - Con: full re-freeze of vectors; database purge; mini-service keys rotated.
+### Principal Architect's decision (2026-08-16)
 
-3. **CHANGE to another algorithm** (specify which — SHA-3-256, BLAKE3, etc.).
-   - Pro/Con depend on the algorithm.
+**Option 5 (write-in): CHANGE to BLAKE3-256 + lowercase unpadded RFC 4648 base32.**
 
-4. **DEFER the decision** — keep BLAKE2b-256 as the current interim derivation, but mark it as `INTERIM` (not `FROZEN`) in spec/02 and ADR-0003 until a formal review with the security team is complete.
+The Principal Architect chose BLAKE3 (not BLAKE2b, not SHA-256) and base32
+(not hex) for the canonical scheme. The domain tag is `SHARENET/NODEID/1`
+(uppercase, slash-separated, to match the conventional domain-tag style
+used in other protocols). The encoding is lowercase unpadded base32 for
+compactness and case-insensitive friendliness.
 
 ## What this ADR does NOT do
 
-- Does NOT change any code.
-- Does NOT re-freeze any vector.
-- Does NOT rewrite git history.
-- Does NOT make any claim about which algorithm is "correct".
+- Does NOT retain the interim scheme.
+- Does NOT provide dual parsing or fallback.
+- Does NOT rewrite git history (the interim NodeIds remain in prior commits
+  and are documented as retired).
 - Does NOT proceed to routing, circuits, gateway forwarding, Android, or any other protocol work.
 
 ## References
 
 - spec/00 §13 (Identity — original instruction)
-- spec/00 §3 (Protocol-First Rule — stop and request review on primitive substitution)
-- spec/00 §35 (Stop Conditions — cryptographic primitive substitution)
-- spec/02-identity.md §2.1 (current frozen algorithm — possibly illegitimate)
-- adr/0003-nodeid-derivation-frozen.md (the decision that should have been a proposal)
-- reference/identity/keys.ts (the implementation)
-- reference/identity/golden-vectors.ts (the frozen vector that must be recomputed if the algorithm changes)
+- spec/00 §3 (Protocol-First Rule)
+- spec/00 §35 (Stop Conditions)
+- spec/02-identity.md §2 (canonical algorithm)
+- adr/0003-nodeid-derivation-frozen.md (the decision ADR, updated to canonical)
+- conformance/vectors/V-NODEID-001.json (frozen vector)
+- reference/identity/keys.ts (implementation)

@@ -27,138 +27,28 @@ interface NodeRow {
 }
 
 export function ProtocolPanel({ session }: { session: { isDemo: boolean } | null }) {
-  const [tab, setTab] = useState<"identity" | "sign" | "verify" | "nodes" | "gateway">("identity");
+  const [tab, setTab] = useState<"verify" | "nodes" | "gateway">("verify");
 
   return (
     <div className="space-y-4">
+      <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-300">
+        <strong>Private-key boundary (corrective milestone 2026-08-16):</strong> the
+        &quot;Generate NodeId&quot; and &quot;Sign Advertisement&quot; endpoints have been
+        REMOVED. A node private key MUST be generated, stored, and used locally by the node
+        implementation — it MUST NOT traverse the web server, API request body, browser UI,
+        logs, database, fixtures, or test snapshots. To produce a signed advertisement, run
+        the node-link mini-service locally (<code>bash mini-services/node-link/start-mesh.sh</code>)
+        which generates and uses its own keypair.
+      </div>
       <div className="flex gap-2 flex-wrap">
-        <Button variant={tab === "identity" ? "default" : "outline"} size="sm" onClick={() => setTab("identity")}>Generate NodeId</Button>
-        <Button variant={tab === "sign" ? "default" : "outline"} size="sm" onClick={() => setTab("sign")}>Sign Advertisement</Button>
         <Button variant={tab === "verify" ? "default" : "outline"} size="sm" onClick={() => setTab("verify")}>Verify + Accept</Button>
         <Button variant={tab === "nodes" ? "default" : "outline"} size="sm" onClick={() => setTab("nodes")}>Accepted Nodes</Button>
         <Button variant={tab === "gateway" ? "default" : "outline"} size="sm" onClick={() => setTab("gateway")}>Gateway Policy</Button>
       </div>
-      {tab === "identity" && <IdentityTab />}
-      {tab === "sign" && <SignTab />}
       {tab === "verify" && <VerifyTab session={session} />}
       {tab === "nodes" && <NodesTab />}
       {tab === "gateway" && <GatewayTab session={session} />}
     </div>
-  );
-}
-
-function IdentityTab() {
-  const [result, setResult] = useState<Record<string, string> | null>(null);
-  const [loading, setLoading] = useState(false);
-  async function generate() {
-    setLoading(true);
-    const r = await api<{ nodeId: string; publicKeyHex: string; secretKeyHex: string; warning: string; derivation: Record<string, string> }>("/api/sharenet/protocol/node-id", { method: "POST" });
-    setLoading(false);
-    if (r.ok && r.data) {
-      setResult({ nodeId: r.data.nodeId, publicKeyHex: r.data.publicKeyHex, secretKeyHex: r.data.secretKeyHex, warning: r.data.warning });
-      toast.success("New Ed25519 keypair generated");
-    } else toast.error(r.error ?? "Generation failed");
-  }
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Ed25519 Keypair + NodeId Derivation</CardTitle>
-        <CardDescription>
-          Per spec/02 §2.1 + ADR-0003:
-          <code className="block mt-1 text-emerald-400 text-xs">NodeId = "node:" + hex(BLAKE2b-256("sharenet-node-id-v1" ‖ Ed25519PublicKey))</code>
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <Button onClick={generate} disabled={loading}>{loading ? "Generating…" : "Generate fresh keypair"}</Button>
-        {result && (
-          <div className="space-y-2">
-            <KV label="NodeId" value={result.nodeId} mono accent />
-            <KV label="Public key (32 bytes, hex)" value={result.publicKeyHex} mono />
-            <KV label="Secret key (32 bytes, hex) — shown ONCE" value={result.secretKeyHex} mono secret />
-            <div className="text-xs text-amber-400 border border-amber-500/30 bg-amber-500/10 rounded p-2">{result.warning}</div>
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function SignTab() {
-  const [secretKeyHex, setSecretKeyHex] = useState("");
-  const [capabilities, setCapabilities] = useState<string[]>(["MESH_RELAY"]);
-  const [endpointAddr, setEndpointAddr] = useState("10.0.0.1");
-  const [endpointPort, setEndpointPort] = useState("7788");
-  const [sequence, setSequence] = useState("1");
-  const [ttl, setTtl] = useState("3600");
-  const [result, setResult] = useState<Record<string, unknown> | null>(null);
-  const [loading, setLoading] = useState(false);
-
-  async function sign() {
-    if (!secretKeyHex || secretKeyHex.length !== 64) { toast.error("Secret key must be 64 hex chars"); return; }
-    if (capabilities.length === 0) { toast.error("Pick at least one capability"); return; }
-    setLoading(true);
-    const r = await api<{ advertisementHex: string; fields: Record<string, unknown> }>("/api/sharenet/protocol/sign-advertisement", {
-      method: "POST",
-      body: JSON.stringify({
-        secretKeyHex,
-        capabilities,
-        endpoints: [{ type: "tcp", address: endpointAddr, port: parseInt(endpointPort, 10) }],
-        sequence: parseInt(sequence, 10),
-        ttlSeconds: parseInt(ttl, 10),
-      }),
-    });
-    setLoading(false);
-    if (r.ok && r.data) { setResult({ advertisementHex: r.data.advertisementHex, fields: r.data.fields }); toast.success("Advertisement signed"); }
-    else toast.error(r.error ?? "Sign failed");
-  }
-
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Sign NodeAdvertisement</CardTitle>
-        <CardDescription>Builds a canonical-CBOR advertisement and signs it with Ed25519. The signature covers BLAKE2b("sharenet-advertisement-v1" ‖ canonical_cbor(body_without_signature)).</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        <div className="grid gap-2">
-          <Label>Secret key hex (32 bytes)</Label>
-          <Input value={secretKeyHex} onChange={(e) => setSecretKeyHex(e.target.value)} placeholder="64 hex chars" className="font-mono text-xs" />
-          <p className="text-xs text-muted-foreground">Tip: generate one in the &quot;Generate NodeId&quot; tab and paste it here.</p>
-        </div>
-        <div className="grid gap-2">
-          <Label>Capabilities</Label>
-          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-            {ALL_CAPS.map((cap) => (
-              <label key={cap} className="flex items-center gap-2 text-xs cursor-pointer">
-                <Checkbox
-                  checked={capabilities.includes(cap)}
-                  onCheckedChange={(v) => {
-                    if (v) setCapabilities([...capabilities, cap]);
-                    else setCapabilities(capabilities.filter((c) => c !== cap));
-                  }}
-                />
-                <span>{cap}</span>
-              </label>
-            ))}
-          </div>
-        </div>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-          <div><Label>Endpoint addr</Label><Input value={endpointAddr} onChange={(e) => setEndpointAddr(e.target.value)} /></div>
-          <div><Label>Port</Label><Input value={endpointPort} onChange={(e) => setEndpointPort(e.target.value)} type="number" /></div>
-          <div><Label>Sequence</Label><Input value={sequence} onChange={(e) => setSequence(e.target.value)} type="number" /></div>
-          <div><Label>TTL (sec)</Label><Input value={ttl} onChange={(e) => setTtl(e.target.value)} type="number" /></div>
-        </div>
-        <Button onClick={sign} disabled={loading}>{loading ? "Signing…" : "Sign advertisement"}</Button>
-        {result && (
-          <div className="space-y-2">
-            <KV label="Advertisement (canonical CBOR, hex)" value={String(result.advertisementHex)} mono />
-            <details className="text-xs">
-              <summary className="cursor-pointer text-muted-foreground">Decoded fields</summary>
-              <pre className="mt-2 p-2 bg-muted/30 rounded text-xs overflow-x-auto">{JSON.stringify(result.fields, null, 2)}</pre>
-            </details>
-          </div>
-        )}
-      </CardContent>
-    </Card>
   );
 }
 

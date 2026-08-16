@@ -1,0 +1,14 @@
+{
+  "id": "V-NODEID-002",
+  "status": "ratified",
+  "spec": "spec/02-identity.md §3",
+  "description": "NodeId binding enforcement: verifyNodeIdBinding MUST reject a NodeId that does not match the canonical derivation of the given public key. A node MUST NOT be allowed to claim an arbitrary NodeId.",
+  "input": {
+    "claimedNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+    "differentPublicKeyHex": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968440fcd37659593b6f"
+  },
+  "expected": {
+    "verifyNodeIdBinding": false
+  },
+  "rationale": "The claimed NodeId is the canonical derivation of a DIFFERENT public key (the one in V-NODEID-001). Pairing it with an unrelated public key MUST fail binding verification."
+}

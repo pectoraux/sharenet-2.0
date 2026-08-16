@@ -1,0 +1,53 @@
+{
+  "id": "V-NODEID-001",
+  "status": "ratified",
+  "spec": "spec/02-identity.md §2.1",
+  "adr": "adr/0015-PROPOSAL-nodeid-derivation-algorithm-authority-conflict.md (RESOLVED — Principal Architect approved canonical scheme 2026-08-16)",
+  "description": "Canonical NodeId derivation from an Ed25519 public key using BLAKE3-256 and lowercase unpadded RFC 4648 base32 encoding.",
+  "algorithm": {
+    "name": "BLAKE3-256 + base32",
+    "domainTag": "SHARENET/NODEID/1",
+    "domainTagBytesHex": "53484152454e45542f4e4f444549442f31",
+    "domainTagEncoding": "ASCII (16 bytes, no NUL terminator)",
+    "hashFunction": "BLAKE3",
+    "hashOutputBytes": 32,
+    "encoding": "RFC 4648 base32, lowercase, unpadded",
+    "alphabet": "abcdefghijklmnopqrstuvwxyz234567",
+    "outputLengthChars": 52
+  },
+  "input": {
+    "ed25519SecretKeyHex": "0000000000000000000000000000000000000000000000000000000000000001",
+    "ed25519PublicKeyHex": "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29"
+  },
+  "intermediate": {
+    "hashInputHex": "53484152454e45542f4e4f444549442f314cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29",
+    "hashInputDescription": "utf8(\"SHARENET/NODEID/1\") || Ed25519PublicKey (16 + 32 = 48 bytes)",
+    "nodeIdBytesHex": "c577f2e11e5b21067ccadc94619259169a61a4fa8d08d628add0c5a5666051d0"
+  },
+  "expected": {
+    "nodeIdText": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+    "nodeIdTextLength": 52,
+    "nodeIdTextAlphabet": "[a-z2-7]",
+    "nodeIdTextPrefix": "none"
+  },
+  "invariants": {
+    "deterministic": "The same Ed25519PublicKey MUST always produce the same NodeIdText.",
+    "binding": "verifyNodeIdBinding(nodeIdText, publicKey) MUST return true iff nodeIdText == deriveNodeId(publicKey).",
+    "format": "isValidNodeIdFormat(nodeIdText) MUST return true iff nodeIdText is exactly 52 lowercase base32 chars [a-z2-7] with canonical (zero) trailing bits.",
+    "noDualParsing": "Implementations MUST NOT accept the retired 'node:' + hex scheme. There is no fallback derivation and no silent migration."
+  },
+  "retiredScheme": {
+    "description": "The interim BLAKE2b-256 + 'node:' + lowercase-hex scheme is RETIRED.",
+    "retiredDomainTag": "sharenet-node-id-v1",
+    "retiredPrefix": "node:",
+    "retiredHashFunction": "BLAKE2b-256",
+    "retiredEncoding": "lowercase hex",
+    "retiredOutputLength": "71 chars (5 + 64)",
+    "retiredReason": "Build orchestrator selected BLAKE2b without Principal-Architect authority. The canonical scheme (BLAKE3 + base32) was approved 2026-08-16.",
+    "noCompatibility": "Implementations MUST NOT parse, accept, or derive the retired scheme. NodeIds produced under the retired scheme are not valid in the canonical scheme."
+  },
+  "computedAt": "2026-08-16",
+  "computedBy": "reference/identity/keys.ts (BLAKE3 from @noble/hashes v2.3.0, base32 encoder in reference/identity/keys.ts)",
+  "verification": "reference/identity/golden-vectors.ts runIdentityGoldenVectors() asserts all 8 sub-vectors at module load and on every test run.",
+  "notes": "The TEST_SEED is a fixed published test vector. It MUST NOT be used in production. It exists solely so conformance test runners can verify the derivation is byte-stable across implementations (TypeScript, Rust, Go, C, Python)."
+}

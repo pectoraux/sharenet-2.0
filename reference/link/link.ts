@@ -10,15 +10,23 @@
  *
  *   An advertised endpoint is NOT equivalent to a usable link.
  *
- * State machine (spec/04 §3):
+ * State machine (spec/04 §4, corrected 2026-08-16):
  *
- *   LINK_PENDING  — transport connection initiated, handshake in progress
- *       ↓ handshake success
- *   LINK_UP       — authenticated, peer NodeId verified, usable
+ *   LINK_PENDING   — transport connection initiated, handshake in progress
+ *       ↓ advertisement verification success (current two-message exchange)
+ *   ADV_VERIFIED   — advertisements verified; NOT yet authenticated (replay-vulnerable)
+ *                    NOT eligible for routing. NOT an executable LINK_UP record.
+ *       ↓ future: ADR-0016 challenge-response possession proof (NOT YET IMPLEMENTED)
+ *   LINK_UP        — authenticated (fresh key possession proven), eligible for routing
+ *                    **Not yet implemented** — gated on ADR-0016.
  *       ↓ transport close OR peer NodeId mismatch OR expiry
- *   LINK_DOWN     — no longer usable
+ *   LINK_DOWN      — no longer usable
  *
- *   (LINK_DEGRADED is a future state for high-loss links; not in Phase 3.)
+ * Per the corrective milestone (2026-08-16, requirement 3):
+ *   The current two-message exchange establishes ADV_VERIFIED, NOT LINK_UP.
+ *   It must not create an executable LINK_UP record or qualify as the
+ *   Phase 3 milestone. The only truthful term is
+ *   "advertisement-verification exchange."
  *
  * LinkId derivation (FROZEN per ADR-0014 — see below):
  *
@@ -48,8 +56,8 @@ export const LINK_ID_HASH_BYTES = 32;
 /** Length of the handshake nonce (16 bytes). */
 export const LINK_NONCE_BYTES = 16;
 
-/** Link state machine. spec/04 §3. */
-export type LinkState = "LINK_PENDING" | "LINK_UP" | "LINK_DOWN";
+/** Link state machine. spec/04 §4 (corrected 2026-08-16). */
+export type LinkState = "LINK_PENDING" | "ADV_VERIFIED" | "LINK_UP" | "LINK_DOWN";
 
 /**
  * Derive a LinkId from the two endpoints + their handshake nonces.
@@ -122,10 +130,11 @@ export interface DirectedLink {
   observedRttMs?: number;
 }
 
-/** Event emitted when a link transitions state. spec/04 §3.1. */
+/** Event emitted when a link transitions state. spec/04 §4 (corrected). */
 export type LinkEvent =
   | { type: "LINK_PENDING"; linkId: string; localNodeId: string; remoteEndpoint: string; at: number }
-  | { type: "LINK_UP"; linkId: string; remoteNodeId: string; at: number }
+  | { type: "ADV_VERIFIED"; linkId: string; remoteNodeId: string; at: number }
+  | { type: "LINK_UP"; linkId: string; remoteNodeId: string; at: number }  // reserved for ADR-0016
   | { type: "LINK_DOWN"; linkId: string; reason: string; at: number };
 
 /** True iff linkId is well-formed (prefix + 64 hex). */

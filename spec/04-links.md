@@ -99,14 +99,35 @@ Peer authentication MUST verify:
 
 Only after all three checks pass does the Link enter `LINK_UP`.
 
+> **⚠️ STATUS CORRECTION (2026-08-16, corrective milestone):**
+> The current two-message handshake (ADR-0014) does NOT implement the
+> challenge-response described in §3.2 above. It verifies signed
+> advertisements but does NOT prove fresh possession of the signing key
+> bound to the connection transcript. A captured advertisement is replayable.
+>
+> Therefore the current exchange does NOT establish `LINK_UP`. It establishes
+> a weaker state, `ADV_VERIFIED` (advertisement-verified), which is a
+> PREREQUISITE for `LINK_UP` but is NOT `LINK_UP` itself.
+>
+> `LINK_UP` is reserved for the future authenticated handshake defined in
+> ADR-0016 (PROPOSAL — awaiting Principal Architect approval).
+>
+> The only truthful term for the current exchange is
+> **"advertisement-verification exchange."**
+
 ## 4. Link State Machine
 
 | State           | Meaning                                                                | Transitions Out                       |
 |-----------------|------------------------------------------------------------------------|---------------------------------------|
-| `LINK_PENDING`  | Transport attempt or handshake in progress; not yet authenticated.     | → `LINK_UP`, → `LINK_DOWN`.           |
-| `LINK_UP`       | Authenticated, transport healthy. Eligible for routing.                | → `LINK_DEGRADED`, → `LINK_DOWN`.     |
-| `LINK_DEGRADED` | Authenticated, but transport exhibiting high loss / latency / errors. | → `LINK_UP`, → `LINK_DOWN`.           |
+| `LINK_PENDING`  | Transport attempt or handshake in progress; not yet authenticated.     | → `ADV_VERIFIED`, → `LINK_DOWN`.      |
+| `ADV_VERIFIED`  | Advertisements verified; NOT yet authenticated (replay-vulnerable). NOT eligible for routing. | → `LINK_UP` (future, requires ADR-0016), → `LINK_DOWN`. |
+| `LINK_UP`       | Authenticated (fresh key possession proven), transport healthy. Eligible for routing. **Not yet implemented** (requires ADR-0016). | → `LINK_DEGRADED`, → `LINK_DOWN`. |
+| `LINK_DEGRADED` | Authenticated, but transport exhibiting high loss / latency / errors. **Not yet implemented.** | → `LINK_UP`, → `LINK_DOWN`.           |
 | `LINK_DOWN`     | Transport broken or authentication failed. Not eligible for routing.  | → `LINK_PENDING` (re-attempt), or terminal. |
+
+**Current implementation status:** the reference mini-service (`mini-services/node-link/`)
+reaches `ADV_VERIFIED` only. It does NOT reach `LINK_UP`. `LINK_UP` is
+gated on ADR-0016 (replay-defect repair + transcript binding).
 
 ### 4.1 Transition Rules
 

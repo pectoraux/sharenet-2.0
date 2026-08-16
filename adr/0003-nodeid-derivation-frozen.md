@@ -1,171 +1,106 @@
-# ADR 0003 — NodeId Derivation (INTERIM — pending ADR-0015)
+# ADR 0003 — NodeId Derivation (CANONICAL, Principal-Architect-APPROVED)
 
-Date: 2024-Q3 (first deliverable)
-Decision Maker: ShareNet 2.0 build orchestrator
+Date: 2024-Q3 (first deliverable); REVISED 2026-08-16 (canonical scheme approved)
+Decision Maker: Principal Architect (approved 2026-08-16)
 
 ## Status
 
-**⚠️ RETRACTED as a frozen decision (2026-08-16, corrective milestone).**
-
-This ADR previously claimed `Accepted` status as a binding freeze of the
-NodeId derivation algorithm (BLAKE2b-256 with domain `sharenet-node-id-v1`).
-That claim is **retracted**. The build orchestrator is not the Principal
-Architect and did not have authority to freeze a cryptographic primitive
-choice unilaterally.
-
-Per spec/00 §3 (Protocol-First Rule) and §35 (Stop Conditions — cryptographic
-primitive substitution), the algorithm choice is now under formal review in
-**ADR-0015 (PROPOSAL)**. Until ADR-0015 is resolved by the Principal
-Architect:
-
-- The current implementation uses BLAKE2b-256 with domain
-  `sharenet-node-id-v1` (the code in `reference/identity/keys.ts` is
-  unchanged — this ADR does NOT modify code).
-- The derivation is labeled **INTERIM**, not FROZEN.
-- The golden vector in `reference/identity/golden-vectors.ts` remains
-  valid for the INTERIM algorithm but is NOT ratified as a permanent
-  conformance vector.
-- Any change in algorithm will require recomputing all golden vectors,
-  purging all NodeRecord + SequenceFloor rows, and bumping the domain
-  string to `sharenet-node-id-v2`.
-
-The original "Decision" rationale is preserved below for historical context
-and as input to ADR-0015's impact inventory.
-
-The freeze means: the domain string `sharenet-node-id-v1` MUST NOT
-be changed without a new spec version, a new derivation domain
-string, a new NodeId namespace, and a migration plan that re-binds
-every existing advertisement, hint, circuit, and receipt to the
-new namespace.
+**ACCEPTED (CANONICAL).** This decision records the Principal-Architect-approved
+canonical NodeId derivation for ShareNet 2.0. The derivation is FROZEN and
+MUST NOT be changed without a new spec version, a new domain tag, a new NodeId
+namespace, and a coordinated migration plan.
 
 ## Context
 
-`spec/02-identity.md` §2 freezes the NodeId derivation. The
-constraints on the derivation are:
+The master implementation prompt (spec/00 §13 "Identity") instructed:
 
-1. **Deterministic.** Given the same Ed25519 public key, every
-   implementation on every platform MUST produce the identical
-   NodeId. A divergence is a conformance failure (`spec/17-conformance.md`
-   §2 test 1).
-2. **Collision-resistant.** Two different Ed25519 public keys MUST
-   NOT produce the same NodeId except with negligible probability
-   (≤ 2^-128 for a 256-bit digest).
-3. **Domain-separated.** The derivation MUST NOT produce a NodeId
-   that is the same as a hash of the same public key under a
-   different protocol's derivation (e.g., a Tor v3 onion address, a
-   libp2p PeerId, an IPFS CID). A dedicated domain string achieves
-   this.
-4. **Immutable across implementations.** The derivation MUST be a
-   pure function of the public key. There MUST be no per-implementation
-   salt, no per-deployment salt, no per-version salt baked into the
-   implementation. Salt would break cross-implementation NodeId
-   equality.
-5. **Avalanche.** A single-bit change in the public key MUST change
-   approximately half of the bits in the NodeId. Verified by the
-   conformance suite (`spec/17-conformance.md` §1.2).
+> Use: Ed25519 signing key
+> and derive: NodeId
+> from the public key using a domain-separated cryptographic hash.
+> Freeze the exact derivation in the specification.
+> Create golden vectors.
 
-The derivation must also be cheap to compute (called on every
-signed object verification per `spec/02-identity.md` §4).
+The master prompt did NOT specify which hash algorithm or encoding. The
+build orchestrator previously selected BLAKE2b-256 + `node:` + lowercase-hex
+without Principal-Architect authority. That interim scheme was flagged in
+ADR-0015 (PROPOSAL) and is now RETIRED.
+
+The Principal Architect has APPROVED the canonical scheme:
+
+```
+NodeIdBytes = BLAKE3-256( utf8("SHARENET/NODEID/1") || Ed25519PublicKey )
+NodeIdText  = lowercase_unpadded_base32( NodeIdBytes )   // RFC 4648
+```
 
 ## Decision
 
-Freeze the NodeId derivation algorithm as:
+The canonical NodeId derivation is:
+
+- **Hash function:** BLAKE3-256 (32-byte output)
+- **Domain-separation tag:** `SHARENET/NODEID/1` (ASCII, 16 bytes, no NUL)
+- **Encoding:** RFC 4648 base32, lowercase, unpadded (no `=` fill)
+- **Output length:** exactly 52 characters from the alphabet `[a-z2-7]`
+- **No prefix:** the retired `node:` prefix is REMOVED. There is no prefix.
+
+### Properties
+
+- `Ed25519PublicKey` is exactly 32 raw bytes.
+- `NodeIdBytes` is exactly 32 bytes.
+- `NodeIdText` is exactly 52 lowercase base32 characters.
+- The final base32 character encodes 5 bits, of which only the top 1 is
+  meaningful (4 bits are leftover). The final character's value MUST be
+  0 (`a`) or 1 (`b`). Values 2-31 indicate a non-canonical NodeId and
+  MUST be rejected by `isValidNodeIdFormat`.
+
+### Frozen conformance vector
+
+`conformance/vectors/V-NODEID-001.json` records the canonical NodeId for
+the fixed test seed `0000...0001`. The expected `NodeIdText` is:
 
 ```
-NodeId = "node:" + hex(BLAKE2b-256("sharenet-node-id-v1" || Ed25519PublicKey))
+yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia
 ```
 
-Where:
-
-- `Ed25519PublicKey` is the 32-byte raw Ed25519 public key (NOT a
-  DER/PEM-wrapped key).
-- `"sharenet-node-id-v1"` is the **frozen domain-separation
-  string**, encoded as UTF-8 (20 bytes, no NUL terminator).
-- `BLAKE2b-256` is BLAKE2b with a 32-byte digest and the default
-  empty salt and empty personalization.
-- `||` is byte concatenation. Total input to BLAKE2b is exactly
-  52 bytes (`20 + 32`).
-- The textual form is the lowercase hex encoding of the digest,
-  prefixed with the ASCII string `node:`. Total length: 69 ASCII
-  characters.
-
-The domain string `sharenet-node-id-v1` is **frozen forever**. A
-future spec version that introduces a new derivation (e.g., a
-post-quantum signature scheme) MUST use a new domain string (e.g.,
-`sharenet-node-id-v2`) and a new NodeId namespace. Old and new
-namespaces coexist; they are not interchangeable.
-
-A node MUST NOT claim an arbitrary NodeId. The NodeId is not
-chosen; it is computed. The only way to obtain a given NodeId is
-to possess the corresponding Ed25519 private key. This is verified
-at every advertisement, hint, and circuit step.
+Any conformant implementation (TypeScript, Rust, Go, C, Python) MUST
+produce this exact `NodeIdText` for the test seed's public key.
 
 ## Consequences
 
-- **NodeId is permanently bound to one keypair.** Rotating the
-  signing key produces a new NodeId, which is a new node identity.
-  All references to the old NodeId remain valid under the old
-  NodeId; nothing is migrated.
-- **Key rotation = new identity.** This is a feature, not a bug.
-  It prevents key reuse across identities and prevents silent
-  identity hijacking via key rotation. See `spec/02-identity.md`
-  §3.
-- **No claim-and-verify attack surface.** An attacker cannot
-  pre-claim a NodeId and wait for a victim to generate the matching
-  key — the key is the identity. A victim generating a fresh
-  Ed25519 keypair automatically gets a fresh, uncollided NodeId
-  with overwhelming probability.
-- **Cross-implementation reproducibility is a hard contract.**
-  Any port of ShareNet to Python, Rust, Go, or a browser plugin
-  MUST produce identical NodeIds for the same public key. The
-  conformance golden vectors (`conformance/vectors/identity/*.json`)
-  lock this.
-- **Domain separation is auditable.** The conformance test
-  `spec/17-conformance.md` §3.4 scans the codebase for the literal
-  `sharenet-node-id-v1` and asserts it appears in exactly one
-  location (the identity module).
-- **BLAKE2b-256 is the only hash permitted for this derivation.**
-  SHA-256 is reserved for hash chains (`spec/14-security.md` §5)
-  and HKDF inputs; using SHA-256 for NodeId would create a
-  different namespace and is forbidden.
+- The interim BLAKE2b-256 + `node:` + hex scheme is RETIRED. All NodeIds
+  produced under the interim scheme are invalid in the canonical scheme.
+- No dual parsing, no fallback derivation, no silent migration.
+- The interim test/development NodeIds (documented in
+  `mini-services/node-link/data/README.md`) are retired and must never
+  be reused.
+- All `NodeRecord` and `SequenceFloor` database rows (if any) must be
+  purged before deploying the canonical scheme — the same Ed25519 public
+  key now maps to a different NodeId string.
+- Cross-implementation interoperability: any third-party implementation
+  that adopted the interim scheme would break. (No such implementation
+  exists — the only consumer is this repository.)
 
 ## Alternatives Considered
 
-1. **SHA-256 instead of BLAKE2b-256.** Rejected — BLAKE2b-256 has
-   a cleaner domain-separation story, is faster in pure JS, and
-   is not on any NIST-standardization controversy list. SHA-256
-   is reserved for hash chains per `spec/14-security.md` §5.
-2. **Truncation to 16 bytes (128-bit NodeId).** Rejected —
-   collision risk at scale. ShareNet expects on the order of 2^20
-   nodes in the medium term; 128-bit NodeIds would still be safe,
-   but the cost of 16 extra bytes per NodeId is negligible. A
-   256-bit NodeId preserves headroom and matches the Ed25519 key
-   size.
-3. **A custom base32 or bech32 encoding instead of hex.** Considered
-   and rejected — hex is the lowest-friction encoding, debuggable
-   in any tool, and the textual length (64 chars) is acceptable
-   for the wire and the UI. Bech32 would add a checksum but cost
-   code complexity.
-4. **Including a network or deployment identifier in the
-   derivation.** Rejected — would break cross-deployment NodeId
-   equality. A node that moves between networks would lose its
-   identity.
-5. **No domain string (just `BLAKE2b-256(pk)`).** Rejected —
-   would collide with any other protocol that hashes a 32-byte
-   Ed25519 public key the same way (libp2p PeerId, Tor v3 onion).
-   The domain string is the cheapest possible defense.
+1. **BLAKE2b-256 + hex (the interim scheme).** Retired — the build
+   orchestrator selected it without authority; the Principal Architect
+   chose BLAKE3 + base32 for cross-language library availability and
+   more compact text representation.
+
+2. **SHA-256 + hex.** Considered in ADR-0015. Not selected — BLAKE3 is
+   faster, has a cleaner domain-separation story, and is increasingly
+   the default in modern protocol design.
+
+3. **SHA-3-256.** Considered. Not selected — BLAKE3 is faster in software
+   and the @noble/hashes implementation is audited.
+
+4. **Base58 encoding.** Considered for the text form. Not selected —
+   base32 is case-insensitive-friendly and decodes more cheaply; base58's
+   ambiguity-resistance is not needed here.
 
 ## References
 
-- `spec/02-identity.md` §2 — frozen derivation algorithm.
-- `spec/02-identity.md` §3 — key lifecycle (rotation = new
-  identity).
-- `spec/02-identity.md` §4 — identity binding verification on
-  every signed object.
-- `spec/14-security.md` §4 — domain separation register entry for
-  `sharenet-node-id-v1`.
-- `spec/17-conformance.md` §2 tests 1-2 — NodeId derivation golden
-  vectors and invariant test.
-- `spec/17-conformance.md` §1.2 — avalanche vector requirement.
-- ADR 0002 — crypto library choice (`@noble/hashes` BLAKE2b-256).
-- Michael Nygard ADR template — structural source.
+- spec/02-identity.md §2 (canonical algorithm)
+- ADR-0015 (PROPOSAL that this decision resolves — now CLOSED)
+- conformance/vectors/V-NODEID-001.json (frozen vector)
+- reference/identity/keys.ts (implementation)
+- reference/identity/golden-vectors.ts (runtime verification)

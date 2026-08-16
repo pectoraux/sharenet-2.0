@@ -26,58 +26,47 @@ account. Statements like "this node is operated by Alice" MUST be
 carried by a separate attestation object signed by Alice's `UserId`
 key, never inferred from the `NodeId` alone.
 
-## 2. NodeId Derivation (INTERIM — pending ADR-0015)
-
-> **⚠️ STATUS CORRECTION (2026-08-16, corrective milestone):**
-> The derivation was previously labeled `FROZEN` in this section and in
-> ADR-0003. That label is **retracted**. The build orchestrator
-> unilaterally selected BLAKE2b-256 without Principal-Architect approval.
-> Per spec/00 §3 (Protocol-First Rule) and §35 (Stop Conditions —
-> cryptographic primitive substitution), the algorithm choice is now
-> under formal review in **ADR-0015 (PROPOSAL)**.
->
-> Until ADR-0015 is resolved, the derivation is labeled **INTERIM**:
-> - The current implementation uses BLAKE2b-256 with domain
->   `sharenet-node-id-v1`.
-> - This is the behavior the reference implementation produces today.
-> - It is NOT ratified as the permanent ShareNet NodeId derivation.
-> - A change in algorithm will require recomputing all golden vectors,
->   purging all NodeRecord + SequenceFloor rows, and bumping the
->   domain string to `sharenet-node-id-v2`.
+## 2. NodeId Derivation (CANONICAL — APPROVED by Principal Architect 2026-08-16, ADR-0015 RESOLVED)
 
 A node's identity is its Ed25519 signing public key. The NodeId is a
 **deterministic, collision-resistant** derivation of that public key.
 
-### 2.1 Algorithm (INTERIM — see ADR-0015)
+### 2.1 Algorithm (canonical Phase 0 scheme)
 
 Given an Ed25519 public key `pk` (32 raw bytes):
 
 ```
-NodeId = BLAKE2b-256("sharenet-node-id-v1" || pk)
+NodeIdBytes = BLAKE3-256( utf8("SHARENET/NODEID/1") || pk )
+NodeIdText  = lowercase_unpadded_base32( NodeIdBytes )   // RFC 4648
 ```
 
 Where:
 
-- `BLAKE2b-256` is BLAKE2b with a 32-byte (256-bit) digest and the
-  default 16-byte salt and 16-byte personalization left empty.
-- `"sharenet-node-id-v1"` is the **domain-separation string**, encoded
-  as UTF-8 (20 bytes, no NUL terminator).
-- `||` is byte concatenation.
-- The input to BLAKE2b is exactly `20 + 32 = 52` bytes.
+- `BLAKE3-256` is the BLAKE3 hash function with a 32-byte (256-bit) output.
+- `"SHARENET/NODEID/1"` is the **domain-separation tag**, encoded as
+  ASCII (16 bytes, no NUL terminator). The bytes are
+  `53484152454e45542f4e4f444549442f31` in hex.
+- `||` is byte concatenation. The input to BLAKE3 is exactly `16 + 32 = 48` bytes.
+- `lowercase_unpadded_base32` is RFC 4648 base32 with the lowercase alphabet
+  `abcdefghijklmnopqrstuvwxyz234567` and no `=` padding.
 
-The textual NodeId is the lowercase hex encoding of the 32-byte digest,
-prefixed with the ASCII string `node:`. Example:
+The textual NodeId is exactly **52 lowercase base32 characters**. There is
+no `node:` prefix. There is no hex. There is no padding. Example:
 
 ```
-node:9f3c1a4b2e8d0f5c6a7b8e9d0c1b2a3f4e5d6c7b8a9f0e1d2c3b4a5f6e7d8c9
+yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia
 ```
 
-Total textual length: `5 + 64 = 69` ASCII characters.
+**Canonical trailing bits:** 32 bytes (256 bits) encoded into 52 base32 chars
+(260 bits) leaves 4 unused bits in the final character. These bits MUST be
+zero on encode (the final character's 5-bit value is 0 or 1). On decode,
+these bits MUST be verified to be zero; a non-zero value indicates a
+malformed or non-canonical NodeId and MUST be rejected.
 
 ### 2.2 Invariant
 
 ```
-NodeId == CanonicalNodeId(Ed25519PublicKey)
+NodeIdText == CanonicalNodeId(Ed25519PublicKey)
 ```
 
 This invariant MUST hold for every advertisement, every circuit, every
@@ -89,30 +78,69 @@ A node MUST NOT claim an arbitrary NodeId. The NodeId is not chosen; it
 is computed. The only way to obtain a given NodeId is to possess the
 corresponding Ed25519 private key.
 
-### 2.3 Reference Pseudocode
+### 2.3 Retired scheme (NO compatibility)
+
+The interim BLAKE2b-256 + `node:` + lowercase-hex scheme is **RETIRED**.
+Implementations MUST NOT parse, accept, or derive the retired scheme.
+There is **no dual parsing, no fallback derivation, and no silent migration**.
+NodeIds produced under the retired scheme are not valid in the canonical
+scheme and MUST be rejected.
+
+| Property | Retired (interim) | Canonical (current) |
+|----------|-------------------|---------------------|
+| Hash function | BLAKE2b-256 | BLAKE3-256 |
+| Domain tag | `sharenet-node-id-v1` | `SHARENET/NODEID/1` |
+| Encoding | lowercase hex | lowercase RFC 4648 base32 |
+| Prefix | `node:` | (none) |
+| Text length | 71 chars | 52 chars |
+
+### 2.4 Reference Pseudocode
 
 ```typescript
-import { blake2b } from "@noble/hashes/blake2b";
+import { blake3 } from "@noble/hashes/blake3";
 import { utf8ToBytes } from "@noble/hashes/utils";
 
-const DOMAIN = utf8ToBytes("sharenet-node-id-v1");
+const DOMAIN_TAG = utf8ToBytes("SHARENET/NODEID/1");  // 16 bytes
 
-export function deriveNodeId(ed25519PublicKey: Uint8Array): Uint8Array {
+export function deriveNodeIdBytes(ed25519PublicKey: Uint8Array): Uint8Array {
   if (ed25519PublicKey.length !== 32) {
     throw new Error("Ed25519 public key must be 32 bytes");
   }
-  return blake2b.create({ dkLen: 32 })
-    .update(DOMAIN)
-    .update(ed25519PublicKey)
-    .digest();
+  const input = new Uint8Array(DOMAIN_TAG.length + ed25519PublicKey.length);
+  input.set(DOMAIN_TAG, 0);
+  input.set(ed25519PublicKey, DOMAIN_TAG.length);
+  return blake3(input, { dkLen: 32 });
 }
 
+// RFC 4648 lowercase unpadded base32
+const ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+
 export function canonicalNodeIdText(ed25519PublicKey: Uint8Array): string {
-  const digest = deriveNodeId(ed25519PublicKey);
-  const hex = Buffer.from(digest).toString("hex");
-  return `node:${hex}`;
+  const digest = deriveNodeIdBytes(ed25519PublicKey);
+  let out = "";
+  let buffer = 0;
+  let bits = 0;
+  for (let i = 0; i < digest.length; i++) {
+    buffer = (buffer << 8) | digest[i];
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += ALPHABET[(buffer >> bits) & 0x1f];
+    }
+  }
+  if (bits > 0) {
+    out += ALPHABET[(buffer << (5 - bits)) & 0x1f];
+  }
+  return out;  // 52 chars, no padding
 }
 ```
+
+### 2.5 Conformance vectors
+
+The frozen conformance vector `V-NODEID-001` (in `conformance/vectors/`)
+records the canonical NodeId for a fixed test seed. Any conformant
+implementation (TypeScript, Rust, Go, C, Python) MUST produce the
+identical `NodeIdText` for the identical `Ed25519PublicKey`.
 
 ## 3. Key Lifecycle
 

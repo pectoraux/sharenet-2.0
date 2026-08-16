@@ -12,8 +12,8 @@
     "db:migrate": "prisma migrate dev",
     "db:reset": "prisma migrate reset",
     "test:unit": "bun test tests/",
-    "test:arch": "curl -s http://localhost:3000/api/sharenet/architecture/summary | bun -e 'const d=JSON.parse(await Bun.stdin.text()); console.log(`passed=${d.passed} failed=${d.failed} skipped=${d.skipped ?? 0}/${d.totalTests}`); process.exit(d.failed > 0 ? 1 : 0)'",
-    "test:integration:mesh": "bash mini-services/node-link/start-mesh.sh && sleep 2 && curl -s http://localhost:3000/api/sharenet/architecture/summary | bun -e 'const d=JSON.parse(await Bun.stdin.text()); const t25 = d.results.find(r => r.id === 25); console.log(`test #25 (two-process link): ${t25.status ?? (t25.passed ? \"passed\" : \"failed\")}`); process.exit(t25.passed ? 0 : 1)'"
+    "test:arch": "bun run src/lib/sharenet/run-arch-tests.ts",
+    "test:integration:mesh": "bash mini-services/node-link/start-mesh.sh && sleep 2 && bun run src/lib/sharenet/run-arch-tests.ts"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

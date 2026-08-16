@@ -536,8 +536,9 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
   results.push(
     await runOne(24, "LinkId is directional: A→B ≠ B→A with same nonces (spec/04 §2, ADR-0014)", "ARCHITECTURE", "spec/04 §2 + spec/00 §37 + ADR-0014", async () => {
       const { deriveLinkId, generateLinkNonce } = await import("@reference/link/link");
-      const nodeA = "node:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-      const nodeB = "node:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+      // Use canonical NodeId format (52 lowercase base32 chars, no prefix).
+      const nodeA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+      const nodeB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
       const nonceA = generateLinkNonce();
       const nonceB = generateLinkNonce();
       // A→B uses (local=A, remote=B, localNonce=A's, remoteNonce=B's)
@@ -552,12 +553,12 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
     }),
   );
 
-  // G15: Two real node-link processes establish an authenticated directed link (spec/00 §37)
+  // G15: Two real node-link processes complete an advertisement-verification exchange (spec/00 §37)
   // This is the REAL two-process test. It queries the live node-link mini-services
-  // (ports 3001 + 3002) and asserts that an authenticated directed link can be
+  // (ports 3001 + 3002) and asserts that an advertisement-verification exchange can be
   // established between them via the TCP handshake.
   results.push(
-    await runOne(25, "two real node-link processes establish authenticated directed link (spec/00 §37)", "ARCHITECTURE", "spec/00 §37 + spec/04 §3.2 + ADR-0014", async () => {
+    await runOne(25, "two real node-link processes complete advertisement-verification exchange (spec/00 §37)", "ARCHITECTURE", "spec/00 §37 + spec/04 §3.2 + ADR-0014", async () => {
       // Step 1: check both node processes are reachable.
       const [aStatus, bStatus] = await Promise.all([
         fetch("http://localhost:3001/status", { signal: AbortSignal.timeout(2000) }).then((r) => r.json() as Promise<{ ok: boolean; node?: { nodeId: string } }>).catch(() => null),
@@ -587,21 +588,21 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       if (!dialRes.ok || !dialRes.linkId) {
         return {
           passed: false,
-          expected: "Node A dials Node B and establishes LinkUp",
+          expected: "Node A dials Node B and establishes ADV_VERIFIED",
           actual: `dial failed: ${dialRes.reason ?? "no linkId"}`,
         };
       }
-      // Step 3: query both nodes' link registries — both should report LINK_UP.
+      // Step 3: query both nodes' link registries — both should report ADV_VERIFIED.
       const [aLinks, bLinks] = await Promise.all([
         fetch("http://localhost:3001/links", { signal: AbortSignal.timeout(2000) }).then((r) => r.json() as Promise<{ links: Array<{ state: string; localNodeId: string; remoteNodeId: string; linkId: string }> }>).catch(() => ({ links: [] })),
         fetch("http://localhost:3002/links", { signal: AbortSignal.timeout(2000) }).then((r) => r.json() as Promise<{ links: Array<{ state: string; localNodeId: string; remoteNodeId: string; linkId: string }> }>).catch(() => ({ links: [] })),
       ]);
-      const aUp = aLinks.links.find((l) => l.state === "LINK_UP");
-      const bUp = bLinks.links.find((l) => l.state === "LINK_UP");
+      const aUp = aLinks.links.find((l) => l.state === "ADV_VERIFIED");
+      const bUp = bLinks.links.find((l) => l.state === "ADV_VERIFIED");
       if (!aUp || !bUp) {
         return {
           passed: false,
-          expected: "both Node A and Node B report at least one LINK_UP link",
+          expected: "both Node A and Node B report at least one ADV_VERIFIED link",
           actual: `node-a has ${aLinks.links.length} link(s), node-b has ${bLinks.links.length} link(s)`,
         };
       }
@@ -613,7 +614,7 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       const bSeesA = bUp.remoteNodeId === aStatus.node!.nodeId;
       return {
         passed: directional && aSeesB && bSeesA,
-        expected: "both nodes LINK_UP, LinkIds differ (directional), each sees the other's correct NodeId",
+        expected: "both nodes ADV_VERIFIED, LinkIds differ (directional), each sees the other's correct NodeId",
         actual: `directional=${directional}, A→B sees B=${aSeesB}, B→A sees A=${bSeesA}`,
       };
     }),

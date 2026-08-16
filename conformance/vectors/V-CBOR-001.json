@@ -1,0 +1,29 @@
+{
+  "id": "V-CBOR-001",
+  "status": "draft",
+  "spec": "spec/17-conformance.md §2.1",
+  "adr": "adr/0004-canonical-cbor-as-wire-format.md",
+  "description": "Canonical CBOR encoding (RFC 8949 §4.2.2 deterministic encoding) golden vectors. These vectors verify the encoder produces byte-stable output for the same logical input, enabling cross-implementation signature verification.",
+  "statusNote": "draft — authored and verified against the reference TypeScript implementation (cborg with canonical: true). Cross-language ratification is PLANNED but NOT claimed until an independent consumer (Rust, Go, C) verifies these vectors.",
+  "vectors": [
+    { "name": "unsigned-int-0", "input": 0, "expectedHex": "00" },
+    { "name": "unsigned-int-1", "input": 1, "expectedHex": "01" },
+    { "name": "unsigned-int-23", "input": 23, "expectedHex": "17" },
+    { "name": "unsigned-int-24", "input": 24, "expectedHex": "1818" },
+    { "name": "unsigned-int-100", "input": 100, "expectedHex": "1864" },
+    { "name": "negative-int--1", "input": -1, "expectedHex": "20" },
+    { "name": "empty-byte-string", "input": { "__bytes__": "" }, "expectedHex": "40" },
+    { "name": "short-byte-string", "input": { "__bytes__": "010203" }, "expectedHex": "43010203" },
+    { "name": "empty-text-string", "input": "", "expectedHex": "60" },
+    { "name": "short-text-string", "input": "abc", "expectedHex": "63616263" },
+    { "name": "empty-array", "input": [], "expectedHex": "80" },
+    { "name": "small-array", "input": [1, 2, 3], "expectedHex": "83010203" },
+    { "name": "empty-map", "input": {}, "expectedHex": "a0" },
+    { "name": "sorted-string-keys-map", "input": { "b": 2, "a": 1, "c": 3 }, "expectedHex": "a3616101616202616303" },
+    { "name": "boolean-true", "input": true, "expectedHex": "f5" },
+    { "name": "boolean-false", "input": false, "expectedHex": "f4" },
+    { "name": "null", "input": null, "expectedHex": "f6" }
+  ],
+  "inputFormatNote": "Vectors use a JSON-friendly input format. Byte strings are represented as { '__bytes__': '<hex>' } because JSON cannot natively represent byte strings. Map keys in the input may be in any order; the canonical encoder MUST sort them.",
+  "verification": "reference/encoding/golden-vectors.ts runCborGoldenVectors() asserts each vector at module load."
+}

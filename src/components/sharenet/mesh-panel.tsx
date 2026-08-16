@@ -89,7 +89,7 @@ export function MeshPanel() {
 
   const reachable = mesh?.nodes.filter((n) => n.reachable).length ?? 0;
   const total = mesh?.nodes.length ?? 0;
-  const upLinks = mesh?.links.filter((l) => l.state === "LINK_UP").length ?? 0;
+  const upLinks = mesh?.links.filter((l) => l.state === "ADV_VERIFIED").length ?? 0;
 
   return (
     <div className="space-y-4">
@@ -104,7 +104,7 @@ export function MeshPanel() {
             )}
             {mesh && (
               <Badge variant="outline" className="text-emerald-300 border-emerald-500/40">
-                {upLinks} link{upLinks === 1 ? "" : "s"} LINK_UP
+                {upLinks} link{upLinks === 1 ? "" : "s"} ADV_VERIFIED
               </Badge>
             )}
           </CardTitle>
@@ -189,7 +189,7 @@ export function MeshPanel() {
                     <div className="text-xs text-muted-foreground">recent events:</div>
                     {np.recentEvents.slice().reverse().map((e, i) => (
                       <div key={i} className="text-xs font-mono text-muted-foreground">
-                        <span className={e.type === "LINK_UP" ? "text-emerald-400" : e.type === "LINK_DOWN" ? "text-destructive" : "text-amber-400"}>
+                        <span className={e.type === "ADV_VERIFIED" ? "text-emerald-400" : e.type === "LINK_DOWN" ? "text-destructive" : "text-amber-400"}>
                           {e.type}
                         </span>
                         {" "}
@@ -219,7 +219,7 @@ export function MeshPanel() {
               {mesh?.links.map((l) => (
                 <div key={l.linkId} className="border border-emerald-500/30 bg-emerald-500/5 rounded-md p-3">
                   <div className="flex items-center gap-2 flex-wrap">
-                    <Badge variant="outline" className={l.state === "LINK_UP" ? "text-emerald-300 border-emerald-500/40" : "text-destructive border-destructive/40"}>
+                    <Badge variant="outline" className={l.state === "ADV_VERIFIED" ? "text-emerald-300 border-emerald-500/40" : "text-destructive border-destructive/40"}>
                       {l.state}
                     </Badge>
                     <span className="text-xs font-mono">

@@ -223,7 +223,8 @@ model AuditLog {
 ///   NodeAdvertisement → verifyAdvertisement → acceptAdvertisement → here
 /// A RemoteNodeHint MUST NOT be promotable to this table.
 model NodeRecord {
-  /// The NodeId string ("node:" + 64 hex chars).
+  /// The NodeId text (52 lowercase base32 chars, no prefix). Per spec/02 §2.1
+  /// (canonical scheme, ADR-0015 RESOLVED): BLAKE3-256 + RFC 4648 base32.
   nodeId        String   @id
   /// Hex of the 32-byte Ed25519 public key.
   publicKeyHex  String   @unique

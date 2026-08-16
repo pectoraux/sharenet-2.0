@@ -214,12 +214,12 @@ function establishLinkUp(socket: Socket, remoteAdv: NodeAdvertisement, isInitiat
     remotePublicKey: remoteAdv.signingPublicKey,
     remoteCapabilities: remoteAdv.capabilities,
     remoteEndpoint,
-    state: "LINK_UP",
+    state: "ADV_VERIFIED",
     stateChangedAt: Date.now(),
     createdAt: Date.now(),
   };
   links.set(linkId, link);
-  recordLinkEvent({ type: "LINK_UP", linkId, remoteNodeId: remoteAdv.nodeId, at: Date.now() });
+  recordLinkEvent({ type: "ADV_VERIFIED", linkId, remoteNodeId: remoteAdv.nodeId, at: Date.now() });
 
   socket.on("close", () => {
     if (links.has(linkId)) {
@@ -278,7 +278,7 @@ async function dialOut(host: string, port: number, expectedNodeId?: string): Pro
       handleSocketData(socket, data, true, expectedNodeId);
       // Check if a link was established in this turn.
       for (const [lid, link] of links.entries()) {
-        if (link.remoteEndpoint === `${host}:${port}` && link.state === "LINK_UP") {
+        if (link.remoteEndpoint === `${host}:${port}` && link.state === "ADV_VERIFIED") {
           if (!resolved) {
             resolved = true;
             socket.setTimeout(0); // clear the handshake timeout — link is UP
@@ -310,7 +310,7 @@ async function dialOut(host: string, port: number, expectedNodeId?: string): Pro
   });
 }
 
-/** Active sockets — kept alive so links stay LINK_UP after the dial promise resolves. */
+/** Active sockets — kept alive so links stay ADV_VERIFIED after the dial promise resolves. */
 const activeSockets = new Set<Socket>();
 
 // ---------- HTTP control API ----------
