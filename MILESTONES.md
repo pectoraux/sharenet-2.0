@@ -9,7 +9,7 @@ Advance only when `ready_for_next_gate: true` and CI verifies the gate evidence.
 | GATE-01 | Conformance foundation | ✅ COMPLETE | `73eada1` | `evidence/GATE-01.json` |
 | GATE-02 | Identity and persistent advertisement state | ✅ COMPLETE | `2c6ac24` | `evidence/GATE-02.json` |
 | GATE-03 | Secure authenticated directed links | ✅ COMPLETE | `d4a241c` | `evidence/GATE-03.json` |
-| GATE-04 | Discovery and topology hints | ⏳ PENDING | — | — |
+| GATE-04 | Discovery and topology hints | ✅ COMPLETE | `26eda87` | `evidence/GATE-04.json` |
 | GATE-05 | Service negotiation and route commitment | ⏳ PENDING | — | — |
 | GATE-06 | Circuits and encrypted forwarding | ⏳ PENDING | — | — |
 | GATE-07 | Mode A Internet gateway | ⏳ PENDING | — | — |

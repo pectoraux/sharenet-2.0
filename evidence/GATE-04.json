@@ -1,0 +1,47 @@
+{
+  "gate_id": "GATE-04",
+  "gate_title": "Discovery and topology hints",
+  "commit_sha": "26eda8713967de1f1d5226a948703d9f2c02fe2c",
+  "commit_message": "GATE-04: discovery and topology hints — bounded propagation + separate sequence floor",
+  "date": "2026-08-16",
+  "scope_completed": [
+    "RemoteNodeHint type (reference/topology/remote-node-hint.ts — existing, with __brand phantom type)",
+    "Signed propagation message (createRemoteNodeHint + verifyRemoteNodeHint with reporter Ed25519 signature)",
+    "Separate propagation sequence floor (HintPropagationStore — distinct from advertisement sequence floor)",
+    "Bounded size (MAX_TOTAL_HINTS=10000, MAX_HINTS_PER_REPORTER=100 with eviction)",
+    "Bounded horizon (hopCount ≤ MAX_HINT_HOPS=3, forwardHint drops at max)",
+    "Freshness (timestamp within MAX_HINT_FRESHNESS_SECONDS=3600s)",
+    "Provenance (reporterNodeId + reporterSignature on every hint)",
+    "Replay protection (nonce uniqueness per reporter in HintPropagationStore)",
+    "forwardHint() with hopCount increment + re-signing + horizon drop",
+    "purgeExpired() for stale hint cleanup",
+    "PROMOTE_HINT_TO_RECORD_FORBIDDEN architecture guard (existing, verified by test #2)",
+    "12 unit tests covering all bounds + guards"
+  ],
+  "commands_run": [
+    "bun install --frozen-lockfile",
+    "bun run lint",
+    "bun run test:unit",
+    "bun run test:arch",
+    "bun run tools/verify-gate.ts"
+  ],
+  "pass_fail_skipped": {
+    "lint": { "errors": 0, "warnings": 0 },
+    "unit": { "total": 27, "passed": 27, "failed": 0, "skipped": 0 },
+    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
+    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+  },
+  "vector_files_consumed": [],
+  "vector_files_generated": [],
+  "protocol_adr_references": [
+    "spec/06-topology.md (RemoteNodeHint, bounded propagation, provenance, freshness)",
+    "ADR-0007 (AuthenticatedNodeRecord pipeline — hint cannot promote)",
+    "ADR-0013 (three-layer separation — hint store is in reference/, DB-free)"
+  ],
+  "known_limitations": [
+    "Three-node real-process propagation test (integration) is deferred to a follow-up. The unit tests prove the protocol-core correctness; the integration test will exercise the mini-services once they support hint propagation.",
+    "The hint propagation store is in-memory only. A production implementation would need persistent storage for the propagation sequence floor (similar to the advertisement sequence floor).",
+    "The forwardHint function replaces the reporter with the forwarder. A future extension could preserve the full provenance chain (list of forwarders) for auditability."
+  ],
+  "ready_for_next_gate": true
+}
