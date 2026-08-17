@@ -47,10 +47,16 @@ function makeCommittedRoute(nodeIds: string[], initiator: ReturnType<typeof gene
     agreementDigest: bytesToHex(randomBytes(32)),
   };
   const kps = nodeIds.map(() => generateNodeKeypair());
+  const serviceAgreements = new Map<number, any>();
+  const hopPublicKeys = new Map<string, Uint8Array>();
+  for (let i = 0; i < nodeIds.length; i++) {
+    serviceAgreements.set(i, {nodeId:nodeIds[i],capability:hops[i]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    hopPublicKeys.set(nodeIds[i]!, kps[i]!.publicKey);
+  }
   const acceptances = nodeIds.map((nodeId, i) =>
-    signRouteAcceptance(proposal.routeId, i, nodeId, proposal.expiry, kps[i]!.secretKey),
+    signRouteAcceptance(proposal, i, hops[i]!, serviceAgreements.get(i)!, nodeId, kps[i]!.secretKey, proposal.expiry),
   );
-  const result = createRouteCommitment(proposal, acceptances, initiator.secretKey, REFERENCE_NOW);
+  const result = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, initiator.secretKey, REFERENCE_NOW);
   if (!result.ok) throw new Error("commitment failed");
   return createCommittedRoute(result.commitment);
 }

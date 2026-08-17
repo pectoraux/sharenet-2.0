@@ -1,43 +1,42 @@
 /**
- * ShareNet 2.0 — Route Objects (GATE-05).
+ * ShareNet 2.0 — Route Objects (R-003: repaired acceptance binding).
  *
- * Per spec/07-routing.md and spec/00 §23 (Route Objects):
+ * Per R-003 requirement, RouteAcceptance now cryptographically binds:
+ *   proposal_digest (the exact route being accepted)
+ *   hop_index (which hop this acceptance is for)
+ *   hop_digest (the exact hop descriptor — nodeId, capability, endpoint, linkUp)
+ *   service_digest (the exact service agreement terms)
+ *   acceptor_node_id (who is accepting)
+ *   acceptance_nonce (fresh per-acceptance nonce)
+ *   expiry (when the acceptance expires)
  *
- *   Define distinct objects:
- *     RouteProposal
- *     RouteAcceptance
- *     RouteCommitment
- *     CommittedRoute
+ * The acceptance signature proves:
+ *   "Node X, occupying hop N, accepts this exact route proposal, this exact
+ *    role, and these exact negotiated service terms until this expiry."
  *
- *   A source signature cannot substitute for participant acceptance.
- *   Each executable hop must contain sufficient authenticated information
- *   to prove: node identity, link authenticity, transport usability,
- *   service compatibility, policy acceptance.
+ * Per R-003: immutable canonical artifacts. Digests are computed once
+ * and carried explicitly. Verification compares the carried digest.
+ * No TOCTOU — the verifier does not recompute digests from mutable objects.
  *
- *   Per spec/00 §22 (Routing):
- *     The correct conceptual sequence is:
- *       Discovery → Candidate Destination → Destination Authentication →
- *       Next-Hop Discovery → Path Validation → Service Negotiation →
- *       Route Proposal → Route Acceptance → Committed Route → Circuit
+ * Per R-004 (merged into R-003E): createRouteCommitment MUST verify every
+ * acceptance signature before issuing a CommittedRoute.
  *
- *     Distance hints are discovery metadata. They are never executable
- *     routing instructions.
- *
- * Per spec/00 §31 (forbidden transitions):
- *   topology/Dijkstra output alone cannot create a route.
- *
- * ARCHITECTURE GUARD: TOPOLOGY_TO_ROUTE_FORBIDDEN throws if any code
- * attempts to create a CommittedRoute from topology/graph data without
- * going through the full RouteProposal → RouteAcceptance → RouteCommitment
- * pipeline.
+ * Per spec/00 §31: topology/Dijkstra → route is FORBIDDEN.
+ * Per spec/00 §31: RouteProposal → ActiveCircuit (without commitment) is FORBIDDEN.
  */
 
 import { signMessage, verifySignature, type NodeCapability } from "../identity/keys";
-import { canonicalEncode, toHex, fromHex } from "../encoding/cbor";
+import { blake3 } from "@noble/hashes/blake3.js";
+import { randomBytes } from "@noble/hashes/utils.js";
+import { canonicalEncode, toHex } from "../encoding/cbor";
+import { proposalDigest, hopDigest, serviceDigest } from "./digests";
 import type { ServiceAgreement } from "./service-negotiation";
 
+// Re-export ServiceAgreement type for convenience
+export type { ServiceAgreement } from "./service-negotiation";
+
 // -----------------------------------------------------------------------
-// Domain tags (FROZEN per spec/14 §4)
+// Domain tags (FROZEN per spec/14 §4 + ADR-0017)
 // -----------------------------------------------------------------------
 
 export const ROUTE_PROPOSAL_DOMAIN = "SHARENET/ROUTE/PROPOSAL/1";
@@ -48,54 +47,27 @@ export const ROUTE_COMMITMENT_DOMAIN = "SHARENET/ROUTE/COMMITMENT/1";
 // Hop (a single hop in a route)
 // -----------------------------------------------------------------------
 
-/**
- * A hop in a route. Each hop MUST have:
- *   - an authenticated node (NodeId)
- *   - a LINK_UP link (not ADV_VERIFIED)
- *   - transport usability (endpoint)
- *   - role (what this hop does: relay, gateway, etc.)
- *   - policy acceptance (the node agreed to the policy)
- *   - service compatibility (the node has the required capability)
- */
 export interface RouteHop {
-  /** The node at this hop. Must be an AuthenticatedNodeRecord. */
   nodeId: string;
-  /** The capability this hop provides (MESH_RELAY, INTERNET_GATEWAY, etc.). */
   capability: NodeCapability;
-  /** The endpoint to reach this node. */
   endpoint: string;
-  /** Whether this hop has LINK_UP (must be true; ADV_VERIFIED is NOT routable). */
   linkUp: boolean;
-  /** The service agreement for this hop (from service negotiation). */
   serviceAgreement?: ServiceAgreement;
 }
 
 // -----------------------------------------------------------------------
-// RouteProposal (proposed by the initiator, NOT yet accepted)
+// RouteProposal
 // -----------------------------------------------------------------------
 
-/**
- * A RouteProposal is the initiator's proposed path. It is NOT an executable
- * route. Each hop MUST accept (sign) before the route becomes committed.
- *
- * Per spec/00 §23: "A source signature cannot substitute for participant acceptance."
- */
 export interface RouteProposal {
-  /** Unique route ID (random 32 bytes, hex-encoded). */
   routeId: string;
-  /** Ordered hops from source to destination. */
   hops: RouteHop[];
-  /** The service requirement this route satisfies. */
   requirementDigest: string;
-  /** Route expiry (unix seconds). */
   expiry: number;
-  /** The initiator's NodeId. */
   initiatorNodeId: string;
-  /** Agreement digest (BLAKE3-256 of all hop service agreements). */
   agreementDigest: string;
 }
 
-/** Compute the signing payload for a RouteProposal. */
 export function routeProposalSigningPayload(proposal: RouteProposal): Uint8Array {
   const m = new Map<number, unknown>([
     [1, proposal.routeId],
@@ -113,11 +85,6 @@ export function routeProposalSigningPayload(proposal: RouteProposal): Uint8Array
   return out;
 }
 
-/**
- * Create a signed RouteProposal. The initiator signs the proposal.
- * NOTE: the initiator's signature does NOT make this an executable route.
- * Each hop must independently accept.
- */
 export function createRouteProposal(
   proposal: RouteProposal,
   initiatorSecretKey: Uint8Array,
@@ -133,147 +100,317 @@ export interface SignedRouteProposal {
 }
 
 // -----------------------------------------------------------------------
-// RouteAcceptance (each hop signs acceptance)
+// RouteAcceptance (R-003C: fully bound)
 // -----------------------------------------------------------------------
 
 /**
  * A RouteAcceptance is a hop's signed agreement to participate in the route.
- * Each hop MUST sign independently. The initiator's signature is NOT sufficient.
+ *
+ * Per R-003: the acceptance MUST bind:
+ *   - proposal_digest: the exact route proposal being accepted
+ *   - hop_index: which hop this acceptance is for
+ *   - hop_digest: the exact hop descriptor (nodeId, capability, endpoint, linkUp)
+ *   - service_digest: the exact service agreement terms
+ *   - acceptor_node_id: who is accepting
+ *   - acceptance_nonce: fresh per-acceptance nonce (16 bytes)
+ *   - expiry: when the acceptance expires
+ *
+ * The acceptance signature proves:
+ *   "Node X, occupying hop N, accepts this exact route proposal, this exact
+ *    role, and these exact negotiated service terms until this expiry."
+ *
+ * Mutating ANY of these fields invalidates the signature.
  */
 export interface RouteAcceptance {
-  routeId: string;
-  hopIndex: number;
-  acceptorNodeId: string;
-  expiry: number;
-  /** The acceptor's signature over the acceptance payload. */
-  signature: Uint8Array;
+  proposalDigestHex: string;     // BLAKE3-256 of the canonical RouteProposal
+  hopIndex: number;              // which hop this acceptance is for
+  hopDigestHex: string;           // BLAKE3-256 of the canonical HopDescriptor
+  serviceDigestHex: string;      // BLAKE3-256 of the canonical ServiceAgreement
+  acceptorNodeId: string;        // who is accepting
+  acceptanceNonce: Uint8Array;    // 16 random bytes (fresh per acceptance)
+  expiry: number;                // unix seconds
+  signature: Uint8Array;          // Ed25519 by acceptor over the payload
 }
 
-/** Compute the signing payload for a RouteAcceptance. */
+/**
+ * Compute the signing payload for a RouteAcceptance.
+ *
+ * payload = domain || proposal_digest || hop_index || hop_digest || service_digest || acceptor_node_id || nonce || expiry
+ */
 export function routeAcceptanceSigningPayload(
-  routeId: string,
+  proposalDigestBytes: Uint8Array,
   hopIndex: number,
+  hopDigestBytes: Uint8Array,
+  serviceDigestBytes: Uint8Array,
   acceptorNodeId: string,
+  acceptanceNonce: Uint8Array,
   expiry: number,
 ): Uint8Array {
-  const m = new Map<number, unknown>([
-    [1, routeId],
-    [2, hopIndex],
-    [3, acceptorNodeId],
-    [4, expiry],
-  ]);
-  const body = canonicalEncode(m);
   const domain = new TextEncoder().encode(ROUTE_ACCEPTANCE_DOMAIN);
-  const out = new Uint8Array(domain.length + body.length);
-  out.set(domain, 0);
-  out.set(body, domain.length);
+  const acceptorBytes = new TextEncoder().encode(acceptorNodeId);
+  const hopIndexBuf = new Uint8Array(4);
+  new DataView(hopIndexBuf.buffer).setUint32(0, hopIndex, false);
+  const expiryBuf = new Uint8Array(8);
+  const expiryView = new DataView(expiryBuf.buffer);
+  expiryView.setUint32(0, Math.floor(expiry / 0x100000000), false);
+  expiryView.setUint32(4, expiry & 0xFFFFFFFF, false);
+
+  const totalLen = domain.length + 32 + 4 + 32 + 32 + acceptorBytes.length + 16 + 8;
+  const out = new Uint8Array(totalLen);
+  let off = 0;
+  out.set(domain, off); off += domain.length;
+  out.set(proposalDigestBytes, off); off += 32;
+  out.set(hopIndexBuf, off); off += 4;
+  out.set(hopDigestBytes, off); off += 32;
+  out.set(serviceDigestBytes, off); off += 32;
+  out.set(acceptorBytes, off); off += acceptorBytes.length;
+  out.set(acceptanceNonce, off); off += 16;
+  out.set(expiryBuf, off);
   return out;
 }
 
 /**
- * A hop signs acceptance of its role in the route.
- * The signature binds: routeId, hopIndex, acceptorNodeId, expiry.
+ * Sign a RouteAcceptance. The acceptor signs over:
+ *   proposal_digest + hop_index + hop_digest + service_digest + acceptor_node_id + nonce + expiry
+ *
+ * The digests are computed from the immutable canonical CBOR of the
+ * RouteProposal and HopDescriptor. They are carried as fixed 32-byte
+ * values in the acceptance — no TOCTOU.
  */
 export function signRouteAcceptance(
-  routeId: string,
+  proposal: RouteProposal,
   hopIndex: number,
+  hop: RouteHop,
+  serviceAgreement: ServiceAgreement,
   acceptorNodeId: string,
-  expiry: number,
   acceptorSecretKey: Uint8Array,
+  expiry: number,
 ): RouteAcceptance {
-  const payload = routeAcceptanceSigningPayload(routeId, hopIndex, acceptorNodeId, expiry);
+  const proposalDigestBytes = proposalDigest(proposal);
+  const hopDigestBytes = hopDigest(hop);
+  const serviceDigestBytes = serviceDigest(serviceAgreement);
+  const nonce = randomBytes(16);
+
+  const payload = routeAcceptanceSigningPayload(
+    proposalDigestBytes, hopIndex, hopDigestBytes, serviceDigestBytes,
+    acceptorNodeId, nonce, expiry,
+  );
   const signature = signMessage(acceptorSecretKey, payload);
-  return { routeId, hopIndex, acceptorNodeId, expiry, signature };
+
+  return {
+    proposalDigestHex: toHex(proposalDigestBytes),
+    hopIndex,
+    hopDigestHex: toHex(hopDigestBytes),
+    serviceDigestHex: toHex(serviceDigestBytes),
+    acceptorNodeId,
+    acceptanceNonce: nonce,
+    expiry,
+    signature,
+  };
 }
 
 /**
- * Verify a RouteAcceptance signature.
+ * Verify a RouteAcceptance signature against the acceptor's public key.
+ *
+ * Per R-003D: cryptographic acceptance verification.
+ * The verification uses the CARRIED digests (proposalDigestHex, hopDigestHex,
+ * serviceDigestHex) — it does NOT recompute them from mutable objects.
+ * This prevents TOCTOU: the digests were frozen at signing time and are
+ * compared as-is.
  */
 export function verifyRouteAcceptance(
   acceptance: RouteAcceptance,
   acceptorPublicKey: Uint8Array,
 ): boolean {
+  const proposalDigestBytes = fromHexCompat(acceptance.proposalDigestHex);
+  const hopDigestBytes = fromHexCompat(acceptance.hopDigestHex);
+  const serviceDigestBytes = fromHexCompat(acceptance.serviceDigestHex);
+
   const payload = routeAcceptanceSigningPayload(
-    acceptance.routeId,
-    acceptance.hopIndex,
-    acceptance.acceptorNodeId,
-    acceptance.expiry,
+    proposalDigestBytes, acceptance.hopIndex, hopDigestBytes, serviceDigestBytes,
+    acceptance.acceptorNodeId, acceptance.acceptanceNonce, acceptance.expiry,
   );
   return verifySignature(acceptorPublicKey, payload, acceptance.signature);
 }
 
+/**
+ * Verify that a RouteAcceptance matches the expected proposal and hop.
+ * Compares the CARRIED digests against freshly-computed ones from the
+ * immutable canonical objects. This is the binding check — it ensures
+ * the acceptance was signed over EXACTLY this proposal + hop + service.
+ *
+ * Per R-003D test requirement:
+ *   modify proposal → digest mismatch → FAIL
+ *   modify hop → digest mismatch → FAIL
+ *   modify service agreement → digest mismatch → FAIL
+ */
+export function verifyAcceptanceBinding(
+  acceptance: RouteAcceptance,
+  proposal: RouteProposal,
+  hopIndex: number,
+  hop: RouteHop,
+  serviceAgreement: ServiceAgreement,
+): { ok: true } | { ok: false; reason: string } {
+  if (acceptance.hopIndex !== hopIndex) {
+    return { ok: false, reason: `hopIndex mismatch: expected ${hopIndex}, got ${acceptance.hopIndex}` };
+  }
+
+  const expectedProposalDigest = toHex(proposalDigest(proposal));
+  if (acceptance.proposalDigestHex !== expectedProposalDigest) {
+    return { ok: false, reason: `proposal digest mismatch: expected ${expectedProposalDigest.slice(0, 16)}..., got ${acceptance.proposalDigestHex.slice(0, 16)}...` };
+  }
+
+  const expectedHopDigest = toHex(hopDigest(hop));
+  if (acceptance.hopDigestHex !== expectedHopDigest) {
+    return { ok: false, reason: `hop digest mismatch: expected ${expectedHopDigest.slice(0, 16)}..., got ${acceptance.hopDigestHex.slice(0, 16)}...` };
+  }
+
+  const expectedServiceDigest = toHex(serviceDigest(serviceAgreement));
+  if (acceptance.serviceDigestHex !== expectedServiceDigest) {
+    return { ok: false, reason: `service digest mismatch: expected ${expectedServiceDigest.slice(0, 16)}..., got ${acceptance.serviceDigestHex.slice(0, 16)}...` };
+  }
+
+  return { ok: true };
+}
+
 // -----------------------------------------------------------------------
-// RouteCommitment (all hops accepted → commit)
+// RouteCommitment (R-003E/R-004: verifies signatures)
 // -----------------------------------------------------------------------
 
-/**
- * A RouteCommitment is created when ALL hops have signed acceptance.
- * It is the final step before a CommittedRoute.
- *
- * Per spec/00 §31: "RouteProposal → ActiveCircuit without commitment" is forbidden.
- * A circuit can ONLY be created from a CommittedRoute.
- */
 export interface RouteCommitment {
   routeId: string;
   proposal: RouteProposal;
   acceptances: RouteAcceptance[];
-  /** Committer's signature (usually the initiator). */
   committerSignature: Uint8Array;
   committedAt: number;
 }
 
 /**
+ * Acceptance verification result (for R-004).
+ */
+export interface AcceptanceVerificationResult {
+  hopIndex: number;
+  signatureValid: boolean;
+  bindingValid: boolean;
+  reason?: string;
+}
+
+/**
  * Create a RouteCommitment from a proposal + all acceptances.
  *
- * Validates that:
- *   1. Every hop in the proposal has a corresponding acceptance.
- *   2. Each acceptance is from the correct node (matches hop.nodeId).
- *   3. No hop is ADV_VERIFIED-only (all must be LINK_UP).
+ * Per R-003E/R-004: this function MUST verify every acceptance signature
+ * AND every acceptance binding before issuing a CommittedRoute.
+ *
+ * The only legal pipeline:
+ *   for each hop:
+ *     resolve authentic public key
+ *     ↓
+ *   verify RouteAcceptance signature
+ *     ↓
+ *   validate acceptance against proposal digest
+ *     ↓
+ *   validate hop binding
+ *     ↓
+ *   validate service agreement binding
+ *     ↓
+ *   validate expiry
+ *     ↓
+ *   commit
  */
 export function createRouteCommitment(
   proposal: RouteProposal,
   acceptances: RouteAcceptance[],
+  hopPublicKeys: Map<string, Uint8Array>, // nodeId → public key
+  serviceAgreements: Map<number, ServiceAgreement>, // hopIndex → agreement
   committerSecretKey: Uint8Array,
   now: number,
-): { ok: true; commitment: RouteCommitment } | { ok: false; reason: string } {
+): { ok: true; commitment: RouteCommitment; verificationResults: AcceptanceVerificationResult[] } | { ok: false; reason: string; verificationResults: AcceptanceVerificationResult[] } {
   // 1. Check every hop has an acceptance
   if (acceptances.length !== proposal.hops.length) {
     return {
       ok: false,
       reason: `expected ${proposal.hops.length} acceptances, got ${acceptances.length}`,
+      verificationResults: [],
     };
   }
 
-  // 2. Check each acceptance matches the correct hop
+  const verificationResults: AcceptanceVerificationResult[] = [];
+
+  // 2. Verify each acceptance
   for (let i = 0; i < proposal.hops.length; i++) {
     const hop = proposal.hops[i]!;
-    const acc = acceptances[i];
-    if (!acc) {
-      return { ok: false, reason: `missing acceptance for hop ${i}` };
-    }
+    const acc = acceptances[i]!;
+    const result: AcceptanceVerificationResult = {
+      hopIndex: i,
+      signatureValid: false,
+      bindingValid: false,
+    };
+
+    // 2a. Check hopIndex
     if (acc.hopIndex !== i) {
-      return { ok: false, reason: `acceptance ${i} has wrong hopIndex ${acc.hopIndex}` };
+      result.reason = `acceptance ${i} has wrong hopIndex ${acc.hopIndex}`;
+      verificationResults.push(result);
+      return { ok: false, reason: result.reason, verificationResults };
     }
+
+    // 2b. Check acceptorNodeId matches hop
     if (acc.acceptorNodeId !== hop.nodeId) {
-      return {
-        ok: false,
-        reason: `acceptance ${i} from ${acc.acceptorNodeId} != hop ${hop.nodeId}`,
-      };
+      result.reason = `acceptance ${i} acceptor ${acc.acceptorNodeId} != hop ${hop.nodeId}`;
+      verificationResults.push(result);
+      return { ok: false, reason: result.reason, verificationResults };
     }
+
+    // 2c. Check expiry
     if (acc.expiry <= now) {
-      return { ok: false, reason: `acceptance ${i} expired` };
+      result.reason = `acceptance ${i} expired`;
+      verificationResults.push(result);
+      return { ok: false, reason: result.reason, verificationResults };
     }
-  }
 
-  // 3. Check no hop is ADV_VERIFIED-only (all must be LINK_UP)
-  for (let i = 0; i < proposal.hops.length; i++) {
-    const hop = proposal.hops[i]!;
+    // 2d. Resolve public key
+    const pubKey = hopPublicKeys.get(hop.nodeId);
+    if (!pubKey) {
+      result.reason = `no public key for hop ${i} (${hop.nodeId})`;
+      verificationResults.push(result);
+      return { ok: false, reason: result.reason, verificationResults };
+    }
+
+    // 2e. Verify signature (R-004: mandatory)
+    const sigOk = verifyRouteAcceptance(acc, pubKey);
+    result.signatureValid = sigOk;
+    if (!sigOk) {
+      result.reason = `acceptance ${i} signature invalid`;
+      verificationResults.push(result);
+      return { ok: false, reason: result.reason, verificationResults };
+    }
+
+    // 2f. Verify binding (R-003D: the acceptance was signed over EXACTLY this proposal + hop)
+    const serviceAgreement = serviceAgreements.get(i);
+    if (!serviceAgreement) {
+      result.reason = `no service agreement for hop ${i}`;
+      verificationResults.push(result);
+      return { ok: false, reason: result.reason, verificationResults };
+    }
+
+    const bindingResult = verifyAcceptanceBinding(acc, proposal, i, hop, serviceAgreement);
+    result.bindingValid = bindingResult.ok;
+    if (!bindingResult.ok) {
+      result.reason = bindingResult.reason;
+      verificationResults.push(result);
+      return { ok: false, reason: result.reason, verificationResults };
+    }
+
+    // 2g. Check no hop is ADV_VERIFIED-only (all must be LINK_UP)
     if (!hop.linkUp) {
-      return { ok: false, reason: `hop ${i} (${hop.nodeId}) is not LINK_UP` };
+      result.reason = `hop ${i} (${hop.nodeId}) is not LINK_UP`;
+      verificationResults.push(result);
+      return { ok: false, reason: result.reason, verificationResults };
     }
+
+    verificationResults.push(result);
   }
 
-  // Sign the commitment
+  // 3. All verifications passed — sign the commitment
   const payload = routeCommitmentSigningPayload(proposal, acceptances);
   const signature = signMessage(committerSecretKey, payload);
 
@@ -286,6 +423,7 @@ export function createRouteCommitment(
       committerSignature: signature,
       committedAt: now,
     },
+    verificationResults,
   };
 }
 
@@ -307,18 +445,9 @@ function routeCommitmentSigningPayload(
 }
 
 // -----------------------------------------------------------------------
-// CommittedRoute (the executable route, created ONLY from a commitment)
+// CommittedRoute
 // -----------------------------------------------------------------------
 
-/**
- * A CommittedRoute is the ONLY object that can be used to create a circuit.
- *
- * Per spec/00 §31:
- *   RouteProposal → ActiveCircuit (without commitment) is FORBIDDEN.
- *   topology/Dijkstra output → Route is FORBIDDEN.
- *
- * A CommittedRoute is created ONLY from a RouteCommitment.
- */
 export interface CommittedRoute {
   routeId: string;
   hops: RouteHop[];
@@ -328,12 +457,6 @@ export interface CommittedRoute {
   committedAt: number;
 }
 
-/**
- * Create a CommittedRoute from a RouteCommitment.
- *
- * This is the ONLY function that creates a CommittedRoute.
- * It requires a valid RouteCommitment (all hops accepted).
- */
 export function createCommittedRoute(commitment: RouteCommitment): CommittedRoute {
   return {
     routeId: commitment.routeId,
@@ -346,17 +469,9 @@ export function createCommittedRoute(commitment: RouteCommitment): CommittedRout
 }
 
 // -----------------------------------------------------------------------
-// ARCHITECTURE GUARD: topology/Dijkstra → Route is FORBIDDEN
+// Architecture guards
 // -----------------------------------------------------------------------
 
-/**
- * Per spec/00 §31 and spec/07:
- *   topology/Dijkstra output alone cannot create a route.
- *
- * This guard throws if any code attempts to create a CommittedRoute from
- * topology/graph data without going through the full
- * RouteProposal → RouteAcceptance → RouteCommitment pipeline.
- */
 export function TOPOLOGY_TO_ROUTE_FORBIDDEN(topologyData: unknown): never {
   throw new Error(
     `ARCHITECTURE VIOLATION: attempted to create a CommittedRoute from topology/Dijkstra ` +
@@ -366,17 +481,25 @@ export function TOPOLOGY_TO_ROUTE_FORBIDDEN(topologyData: unknown): never {
   );
 }
 
-/**
- * Per spec/00 §31:
- *   RouteProposal → ActiveCircuit (without commitment) is FORBIDDEN.
- *
- * This guard throws if any code attempts to create a circuit from a
- * RouteProposal without first creating a RouteCommitment.
- */
 export function PROPOSAL_TO_CIRCUIT_FORBIDDEN(proposal: RouteProposal): never {
   throw new Error(
     `ARCHITECTURE VIOLATION: attempted to create a circuit from RouteProposal ` +
       `(routeId=${proposal.routeId}) without a RouteCommitment. ` +
       `Per spec/00 §31, a circuit can ONLY be created from a CommittedRoute.`,
   );
+}
+
+// -----------------------------------------------------------------------
+// Internal helper
+// -----------------------------------------------------------------------
+
+function fromHexCompat(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) throw new Error(`invalid hex length: ${hex.length}`);
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const b = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    if (Number.isNaN(b)) throw new Error(`invalid hex byte at offset ${i * 2}`);
+    out[i] = b;
+  }
+  return out;
 }

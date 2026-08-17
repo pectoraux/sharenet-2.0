@@ -58,11 +58,18 @@ function makeCommittedRoute(numHops = 2) {
     agreementDigest: bytesToHex(randomBytes(32)),
   };
 
+  const serviceAgreements = new Map<number, any>();
+  const hopPublicKeys = new Map<string, Uint8Array>();
+  for (let i = 0; i < kps.length; i++) {
+    serviceAgreements.set(i, {nodeId:kps[i]!.nodeId,capability:hops[i]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    hopPublicKeys.set(kps[i]!.nodeId, kps[i]!.publicKey);
+  }
+
   const acceptances = kps.map((kp, i) =>
-    signRouteAcceptance(proposal.routeId, i, kp.nodeId, proposal.expiry, kp.secretKey),
+    signRouteAcceptance(proposal, i, hops[i]!, serviceAgreements.get(i)!, kp.nodeId, kp.secretKey, proposal.expiry),
   );
 
-  const commitmentResult = createRouteCommitment(proposal, acceptances, initiator.secretKey, REFERENCE_NOW);
+  const commitmentResult = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, initiator.secretKey, REFERENCE_NOW);
   if (!commitmentResult.ok) throw new Error("failed to create commitment");
   return { route: createCommittedRoute(commitmentResult.commitment), kps, initiator };
 }

@@ -134,7 +134,7 @@ it applies to that hop's role in the path.
 ```
 RouteAcceptance = {
   acceptance_version:  1,
-  proposal_hash:        bstr .size 32, ; BLAKE2b-256 of canonical RouteProposal
+  proposal_hash:        bstr .size 32, ; BLAKE3-256 of canonical RouteProposal
   acceptor_id:          text,
   acceptor_pubkey:      bstr .size 32,
   accepted_role:        "relay" | "gateway",
@@ -159,7 +159,7 @@ RouteCommitment = {
   commitment_version: 1,
   proposal:           RouteProposal,
   acceptances:        [+ RouteAcceptance],
-  commitment_root:    bstr .size 32, ; BLAKE2b-256 of canonical merkle
+  commitment_root:    bstr .size 32, ; BLAKE3-256 of canonical merkle
   commitment_nonce:   bstr .size 16,
   source_signature:   bstr .size 64, ; Ed25519 by source over the rest
 }

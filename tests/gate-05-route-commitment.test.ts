@@ -264,14 +264,21 @@ describe("GATE-05: Service negotiation and route commitment", () => {
       agreementDigest: bytesToHex(randomBytes(32)),
     };
 
+    // Build service agreements + public keys
+    const serviceAgreements = new Map<number, any>();
+    const hopPublicKeys = new Map<string, Uint8Array>();
+    serviceAgreements.set(0, {nodeId:kps.relay.nodeId,capability:proposal.hops[0]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    serviceAgreements.set(1, {nodeId:kps.gateway.nodeId,capability:proposal.hops[1]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    hopPublicKeys.set(kps.relay.nodeId, kps.relay.publicKey);
+    hopPublicKeys.set(kps.gateway.nodeId, kps.gateway.publicKey);
     // Each hop signs acceptance
     const acceptances = [
-      signRouteAcceptance(proposal.routeId, 0, kps.relay.nodeId, proposal.expiry, kps.relay.secretKey),
-      signRouteAcceptance(proposal.routeId, 1, kps.gateway.nodeId, proposal.expiry, kps.gateway.secretKey),
+      signRouteAcceptance(proposal, 0, proposal.hops[0]!, serviceAgreements.get(0)!, kps.relay.nodeId, kps.relay.secretKey, proposal.expiry),
+      signRouteAcceptance(proposal, 1, proposal.hops[1]!, serviceAgreements.get(1)!, kps.gateway.nodeId, kps.gateway.secretKey, proposal.expiry),
     ];
 
     // Create commitment
-    const commitmentResult = createRouteCommitment(proposal, acceptances, kps.initiator.secretKey, REFERENCE_NOW);
+    const commitmentResult = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, kps.initiator.secretKey, REFERENCE_NOW);
     expect(commitmentResult.ok).toBe(true);
 
     if (commitmentResult.ok) {
@@ -300,11 +307,17 @@ describe("GATE-05: Service negotiation and route commitment", () => {
     };
 
     // Only one acceptance (missing the second)
+    const serviceAgreements = new Map<number, any>();
+    const hopPublicKeys = new Map<string, Uint8Array>();
+    serviceAgreements.set(0, {nodeId:kps.relay.nodeId,capability:proposal.hops[0]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    serviceAgreements.set(1, {nodeId:kps.gateway.nodeId,capability:proposal.hops[1]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    hopPublicKeys.set(kps.relay.nodeId, kps.relay.publicKey);
+    hopPublicKeys.set(kps.gateway.nodeId, kps.gateway.publicKey);
     const acceptances = [
-      signRouteAcceptance(proposal.routeId, 0, kps.relay.nodeId, proposal.expiry, kps.relay.secretKey),
+      signRouteAcceptance(proposal, 0, proposal.hops[0]!, serviceAgreements.get(0)!, kps.relay.nodeId, kps.relay.secretKey, proposal.expiry),
     ];
 
-    const result = createRouteCommitment(proposal, acceptances, kps.initiator.secretKey, REFERENCE_NOW);
+    const result = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, kps.initiator.secretKey, REFERENCE_NOW);
     expect(result.ok).toBe(false);
   });
 
@@ -323,13 +336,20 @@ describe("GATE-05: Service negotiation and route commitment", () => {
       agreementDigest: bytesToHex(randomBytes(32)),
     };
 
+    // Build service agreements + public keys
+    const serviceAgreements = new Map<number, any>();
+    const hopPublicKeys = new Map<string, Uint8Array>();
+    serviceAgreements.set(0, {nodeId:kps.relay.nodeId,capability:proposal.hops[0]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    serviceAgreements.set(1, {nodeId:kps.gateway.nodeId,capability:proposal.hops[1]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    hopPublicKeys.set(kps.relay.nodeId, kps.relay.publicKey);
+    hopPublicKeys.set(kps.gateway.nodeId, kps.gateway.publicKey);
     // Second acceptance is from the wrong node (relay instead of gateway)
     const acceptances = [
-      signRouteAcceptance(proposal.routeId, 0, kps.relay.nodeId, proposal.expiry, kps.relay.secretKey),
-      signRouteAcceptance(proposal.routeId, 1, kps.relay.nodeId, proposal.expiry, kps.relay.secretKey), // wrong!
+      signRouteAcceptance(proposal, 0, proposal.hops[0]!, serviceAgreements.get(0)!, kps.relay.nodeId, kps.relay.secretKey, proposal.expiry),
+      signRouteAcceptance(proposal, 1, proposal.hops[1]!, serviceAgreements.get(1)!, kps.relay.nodeId, kps.relay.secretKey, proposal.expiry), // wrong!
     ];
 
-    const result = createRouteCommitment(proposal, acceptances, kps.initiator.secretKey, REFERENCE_NOW);
+    const result = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, kps.initiator.secretKey, REFERENCE_NOW);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("acceptance 1");
   });
@@ -349,12 +369,18 @@ describe("GATE-05: Service negotiation and route commitment", () => {
       agreementDigest: bytesToHex(randomBytes(32)),
     };
 
+    const serviceAgreements = new Map<number, any>();
+    const hopPublicKeys = new Map<string, Uint8Array>();
+    serviceAgreements.set(0, {nodeId:kps.relay.nodeId,capability:proposal.hops[0]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    serviceAgreements.set(1, {nodeId:kps.gateway.nodeId,capability:proposal.hops[1]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    hopPublicKeys.set(kps.relay.nodeId, kps.relay.publicKey);
+    hopPublicKeys.set(kps.gateway.nodeId, kps.gateway.publicKey);
     const acceptances = [
-      signRouteAcceptance(proposal.routeId, 0, kps.relay.nodeId, proposal.expiry, kps.relay.secretKey),
-      signRouteAcceptance(proposal.routeId, 1, kps.gateway.nodeId, proposal.expiry, kps.gateway.secretKey),
+      signRouteAcceptance(proposal, 0, proposal.hops[0]!, serviceAgreements.get(0)!, kps.relay.nodeId, kps.relay.secretKey, proposal.expiry),
+      signRouteAcceptance(proposal, 1, proposal.hops[1]!, serviceAgreements.get(1)!, kps.gateway.nodeId, kps.gateway.secretKey, proposal.expiry),
     ];
 
-    const result = createRouteCommitment(proposal, acceptances, kps.initiator.secretKey, REFERENCE_NOW);
+    const result = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, kps.initiator.secretKey, REFERENCE_NOW);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("not LINK_UP");
   });
@@ -374,13 +400,20 @@ describe("GATE-05: Service negotiation and route commitment", () => {
       agreementDigest: bytesToHex(randomBytes(32)),
     };
 
+    // Build service agreements + public keys
+    const serviceAgreements = new Map<number, any>();
+    const hopPublicKeys = new Map<string, Uint8Array>();
+    serviceAgreements.set(0, {nodeId:kps.relay.nodeId,capability:proposal.hops[0]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    serviceAgreements.set(1, {nodeId:kps.gateway.nodeId,capability:proposal.hops[1]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
+    hopPublicKeys.set(kps.relay.nodeId, kps.relay.publicKey);
+    hopPublicKeys.set(kps.gateway.nodeId, kps.gateway.publicKey);
     // Acceptances with expiry in the past
     const acceptances = [
-      signRouteAcceptance(proposal.routeId, 0, kps.relay.nodeId, REFERENCE_NOW - 100, kps.relay.secretKey),
-      signRouteAcceptance(proposal.routeId, 1, kps.gateway.nodeId, REFERENCE_NOW - 100, kps.gateway.secretKey),
+      signRouteAcceptance(proposal, 0, proposal.hops[0]!, serviceAgreements.get(0)!, kps.relay.nodeId, kps.relay.secretKey, REFERENCE_NOW - 100),
+      signRouteAcceptance(proposal, 1, proposal.hops[1]!, serviceAgreements.get(1)!, kps.gateway.nodeId, kps.gateway.secretKey, REFERENCE_NOW - 100),
     ];
 
-    const result = createRouteCommitment(proposal, acceptances, kps.initiator.secretKey, REFERENCE_NOW);
+    const result = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, kps.initiator.secretKey, REFERENCE_NOW);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("expired");
   });
@@ -406,7 +439,7 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   // --- 18. Route acceptance verification ---
   test("route acceptance verifies correctly", () => {
     const kp = generateNodeKeypair();
-    const acceptance = signRouteAcceptance("route123", 0, kp.nodeId, REFERENCE_NOW + 3600, kp.secretKey);
+    const acceptance = signRouteAcceptance({routeId:"route123",hops:[{nodeId:kp.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true}],requirementDigest:"",expiry:REFERENCE_NOW+3600,initiatorNodeId:"",agreementDigest:""} as any, 0, {nodeId:kp.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true} as any, {nodeId:kp.nodeId,capability:"MESH_RELAY",requirementDigest:"",allocatedBandwidthBps:0,expiry:REFERENCE_NOW+3600,policyVersion:1} as any, kp.nodeId, kp.secretKey, REFERENCE_NOW + 3600);
     const ok = verifyRouteAcceptance(acceptance, kp.publicKey);
     expect(ok).toBe(true);
   });
@@ -414,7 +447,7 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   test("route acceptance with wrong key fails", () => {
     const kpA = generateNodeKeypair();
     const kpB = generateNodeKeypair();
-    const acceptance = signRouteAcceptance("route123", 0, kpA.nodeId, REFERENCE_NOW + 3600, kpA.secretKey);
+    const acceptance = signRouteAcceptance({routeId:"route123",hops:[{nodeId:kpA.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true}],requirementDigest:"",expiry:REFERENCE_NOW+3600,initiatorNodeId:"",agreementDigest:""} as any, 0, {nodeId:kpA.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true} as any, {nodeId:kpA.nodeId,capability:"MESH_RELAY",requirementDigest:"",allocatedBandwidthBps:0,expiry:REFERENCE_NOW+3600,policyVersion:1} as any, kpA.nodeId, kpA.secretKey, REFERENCE_NOW + 3600);
     const ok = verifyRouteAcceptance(acceptance, kpB.publicKey);
     expect(ok).toBe(false);
   });
