@@ -20,6 +20,8 @@
 
 import { isVerifiedNodeAdvertisement, type VerifiedNodeAdvertisement } from "../advertisement/advertisement";
 import type { RouteCommitment } from "../routing/route";
+import type { AuthenticatedLink } from "./authenticated-link";
+import { isAuthenticatedLink } from "./authenticated-link";
 
 // -----------------------------------------------------------------------
 // Private WeakSet registries (genuinely unforgeable)
@@ -118,43 +120,51 @@ export interface ValidatedHop {
 
 /**
  * The ONLY function that creates a ValidatedHop.
+ *
+ * Per R-002-P1 (Principal Architect refinement): ValidatedHop now consumes
+ * a genuine `AuthenticatedLink` (WeakSet-registered) instead of the
+ * previous `(AuthenticatedNodeRecord, linkUp: boolean)` pair. This
+ * removes the caller-supplied trust boolean — `linkUp` is no longer a
+ * value the caller can set to `true`; it is implied by the genuine link
+ * artifact, which itself consumes a genuine `VerifiedTranscript` (the
+ * cryptographic evidence that the 3-message handshake completed).
+ *
  * Requires:
- *   1. A genuine AuthenticatedNodeRecord (WeakSet-verified)
- *   2. linkUp=true (the link is established, not ADV_VERIFIED)
- *   3. A service agreement digest (service was negotiated)
+ *   1. A genuine AuthenticatedLink (WeakSet-verified)
+ *      — which transitively requires a genuine AuthenticatedNodeRecord
+ *      + a genuine VerifiedTranscript (both possession proofs verified).
+ *   2. A service agreement digest (service was negotiated)
  *
  * Per R-006H2: a RemoteNodeHint or raw NodeId string will fail
- * isAuthenticatedNodeRecord() because they were never added to the
- * WeakSet by createAuthenticatedNodeRecord().
+ * isAuthenticatedLink() because they were never added to the WeakSet
+ * by createAuthenticatedLink().
  */
 export function createValidatedHop(
-  node: AuthenticatedNodeRecord,
+  link: AuthenticatedLink,
   endpoint: string,
   capability: string,
-  linkUp: boolean,
   serviceAgreementDigest: string,
 ): ValidatedHop {
-  if (!isAuthenticatedNodeRecord(node)) {
+  if (!isAuthenticatedLink(link)) {
     throw new Error(
-      "ARCHITECTURE VIOLATION: cannot create ValidatedHop — node is not a genuine " +
-        "AuthenticatedNodeRecord (WeakSet membership check failed). Per R-006H2, " +
-        "only verified advertisements can produce executable hops. Copying properties " +
-        "from a genuine AuthenticatedNodeRecord is insufficient — the WeakSet registry " +
-        "tracks object identity, not property values.",
+      "ARCHITECTURE VIOLATION: cannot create ValidatedHop — link is not a genuine " +
+        "AuthenticatedLink (WeakSet membership check failed). Per R-002-P1, " +
+        "only a genuine AuthenticatedLink (produced by createAuthenticatedLink, " +
+        "which consumes a genuine AuthenticatedNodeRecord + a genuine " +
+        "VerifiedTranscript) can produce a ValidatedHop. The previous " +
+        "caller-supplied `linkUp: boolean` trust bit has been removed — " +
+        "linkUp is now implied by the genuine link artifact. Copying " +
+        "properties from a genuine AuthenticatedLink is insufficient — " +
+        "the WeakSet registry tracks object identity, not property values.",
     );
   }
-  if (!linkUp) {
-    throw new Error(
-      "ARCHITECTURE VIOLATION: cannot create ValidatedHop — link is not LINK_UP. " +
-        "ADV_VERIFIED is not routable. Only LINK_UP links can produce executable hops.",
-    );
-  }
+  const node = link.remoteNode;
   const hop: ValidatedHop = {
     nodeId: node.nodeId,
     capability,
     endpoint,
     authenticatedNode: node,
-    linkUp: true,
+    linkUp: true, // implied by the genuine AuthenticatedLink — no longer caller-supplied
     serviceAgreementDigest,
   };
   validatedHopRegistry.add(hop);

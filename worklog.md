@@ -443,3 +443,40 @@ Stage Summary:
 - Dev server: healthy (`/` → 200; zero browser errors).
 - The unsafe `as unknown as ValidatedHop[]` cast is GONE. Every BrandedCommittedRoute is now constructed ONLY from genuine ValidatedHop artifacts that transited the full proof-carrying pipeline (verifyAdvertisement → createAuthenticatedNodeRecord → createValidatedHop), each verified by WeakSet membership.
 - R-006 construction-boundary defect: CLOSED. The trust chain is now genuine end-to-end — no cast, no forgery, no bypass.
+
+---
+Task ID: R-002-P1
+Agent: main (Z.ai Code)
+Task: Introduce the runtime AuthenticatedLink proof artifact and make ValidatedHop consume it instead of the caller-supplied linkUp:boolean. Replace trust booleans with proof artifacts.
+
+Work Log:
+- Created `reference/transport/authenticated-link.ts` — new module with two WeakSet-registered proof artifacts:
+  - `VerifiedTranscript`: factory verifies BOTH possession proofs (initiator + responder) against their respective public keys, over the correct transcript hashes (B signs hash(Initiate), A signs hash(Initiate+Accept)). If either fails, no artifact is produced.
+  - `AuthenticatedLink`: factory consumes a genuine AuthenticatedNodeRecord + genuine VerifiedTranscript, verifies the transcript's remote node matches the authNode's nodeId, and binds them. Carries the directional LinkId + transcript digest.
+  - Runtime checks: `isVerifiedTranscript()`, `isAuthenticatedLink()` — WeakSet membership, unforgeable.
+- Modified `createValidatedHop` in `validated-types.ts`:
+  - Old signature: `createValidatedHop(node: AuthenticatedNodeRecord, endpoint, capability, linkUp: boolean, saDigest)`
+  - New signature: `createValidatedHop(link: AuthenticatedLink, endpoint, capability, saDigest)`
+  - The `linkUp: boolean` parameter is GONE — it is now implied by the genuine AuthenticatedLink. A caller holding a genuine AuthenticatedNodeRecord can no longer pass `linkUp=true` without proof that the directed link completed the handshake.
+  - nodeId/publicKey are derived from `link.remoteNode`.
+- Updated `tests/helpers/branded-route-helper.ts`:
+  - Added `runHandshake()` function that runs a full 3-message handshake (Initiate → Accept → Confirm) per hop, producing genuine possession proofs.
+  - The helper now builds: adv → verify → AuthenticatedNodeRecord → 3-message handshake → VerifiedTranscript → AuthenticatedLink → ValidatedHop → RouteProposal → RouteCommitment → BrandedCommittedRoute.
+  - Returns enriched context with `authenticatedLinks[]` and `verifiedTranscripts[]`.
+- Updated all callers of `createValidatedHop`:
+  - `tests/r006h2-adversarial-validated-types.test.ts`: `makeGenuineCommitment` now delegates to the shared helper. Test #6 shows the new AuthenticatedLink step.
+  - `src/lib/sharenet/architecture-tests.ts`: test #11 updated to test that AuthenticatedNodeRecord alone (without AuthenticatedLink) → REJECTS. Tests #12 and #15 updated to use the shared helper for the positive case.
+- Created `tests/r002p1-authenticated-link.test.ts` (16 adversarial tests):
+  - VerifiedTranscript rejects: bad responder proof, bad initiator proof, wrong challenge, wrong linkIdBytes, tampered Accept message.
+  - AuthenticatedLink unforgeable: forged/copy rejected, non-genuine authNode rejected, non-genuine VerifiedTranscript rejected, transcript remote node mismatch rejected.
+  - ValidatedHop requires genuine AuthenticatedLink: genuine link succeeds (linkUp implied), non-genuine copy rejected, AuthenticatedNodeRecord alone rejected, plain object rejected.
+  - Genuine full pipeline (adv → authNode → handshake → VerifiedTranscript → AuthenticatedLink → ValidatedHop → BrandedCommittedRoute) succeeds end-to-end; branded route hops are the same object identity as the validatedHops.
+
+Stage Summary:
+- Tests: 251 → 267 pass, 0 fail (+16 new R-002-P1 adversarial tests). 737 expect() calls.
+- Architecture tests: 24/24 pass (tests #11, #12, #15 updated to exercise the new AuthenticatedLink boundary).
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The trust chain is now semantically complete end-to-end:
+    VerifiedNodeAdvertisement → AuthenticatedNodeRecord → VerifiedTranscript → AuthenticatedLink → ValidatedHop → RouteCommitment → BrandedCommittedRoute → setupCircuit
+  Every arrow is a WeakSet membership check. No caller-supplied trust booleans remain. The `linkUp: boolean` trust bit has been eliminated.

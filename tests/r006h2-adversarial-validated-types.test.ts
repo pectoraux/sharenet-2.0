@@ -18,19 +18,12 @@ import {
   signAdvertisement,
   verifyAdvertisement,
   isVerifiedNodeAdvertisement,
-  type NodeCapability,
   type VerifiedNodeAdvertisement,
 } from "@reference/advertisement/advertisement";
 import {
-  signRouteAcceptance,
-  createRouteCommitment,
-  type RouteProposal,
   type RouteHop,
   type RouteCommitment,
 } from "@reference/routing/route";
-import type { ServiceAgreement } from "@reference/routing/service-negotiation";
-import { serviceDigest } from "@reference/routing/digests";
-import { toHex } from "@reference/encoding/cbor";
 import {
   createAuthenticatedNodeRecord,
   isAuthenticatedNodeRecord,
@@ -39,9 +32,12 @@ import {
   createBrandedCommittedRoute,
   isBrandedCommittedRoute,
   isRouteCommitment,
-  type AuthenticatedNodeRecord,
   type ValidatedHop,
 } from "@reference/transport/validated-types";
+import { isAuthenticatedLink } from "@reference/transport/authenticated-link";
+import {
+  makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper,
+} from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
 
@@ -56,31 +52,13 @@ function makeGenuineVerifiedAdv(kp: ReturnType<typeof generateNodeKeypair>, now 
   return v.verified;
 }
 
-function makeGenuineCommitment(kp: ReturnType<typeof generateNodeKeypair>): { commitment: RouteCommitment; validatedHops: ValidatedHop[] } {
-  const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
-    hops: [{ nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
-    requirementDigest: bytesToHex(randomBytes(32)),
-    expiry: NOW + 3600,
-    initiatorNodeId: kp.nodeId,
-    agreementDigest: bytesToHex(randomBytes(32)),
-  };
-  const sa = new Map<number, ServiceAgreement>();
-  sa.set(0, { nodeId: kp.nodeId, capability: "MESH_RELAY", requirementDigest: proposal.requirementDigest, allocatedBandwidthBps: 1048576, expiry: proposal.expiry, policyVersion: 1 });
-  const hpk = new Map<string, Uint8Array>();
-  hpk.set(kp.nodeId, kp.publicKey);
-  const acc = [signRouteAcceptance(proposal, 0, proposal.hops[0]!, sa.get(0)!, kp.nodeId, kp.secretKey, proposal.expiry)];
-  const result = createRouteCommitment(proposal, acc, hpk, sa, kp.secretKey, NOW);
-  if (!result.ok) throw new Error("commitment failed");
-
-  // R-006 construction-boundary: build a genuine ValidatedHop for the same
-  // node so createBrandedCommittedRoute can accept the genuine commitment.
-  const verifiedAdv = makeGenuineVerifiedAdv(kp);
-  const authNode = createAuthenticatedNodeRecord(verifiedAdv);
-  const saDigestHex = toHex(serviceDigest(sa.get(0)!));
-  const validatedHop = createValidatedHop(authNode, "10.0.0.1:7788", "MESH_RELAY", true, saDigestHex);
-
-  return { commitment: result.commitment, validatedHops: [validatedHop] };
+// R-002-P1: createValidatedHop now consumes a genuine AuthenticatedLink
+// (produced by the 3-message handshake) instead of a caller-supplied
+// `linkUp: boolean`. Delegate to the shared helper so this file no longer
+// hand-rolls the pipeline.
+function makeGenuineCommitment(_kp: ReturnType<typeof generateNodeKeypair>): { commitment: RouteCommitment; validatedHops: ValidatedHop[] } {
+  const ctx = makeGenuineBrandedRouteHelper(1, NOW);
+  return { commitment: ctx.commitment, validatedHops: ctx.validatedHops };
 }
 
 describe("R-006H3: Unforgeable trust chain at every construction boundary", () => {
@@ -220,20 +198,37 @@ describe("R-006H3: Unforgeable trust chain at every construction boundary", () =
     const authNode = createAuthenticatedNodeRecord(verifiedAdv);
     expect(isAuthenticatedNodeRecord(authNode)).toBe(true);
 
-    // Step 3: Create ValidatedHop (genuine, WeakSet-registered)
-    const hop = createValidatedHop(authNode, "10.0.0.1:7788", "MESH_RELAY", true, "digest");
+    // Step 3: Build the full genuine pipeline via the shared helper. R-002-P1
+    // added AuthenticatedLink as the new step in the chain — createValidatedHop
+    // now consumes a genuine AuthenticatedLink (3-message handshake artifact)
+    // instead of a caller-supplied `linkUp: boolean`.
+    const ctx = makeGenuineBrandedRouteHelper(1, NOW);
+    expect(isAuthenticatedLink(ctx.authenticatedLinks[0])).toBe(true);
+
+    // Step 4: Create ValidatedHop from the genuine AuthenticatedLink
+    // (WeakSet-registered). The helper has already produced ctx.validatedHops[0]
+    // by calling createValidatedHop(authenticatedLinks[0], ...) — re-assert the
+    // construction-boundary invariant here.
+    const hop = ctx.validatedHops[0];
     expect(isValidatedHop(hop)).toBe(true);
+    expect(isValidatedHop(
+      createValidatedHop(
+        ctx.authenticatedLinks[0],
+        ctx.hops[0]!.endpoint,
+        ctx.capabilities[0] as string,
+        ctx.validatedHops[0]!.serviceAgreementDigest,
+      ),
+    )).toBe(true);
 
-    // Step 4: Create genuine RouteCommitment through the full pipeline
-    const { commitment, validatedHops } = makeGenuineCommitment(kp);
-    expect(isRouteCommitment(commitment)).toBe(true);
+    // Step 5: Create genuine RouteCommitment through the full pipeline
+    expect(isRouteCommitment(ctx.commitment)).toBe(true);
 
-    // Step 5: Create BrandedCommittedRoute from genuine commitment + genuine validatedHops
+    // Step 6: Create BrandedCommittedRoute from genuine commitment + genuine validatedHops
     // (R-006 construction-boundary: validatedHops passed explicitly — no cast)
-    const branded = createBrandedCommittedRoute(commitment, validatedHops);
+    const branded = createBrandedCommittedRoute(ctx.commitment, ctx.validatedHops);
     expect(isBrandedCommittedRoute(branded)).toBe(true);
 
-    // Step 6: A copy of the branded route is NOT recognized
+    // Step 7: A copy of the branded route is NOT recognized
     const copy = { ...branded };
     expect(isBrandedCommittedRoute(copy)).toBe(false);
   });

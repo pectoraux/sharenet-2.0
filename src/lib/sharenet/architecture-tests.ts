@@ -85,6 +85,7 @@ import {
 // POST /api/sharenet/architecture/run because of it.
 import { signRouteAcceptance, createRouteCommitment, createCommittedRoute, type RouteCommitment } from "@reference/routing/route";
 import type { ServiceAgreement } from "@reference/routing/service-negotiation";
+import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 export interface ArchTestResult {
   id: number;
@@ -370,7 +371,7 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
   // Per R-006 hardening: test that the TYPE BOUNDARY prevents construction,
   // not merely that a guard function throws.
   results.push(
-    await runOne(11, "RemoteNodeHint → ValidatedHop fails (unforgeable type boundary, R-006H)", "ARCHITECTURE", "spec/00 §31 + spec/07 + R-006H", async () => {
+    await runOne(11, "RemoteNodeHint/AdvVerfied → ValidatedHop fails; genuine AuthenticatedLink → succeeds (R-002-P1 + R-006H)", "ARCHITECTURE", "spec/00 §31 + spec/07 + R-002-P1 + R-006H", async () => {
       const reporter = generateNodeKeypair();
       const subject = generateNodeKeypair();
       const now = Math.floor(Date.now() / 1000);
@@ -384,23 +385,23 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       let hintGuardThrew = false;
       try { HINT_TO_VALIDATED_HOP_FORBIDDEN(hint); } catch { hintGuardThrew = true; }
 
-      // Negative: createValidatedHop REQUIRES an AuthenticatedNodeRecord.
-      // A RemoteNodeHint is NOT an AuthenticatedNodeRecord — it lacks the brand.
-      // Attempting to pass the hint as if it were authenticated must throw.
+      // R-002-P1: createValidatedHop now requires a genuine AuthenticatedLink
+      // (not an AuthenticatedNodeRecord + linkUp boolean). A RemoteNodeHint
+      // is NOT an AuthenticatedLink — it lacks the WeakSet brand.
       let hintToHopThrew = false;
       try {
-        // The hint is not an AuthenticatedNodeRecord — createValidatedHop
-        // checks isAuthenticatedNodeRecord() at runtime and throws.
-        createValidatedHop(hint as any, hint.subjectEndpointHint, "MESH_RELAY", true, "");
+        createValidatedHop(hint as any, hint.subjectEndpointHint, "MESH_RELAY", "");
       } catch { hintToHopThrew = true; }
 
-      // Negative: a raw NodeId string is also not an AuthenticatedNodeRecord
+      // Negative: a raw NodeId string is also not an AuthenticatedLink
       let stringToHopThrew = false;
       try {
-        createValidatedHop({ nodeId: subject.nodeId } as any, "10.0.0.5:7788", "MESH_RELAY", true, "");
+        createValidatedHop({ nodeId: subject.nodeId } as any, "10.0.0.5:7788", "MESH_RELAY", "");
       } catch { stringToHopThrew = true; }
 
-      // Negative: ADV_VERIFIED-only link (linkUp=false) cannot produce ValidatedHop
+      // Negative: an AuthenticatedNodeRecord alone is NOT an AuthenticatedLink.
+      // R-002-P1: the caller-supplied linkUp boolean is gone — an authNode
+      // without a genuine AuthenticatedLink cannot produce a ValidatedHop.
       const authAdv = signAdvertisement({
       protocolVersion: 1, nodeId: subject.nodeId, signingPublicKey: subject.publicKey,
       capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.5", port: 7788 }],
@@ -409,19 +410,28 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
     const authVerify = verifyAdvertisement(authAdv, now);
     if (!authVerify.ok) throw new Error("auth adv verification failed");
     const authNode = createAuthenticatedNodeRecord(authVerify.verified);
-      let advVerifiedThrew = false;
+      let authNodeWithoutLinkThrew = false;
       try {
-        createValidatedHop(authNode, "10.0.0.5:7788", "MESH_RELAY", false, ""); // linkUp=false
-      } catch { advVerifiedThrew = true; }
+        // authNode is genuine but is NOT an AuthenticatedLink — the WeakSet
+        // check (isAuthenticatedLink) fails.
+        createValidatedHop(authNode as any, "10.0.0.5:7788", "MESH_RELAY", "");
+      } catch { authNodeWithoutLinkThrew = true; }
 
-      // Positive: a genuine AuthenticatedNodeRecord + LINK_UP=true CAN produce ValidatedHop
-      const validHop = createValidatedHop(authNode, "10.0.0.5:7788", "MESH_RELAY", true, "digest123");
+      // Positive: a genuine AuthenticatedLink (from the full handshake pipeline)
+      // CAN produce a ValidatedHop. R-002-P1: linkUp is implied by the genuine link.
+      const brandedCtx = makeGenuineBrandedRouteHelper(1, now);
+      const validHop = createValidatedHop(
+        brandedCtx.authenticatedLinks[0]!,
+        brandedCtx.hops[0]!.endpoint,
+        brandedCtx.capabilities[0]!,
+        brandedCtx.validatedHops[0]!.serviceAgreementDigest,
+      );
       const validHopIsBranded = isValidatedHop(validHop);
 
       return {
-        passed: hintGuardThrew && hintToHopThrew && stringToHopThrew && advVerifiedThrew && validHopIsBranded,
-        expected: "hint → ValidatedHop fails (no brand); string → fails; ADV_VERIFIED → fails; authenticated + LINK_UP → succeeds (branded)",
-        actual: `hint guard=${hintGuardThrew}, hint→hop threw=${hintToHopThrew}, string→hop threw=${stringToHopThrew}, adv-only threw=${advVerifiedThrew}, valid branded=${validHopIsBranded}`,
+        passed: hintGuardThrew && hintToHopThrew && stringToHopThrew && authNodeWithoutLinkThrew && validHopIsBranded,
+        expected: "hint → ValidatedHop fails (no AuthenticatedLink); string → fails; AuthenticatedNodeRecord alone → fails (R-002-P1: no linkUp boolean); genuine AuthenticatedLink → succeeds (branded)",
+        actual: `hint guard=${hintGuardThrew}, hint→hop threw=${hintToHopThrew}, string→hop threw=${stringToHopThrew}, authNode-without-link threw=${authNodeWithoutLinkThrew}, valid branded=${validHopIsBranded}`,
       };
     }),
   );
@@ -456,38 +466,13 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       let proposalGuardThrew = false;
       try { PROPOSAL_TO_CIRCUIT_FORBIDDEN(proposal); } catch { proposalGuardThrew = true; }
 
-      // Positive: a BrandedCommittedRoute IS recognized by isBrandedCommittedRoute
-      // (We construct one with a minimal ValidatedHop to prove the brand works)
-      const authAdv = signAdvertisement({
-      protocolVersion: 1, nodeId: kp.nodeId, signingPublicKey: kp.publicKey,
-      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.1", port: 7788 }],
-      sequence: 1, timestamp: Math.floor(Date.now() / 1000), expiry: Math.floor(Date.now() / 1000) + 3600, nonce: randomBytes(16),
-    }, kp.secretKey);
-    const authVerify = verifyAdvertisement(authAdv, Math.floor(Date.now() / 1000));
-    if (!authVerify.ok) throw new Error("auth adv verification failed");
-    const authNode = createAuthenticatedNodeRecord(authVerify.verified);
-      const validHop = createValidatedHop(authNode, "10.0.0.1:7788", "MESH_RELAY", true, "digest");
-      // For BrandedCommittedRoute, we need a genuine RouteCommitment from createRouteCommitment
-      const proposal2: RouteProposal = {
-        routeId: toHex(randomBytes(32)),
-        hops: [{ nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
-        requirementDigest: toHex(randomBytes(32)),
-        expiry: Math.floor(Date.now() / 1000) + 3600,
-        initiatorNodeId: kp.nodeId,
-        agreementDigest: toHex(randomBytes(32)),
-      };
-      const sa2 = new Map<number, any>();
-      sa2.set(0, { nodeId: kp.nodeId, capability: "MESH_RELAY", requirementDigest: proposal2.requirementDigest, allocatedBandwidthBps: 1048576, expiry: proposal2.expiry, policyVersion: 1 });
-      const hpk2 = new Map<string, Uint8Array>();
-      hpk2.set(kp.nodeId, kp.publicKey);
-      const acc2 = [signRouteAcceptance(proposal2, 0, proposal2.hops[0]!, sa2.get(0)!, kp.nodeId, kp.secretKey, proposal2.expiry)];
-      const comm2 = createRouteCommitment(proposal2, acc2, hpk2, sa2, kp.secretKey, Math.floor(Date.now() / 1000));
-      if (!comm2.ok) throw new Error("commitment failed for branded route test");
-      // R-006 construction-boundary: pass genuine ValidatedHop[] explicitly
-      // (no cast from RouteHop[]). The validHop was created above from a
-      // genuine AuthenticatedNodeRecord, and its nodeId/endpoint/capability
-      // match the commitment's hop.
-      const brandedRoute = createBrandedCommittedRoute(comm2.commitment, [validHop]);
+      // Positive: a BrandedCommittedRoute IS recognized by isBrandedCommittedRoute.
+      // R-002-P1: the full pipeline (adv → authNode → handshake → VerifiedTranscript
+      // → AuthenticatedLink → ValidatedHop → commitment → branded) is built by the
+      // shared helper. No caller-supplied linkUp boolean — the genuine
+      // AuthenticatedLink carries the handshake evidence.
+      const brandedCtx = makeGenuineBrandedRouteHelper(1, Math.floor(Date.now() / 1000));
+      const brandedRoute = brandedCtx.branded;
       const brandedRecognized = isBrandedCommittedRoute(brandedRoute);
 
       // R-008 hardening: exercise setupCircuit directly at the runtime brand
@@ -495,7 +480,7 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       // keys are required to prove the negative paths — a legacy
       // CommittedRoute and a property-copy of the branded route must both be
       // rejected before any hop/key validation runs.
-      const legacyRoute = createCommittedRoute(comm2.commitment);
+      const legacyRoute = createCommittedRoute(brandedCtx.commitment);
       const legacyNotBranded = !isBrandedCommittedRoute(legacyRoute);
       let legacySetupThrew = false;
       try { setupCircuit(legacyRoute as unknown as Parameters<typeof setupCircuit>[0], [], Math.floor(Date.now() / 1000)); } catch { legacySetupThrew = true; }
@@ -633,9 +618,10 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       const fakeNotAuthenticated = !isAuthenticatedNodeRecord(fakeNode);
 
       // Negative: attempting to create a ValidatedHop from a non-authenticated object throws
+      // R-002-P1: createValidatedHop requires a genuine AuthenticatedLink (not authNode + boolean)
       let fakeToHopThrew = false;
       try {
-        createValidatedHop(fakeNode as any, "10.0.0.5:7788", "MESH_RELAY", true, "");
+        createValidatedHop(fakeNode as any, "10.0.0.5:7788", "MESH_RELAY", "");
       } catch { fakeToHopThrew = true; }
 
       // Positive: a genuine AuthenticatedNodeRecord IS recognized
@@ -649,8 +635,15 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
     const authNode = createAuthenticatedNodeRecord(authVerify.verified);
       const authRecognized = isAuthenticatedNodeRecord(authNode);
 
-      // Positive: AuthenticatedNodeRecord + LINK_UP → ValidatedHop succeeds
-      const validHop = createValidatedHop(authNode, "10.0.0.5:7788", "MESH_RELAY", true, "digest");
+      // Positive: genuine AuthenticatedLink → ValidatedHop succeeds (R-002-P1)
+      // Use the shared helper which runs the full 3-message handshake.
+      const brandedCtx2 = makeGenuineBrandedRouteHelper(1, now);
+      const validHop = createValidatedHop(
+        brandedCtx2.authenticatedLinks[0]!,
+        brandedCtx2.hops[0]!.endpoint,
+        brandedCtx2.capabilities[0]!,
+        brandedCtx2.validatedHops[0]!.serviceAgreementDigest,
+      );
       const hopBranded = isValidatedHop(validHop);
 
       return {
