@@ -111,11 +111,29 @@ const transcriptConsumedChallengeRegistry = new WeakSet<object>();
  * The `signerRole` field indicates which peer signed the challenge:
  *   - "RESPONDER": the challenge is challengeForB (from Initiate, B signed it)
  *   - "INITIATOR": the challenge is challengeForA (from Accept, A signed it)
+ *
+ * Per R-002-P1 hardening v7: the `verifierNodeId` field records WHICH
+ * local endpoint consumed the challenge. This is bound to the signerRole:
+ *   - signerRole="RESPONDER" → the verifier MUST be the initiator (A
+ *     issued challengeForB and consumes it to verify B's proof)
+ *   - signerRole="INITIATOR" → the verifier MUST be the responder (B
+ *     issued challengeForA and consumes it to verify A's proof)
+ *
+ * This binding is enforced in createVerifiedTranscript() after the
+ * initiator/responder NodeIds are derived from the decoded wire messages.
  */
 export interface ConsumedChallenge {
   readonly challenge: Uint8Array;
   readonly consumedAt: number;
   readonly signerRole: "INITIATOR" | "RESPONDER";
+  /**
+   * Per R-002-P1 hardening v7: the NodeId of the local verifier who
+   * consumed this challenge. Bound to signerRole by
+   * createVerifiedTranscript():
+   *   - signerRole="RESPONDER" → verifierNodeId must be the initiator
+   *   - signerRole="INITIATOR" → verifierNodeId must be the responder
+   */
+  readonly verifierNodeId: string;
 }
 
 /**
@@ -130,11 +148,17 @@ export interface ConsumedChallenge {
  *
  * The `now` parameter MUST come from the trusted local runtime clock,
  * not from untrusted protocol input.
+ *
+ * The `verifierNodeId` is the NodeId of the local verifier. The role-binding
+ * (verifierNodeId must be the initiator if signerRole=RESPONDER, or the
+ * responder if signerRole=INITIATOR) is enforced in createVerifiedTranscript()
+ * after the initiator/responder NodeIds are derived from the decoded wire.
  */
 export function consumeChallengeForTranscript(
   cache: ChallengeCache,
   challenge: Uint8Array,
   signerRole: "INITIATOR" | "RESPONDER",
+  verifierNodeId: string,
   now: number,
 ): ConsumedChallenge {
   // ChallengeCache uses milliseconds internally; `now` is in seconds.
@@ -152,6 +176,7 @@ export function consumeChallengeForTranscript(
     challenge,
     consumedAt: now,
     signerRole,
+    verifierNodeId,
   };
   consumedChallengeRegistry.add(cc);
   return cc;
@@ -246,17 +271,15 @@ export function createVerifiedTranscript(params: {
   acceptBytes: Uint8Array;
   /** A's possession proof from the Confirm message (the one non-wire input). */
   proofA: Uint8Array;
-  /** Freshness/replay proof — the challenge consumed from the local cache. */
+  /**
+   * Freshness/replay proof — the challenge consumed from the local cache.
+   * Per R-002-P1 hardening v7: the consumedChallenge carries the
+   * verifierNodeId internally — createVerifiedTranscript no longer accepts
+   * a separate caller-supplied verifier identity.
+   */
   consumedChallenge: ConsumedChallenge;
   /** Trusted runtime clock (unix seconds) — NOT from untrusted protocol input. */
   now: number;
-  /**
-   * Per R-002-P1 hardening v6: the NodeId of the local verifier who
-   * consumed the challenge. Must be a participant in the handshake
-   * (either the initiator or the responder). This makes the transcript
-   * DIRECTIONAL — the verifier's NodeId is preserved in the artifact.
-   */
-  freshnessVerifierNodeId: string;
 }): VerifiedTranscript {
   // 0. Verify the ConsumedChallenge is genuine.
   if (!isConsumedChallenge(params.consumedChallenge)) {
@@ -447,27 +470,37 @@ export function createVerifiedTranscript(params: {
   //     A second call with the same ConsumedChallenge will fail at step 0b.
   transcriptConsumedChallengeRegistry.add(params.consumedChallenge);
 
-  // 11. R-002-P1 hardening v6: verify the freshnessVerifierNodeId is a
-  //     participant in the handshake (either initiator or responder).
-  //     The freshness proof is only meaningful if the verifier is one of
-  //     the two parties — a third party cannot establish freshness for
-  //     this handshake.
-  if (
-    params.freshnessVerifierNodeId !== initiatorNodeId &&
-    params.freshnessVerifierNodeId !== responderNodeId
-  ) {
+  // 11. R-002-P1 hardening v7: verify the ConsumedChallenge's verifierNodeId
+  //     is bound to the signerRole. The freshness proof is only valid when
+  //     the verifier is the party that ISSUED the challenge:
+  //       - signerRole="RESPONDER" (challengeForB, B signed) → verifier
+  //         must be the INITIATOR (A issued challengeForB)
+  //       - signerRole="INITIATOR" (challengeForA, A signed) → verifier
+  //         must be the RESPONDER (B issued challengeForA)
+  //     This prevents a genuine-but-mismatched ConsumedChallenge from being
+  //     used — the verifier identity is intrinsic to the artifact, not
+  //     caller-supplied.
+  const ccVerifier = params.consumedChallenge.verifierNodeId;
+  const expectedVerifier = params.consumedChallenge.signerRole === "RESPONDER"
+    ? initiatorNodeId
+    : responderNodeId;
+  if (ccVerifier !== expectedVerifier) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        `freshnessVerifierNodeId (${params.freshnessVerifierNodeId}) is ` +
-        `neither the initiator (${initiatorNodeId}) nor the responder ` +
-        `(${responderNodeId}) of the handshake. Per R-002-P1 hardening v6, ` +
-        "the freshness verifier MUST be a participant in the handshake — " +
-        "a third party cannot establish freshness for this bilateral " +
-        "protocol.",
+        `the ConsumedChallenge's verifierNodeId (${ccVerifier}) does not ` +
+        `match the expected verifier for signerRole=` +
+        `${params.consumedChallenge.signerRole}. Per R-002-P1 hardening v7, ` +
+        `signerRole="RESPONDER" requires the verifier to be the initiator ` +
+        `(${initiatorNodeId}), and signerRole="INITIATOR" requires the ` +
+        `verifier to be the responder (${responderNodeId}). The verifier ` +
+        "identity is bound to the signer role — a mismatched ConsumedChallenge " +
+        "cannot produce a VerifiedTranscript.",
     );
   }
 
   // All checks verified — register the genuine artifact.
+  // freshnessVerifierNodeId is DERIVED from the ConsumedChallenge (not
+  // caller-supplied) — the provenance is intrinsic to the artifact.
   const transcript: VerifiedTranscript = {
     transcriptDigestHex: toHex(initiatorTranscriptHash),
     linkIdHex: toHex(linkIdBytes),
@@ -477,7 +510,7 @@ export function createVerifiedTranscript(params: {
     initiatorNonce,
     responderNonce,
     verifiedAt: params.now,
-    freshnessVerifierNodeId: params.freshnessVerifierNodeId,
+    freshnessVerifierNodeId: ccVerifier,
     consumedChallenge: params.consumedChallenge,
   };
   verifiedTranscriptRegistry.add(transcript);

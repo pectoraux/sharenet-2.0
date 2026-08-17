@@ -168,21 +168,23 @@ function runHandshake(
   // produce a ConsumedChallenge proof artifact (intrinsic freshness/replay proof).
   // The initiator (A) generated challengeForB, so A consumes it from A's cache
   // (signerRole=RESPONDER because B signed it).
+  // R-002-P1 hardening v7: verifierNodeId is carried inside the ConsumedChallenge
+  // — the initiator (A) is the freshness verifier.
   const cache = new ChallengeCache();
   cache.registerChallenge(challengeForB, now * 1000); // ChallengeCache uses ms
   const consumedChallenge = consumeChallengeForTranscript(
-    cache, challengeForB, "RESPONDER", now,
+    cache, challengeForB, "RESPONDER", initiatorKp.nodeId, now,
   );
 
-  // Create the genuine VerifiedTranscript — v6 API: wire bytes + proofA +
-  // consumedChallenge + now + freshnessVerifierNodeId (the initiator).
+  // Create the genuine VerifiedTranscript — v7 API: wire bytes + proofA +
+  // consumedChallenge + now. The freshnessVerifierNodeId is derived from
+  // the ConsumedChallenge (no separate caller-supplied verifier identity).
   return createVerifiedTranscript({
     initiateBytes,
     acceptBytes,
     proofA,
     consumedChallenge,
     now,
-    freshnessVerifierNodeId: initiatorKp.nodeId,
   });
 }
 

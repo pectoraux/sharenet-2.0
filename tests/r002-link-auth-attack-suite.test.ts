@@ -243,14 +243,13 @@ describe("R-002A: Link authentication state machine enforcement (evidence-carryi
     // Step 2: consume the challenge → genuine ConsumedChallenge
     const cache = new ChallengeCache();
     cache.registerChallenge(challengeForB, REFERENCE_NOW * 1000);
-    const cc = consumeChallengeForTranscript(cache, challengeForB, "RESPONDER", REFERENCE_NOW);
+    const cc = consumeChallengeForTranscript(cache, challengeForB, "RESPONDER", kpA.nodeId, REFERENCE_NOW);
     expect(isConsumedChallenge(cc)).toBe(true);
 
     // Step 3: create VerifiedTranscript (consumes the ConsumedChallenge)
     const vt = createVerifiedTranscript({
       initiateBytes, acceptBytes, proofA,
       consumedChallenge: cc, now: REFERENCE_NOW,
-      freshnessVerifierNodeId: kpA.nodeId,
     });
     expect(isVerifiedTranscript(vt)).toBe(true);
 
@@ -344,7 +343,7 @@ describe("R-002A: Link authentication state machine enforcement (evidence-carryi
     const challengeY = randomBytes(32);
     const cache = new ChallengeCache();
     cache.registerChallenge(challengeY, REFERENCE_NOW * 1000);
-    const ccY = consumeChallengeForTranscript(cache, challengeY, "RESPONDER", REFERENCE_NOW);
+    const ccY = consumeChallengeForTranscript(cache, challengeY, "RESPONDER", kpA.nodeId, REFERENCE_NOW);
     expect(isConsumedChallenge(ccY)).toBe(true);
 
     // advanceToProofOfPossession must REJECT — ccY is genuine but for Y ≠ X
@@ -372,7 +371,7 @@ describe("R-002A: Link authentication state machine enforcement (evidence-carryi
     // Consume the SAME challenge X
     const cache = new ChallengeCache();
     cache.registerChallenge(challengeX, REFERENCE_NOW * 1000);
-    const ccX = consumeChallengeForTranscript(cache, challengeX, "RESPONDER", REFERENCE_NOW);
+    const ccX = consumeChallengeForTranscript(cache, challengeX, "RESPONDER", kpA.nodeId, REFERENCE_NOW);
     expect(isConsumedChallenge(ccX)).toBe(true);
 
     // advanceToProofOfPossession must ACCEPT — ccX matches the issued challenge X

@@ -704,3 +704,43 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-002 is now FULLY CLOSED: the state machine binds the consumed challenge to the issued challenge (no mismatch), and the VerifiedTranscript carries directional freshness-verifier provenance that createAuthenticatedLink enforces. There is exactly one semantic meaning of LINK_UP: a genuine AuthenticatedLink, verified by the local endpoint that consumed the challenge, bound to the exact issued challenge, with full cryptographic + freshness + replay + lifetime proof.
+
+---
+Task ID: R-002-P1-hardening-v7 (final provenance fix)
+Agent: main (Z.ai Code)
+Task: Move verifierNodeId INTO ConsumedChallenge itself so createVerifiedTranscript() no longer accepts a separate caller-supplied verifier identity. Bind signerRole to the only valid freshness verifier: RESPONDER→initiator, INITIATOR→responder.
+
+Work Log:
+- Added `verifierNodeId: string` field to the `ConsumedChallenge` interface in `reference/transport/authenticated-link.ts`. The verifier identity is now INTRINSIC to the artifact, not caller-supplied.
+- Modified `consumeChallengeForTranscript()` to take `verifierNodeId` as the 4th param (before `now`) and store it in the ConsumedChallenge.
+- Removed the `freshnessVerifierNodeId` parameter from `createVerifiedTranscript()`. The verifier identity is now DERIVED from `consumedChallenge.verifierNodeId`.
+- Added role-binding check in `createVerifiedTranscript()` (step 11): after deriving initiator/responder NodeIds from the decoded wire, verifies:
+  - signerRole="RESPONDER" → verifierNodeId must be the initiator (A issued challengeForB)
+  - signerRole="INITIATOR" → verifierNodeId must be the responder (B issued challengeForA)
+  A mismatch throws "verifierNodeId does not match the expected verifier for signerRole".
+- The `VerifiedTranscript.freshnessVerifierNodeId` field now gets its value from `consumedChallenge.verifierNodeId` (validated by the role-binding check).
+- `createAuthenticatedLink` still enforces `verifiedTranscript.freshnessVerifierNodeId === localNodeId` — the directional link constraint is preserved.
+
+- Updated `tests/helpers/branded-route-helper.ts`: `runHandshake` passes `verifierNodeId: initiatorKp.nodeId` to `consumeChallengeForTranscript` (RESPONDER challenge → initiator verifier).
+
+- Updated `tests/r002p1-authenticated-link.test.ts`:
+  - `buildConsumedChallenge(h)`: passes `h.kpA.nodeId` as verifierNodeId.
+  - `buildVerifiedTranscriptB(h)`: passes `h.kpB.nodeId` as verifierNodeId (INITIATOR challenge → responder verifier).
+  - All inline `consumeChallengeForTranscript` calls updated with verifierNodeId (4th param).
+  - All `createVerifiedTranscript` calls: removed `freshnessVerifierNodeId` property.
+  - REMOVED the v6 "freshnessVerifierNodeId not a participant" test (param no longer exists).
+  - Added new describe block "R-002-P1 v7: ConsumedChallenge verifier role-binding" with 5 tests:
+    - RESPONDER challenge + responder verifier → REJECT
+    - RESPONDER challenge + initiator verifier → ACCEPT
+    - INITIATOR challenge + initiator verifier → REJECT
+    - INITIATOR challenge + responder verifier → ACCEPT
+    - forged verifier provenance → REJECT
+
+- Updated `tests/r002-link-auth-attack-suite.test.ts`: all `consumeChallengeForTranscript` calls updated with `kpA.nodeId` (RESPONDER → initiator); all `createVerifiedTranscript` calls: removed `freshnessVerifierNodeId`.
+
+Stage Summary:
+- Tests: 280 → 284 pass, 0 fail (+4 net: 5 new v7 role-binding tests minus 1 removed v6 test). 770 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-002 is now FULLY CLOSED: the verifier identity is intrinsic to the ConsumedChallenge artifact (not caller-supplied), bound to the signerRole (RESPONDER→initiator, INITIATOR→responder), and enforced at every construction boundary. There is exactly one semantic meaning of LINK_UP: a genuine AuthenticatedLink, verified by the local endpoint, with full cryptographic + freshness + replay + lifetime + provenance proof.

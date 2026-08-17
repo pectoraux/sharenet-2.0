@@ -137,16 +137,19 @@ function runGenuineHandshake() {
   };
 }
 
-/** Build a genuine ConsumedChallenge from the handshake's challengeForB. */
+/** Build a genuine ConsumedChallenge from the handshake's challengeForB.
+ *  Per v7 API, the verifierNodeId is the 4th param. For signerRole=RESPONDER
+ *  (B signed challengeForB), the verifier must be the INITIATOR (kpA.nodeId). */
 function buildConsumedChallenge(h: ReturnType<typeof runGenuineHandshake>): ConsumedChallenge {
   const cache = new ChallengeCache();
   cache.registerChallenge(h.challengeForB, NOW * 1000); // ChallengeCache uses ms
-  return consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", NOW);
+  return consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", h.kpA.nodeId, NOW);
 }
 
-/** Build a genuine VerifiedTranscript from the handshake materials (v6 API).
+/** Build a genuine VerifiedTranscript from the handshake materials (v7 API).
  *  The freshness verifier is the INITIATOR (A) — A issued challengeForB and
- *  consumed it from A's local ChallengeCache. */
+ *  consumed it from A's local ChallengeCache. Per v7, the freshness verifier
+ *  is derived from consumedChallenge.verifierNodeId (no caller-supplied param). */
 function buildVerifiedTranscript(h: ReturnType<typeof runGenuineHandshake>) {
   const cc = buildConsumedChallenge(h);
   return createVerifiedTranscript({
@@ -155,24 +158,24 @@ function buildVerifiedTranscript(h: ReturnType<typeof runGenuineHandshake>) {
     proofA: h.proofA,
     consumedChallenge: cc,
     now: NOW,
-    freshnessVerifierNodeId: h.kpA.nodeId,
   });
 }
 
-/** Build a genuine VerifiedTranscript for the RESPONDER (B) side (v6 API).
+/** Build a genuine VerifiedTranscript for the RESPONDER (B) side (v7 API).
  *  The freshness verifier is the RESPONDER (B) — B issued challengeForA and
- *  consumed it from B's local ChallengeCache. */
+ *  consumed it from B's local ChallengeCache. Per v7, the freshness verifier
+ *  is derived from consumedChallenge.verifierNodeId (no caller-supplied param). */
 function buildVerifiedTranscriptB(h: ReturnType<typeof runGenuineHandshake>) {
   const cache = new ChallengeCache();
   cache.registerChallenge(h.challengeForA, NOW * 1000); // ChallengeCache uses ms
-  const cc = consumeChallengeForTranscript(cache, h.challengeForA, "INITIATOR", NOW);
+  // signerRole=INITIATOR (A signed proofA, B issued challengeForA) → verifier = responder (kpB.nodeId)
+  const cc = consumeChallengeForTranscript(cache, h.challengeForA, "INITIATOR", h.kpB.nodeId, NOW);
   return createVerifiedTranscript({
     initiateBytes: h.initiateBytes,
     acceptBytes: h.acceptBytes,
     proofA: h.proofA,
     consumedChallenge: cc,
     now: NOW,
-    freshnessVerifierNodeId: h.kpB.nodeId,
   });
 }
 
@@ -193,7 +196,6 @@ describe("R-002-P1 v4: VerifiedTranscript — wire binding + challenge freshness
     expect(() => createVerifiedTranscript({
       initiateBytes: tampered, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
-      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow();
   });
 
@@ -204,7 +206,6 @@ describe("R-002-P1 v4: VerifiedTranscript — wire binding + challenge freshness
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h2.proofA, consumedChallenge: cc, now: NOW,
-      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow(/initiator's possession proof did not verify/i);
   });
 
@@ -216,7 +217,6 @@ describe("R-002-P1 v4: VerifiedTranscript — wire binding + challenge freshness
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc2, now: NOW,
-      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow(/consumed challenge does not match/i);
   });
 });
@@ -255,10 +255,10 @@ describe("R-002-P1 v4: Challenge freshness / replay provenance", () => {
     const cache = new ChallengeCache();
     cache.registerChallenge(h.challengeForB, NOW * 1000);
     // First consumption succeeds
-    const cc1 = consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", NOW);
+    const cc1 = consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", h.kpA.nodeId, NOW);
     expect(isConsumedChallenge(cc1)).toBe(true);
     // Second consumption from the SAME cache fails (challenge_replayed)
-    expect(() => consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", NOW + 1)).toThrow(
+    expect(() => consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", h.kpA.nodeId, NOW + 1)).toThrow(
       /challenge_replayed|consumption failed/i,
     );
   });
@@ -270,14 +270,12 @@ describe("R-002-P1 v4: Challenge freshness / replay provenance", () => {
     const vt1 = createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
-      freshnessVerifierNodeId: h.kpA.nodeId,
     });
     expect(isVerifiedTranscript(vt1)).toBe(true);
     // Second transcript with the SAME ConsumedChallenge object → REJECT
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
-      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow(/already been used to produce a VerifiedTranscript/i);
   });
 
@@ -289,7 +287,7 @@ describe("R-002-P1 v4: Challenge freshness / replay provenance", () => {
     cache.registerChallenge(h.challengeForB, expiredMs);
     // Consume at NOW — the challenge is expired (CHALLENGE_EXPIRY_MS = 5min)
     expect(() => consumeChallengeForTranscript(
-      cache, h.challengeForB, "RESPONDER", NOW,
+      cache, h.challengeForB, "RESPONDER", h.kpA.nodeId, NOW,
     )).toThrow(/challenge_expired|consumption failed/i);
   });
 
@@ -298,7 +296,7 @@ describe("R-002-P1 v4: Challenge freshness / replay provenance", () => {
     const cache = new ChallengeCache();
     // Don't register the challenge — consumption should fail
     expect(() => consumeChallengeForTranscript(
-      cache, h.challengeForB, "RESPONDER", NOW,
+      cache, h.challengeForB, "RESPONDER", h.kpA.nodeId, NOW,
     )).toThrow(/challenge_not_found|consumption failed/i);
   });
 
@@ -313,7 +311,6 @@ describe("R-002-P1 v4: Challenge freshness / replay provenance", () => {
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: fakeCc as any, now: NOW,
-      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow(/not a genuine ConsumedChallenge/i);
   });
 });
@@ -326,7 +323,7 @@ describe("R-002-P1 v6: Freshness-verifier provenance", () => {
     const vt = createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
-      freshnessVerifierNodeId: h.kpA.nodeId, // A verified it
+      // cc.verifierNodeId = kpA.nodeId → vt.freshnessVerifierNodeId = kpA.nodeId
     });
     expect(isVerifiedTranscript(vt)).toBe(true);
     // Now try to create B's link from A's transcript → REJECT
@@ -344,7 +341,6 @@ describe("R-002-P1 v6: Freshness-verifier provenance", () => {
     const vt = createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
-      freshnessVerifierNodeId: h.kpA.nodeId,
     });
     const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
     const link = createAuthenticatedLink({
@@ -355,15 +351,77 @@ describe("R-002-P1 v6: Freshness-verifier provenance", () => {
     expect(isAuthenticatedLink(link)).toBe(true);
   });
 
-  test("freshnessVerifierNodeId not a handshake participant → REJECT", () => {
+  // The v6 "freshnessVerifierNodeId not a handshake participant → REJECT" test
+  // was removed: the freshnessVerifierNodeId param no longer exists in v7.
+  // Instead, the verifier role-binding is intrinsic to the ConsumedChallenge
+  // and is enforced inside createVerifiedTranscript based on
+  // consumedChallenge.verifierNodeId. See the v7 describe block below.
+});
+
+describe("R-002-P1 v7: ConsumedChallenge verifier role-binding", () => {
+  test("RESPONDER challenge + responder verifier → REJECT", () => {
     const h = runGenuineHandshake();
-    const cc = buildConsumedChallenge(h);
-    const stranger = generateNodeKeypair();
+    const cache = new ChallengeCache();
+    cache.registerChallenge(h.challengeForB, NOW * 1000);
+    // Wrong: signerRole=RESPONDER but verifier=responder (should be initiator)
+    const cc = consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", h.kpB.nodeId, NOW);
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
-      freshnessVerifierNodeId: stranger.nodeId, // not a participant
-    })).toThrow(/neither the initiator.*nor the responder/i);
+    })).toThrow(/verifierNodeId.*does not match.*expected verifier/i);
+  });
+
+  test("RESPONDER challenge + initiator verifier → ACCEPT", () => {
+    const h = runGenuineHandshake();
+    const cache = new ChallengeCache();
+    cache.registerChallenge(h.challengeForB, NOW * 1000);
+    const cc = consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", h.kpA.nodeId, NOW);
+    const vt = createVerifiedTranscript({
+      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
+      proofA: h.proofA, consumedChallenge: cc, now: NOW,
+    });
+    expect(isVerifiedTranscript(vt)).toBe(true);
+  });
+
+  test("INITIATOR challenge + initiator verifier → REJECT", () => {
+    const h = runGenuineHandshake();
+    const cache = new ChallengeCache();
+    cache.registerChallenge(h.challengeForA, NOW * 1000);
+    // Wrong: signerRole=INITIATOR but verifier=initiator (should be responder)
+    const cc = consumeChallengeForTranscript(cache, h.challengeForA, "INITIATOR", h.kpA.nodeId, NOW);
+    expect(() => createVerifiedTranscript({
+      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
+      proofA: h.proofA, consumedChallenge: cc, now: NOW,
+    })).toThrow(/verifierNodeId.*does not match.*expected verifier/i);
+  });
+
+  test("INITIATOR challenge + responder verifier → ACCEPT", () => {
+    const h = runGenuineHandshake();
+    const cache = new ChallengeCache();
+    cache.registerChallenge(h.challengeForA, NOW * 1000);
+    const cc = consumeChallengeForTranscript(cache, h.challengeForA, "INITIATOR", h.kpB.nodeId, NOW);
+    const vt = createVerifiedTranscript({
+      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
+      proofA: h.proofA, consumedChallenge: cc, now: NOW,
+    });
+    expect(isVerifiedTranscript(vt)).toBe(true);
+  });
+
+  test("forged verifier provenance (non-genuine ConsumedChallenge with wrong verifier) → REJECT", () => {
+    const h = runGenuineHandshake();
+    // Create a genuine ConsumedChallenge with correct verifier, then try to
+    // use it with a different verifierNodeId field (can't — it's immutable).
+    // Instead, test: a genuine ConsumedChallenge with the WRONG verifierNodeId
+    // (mismatched role) is rejected by createVerifiedTranscript.
+    const cache = new ChallengeCache();
+    cache.registerChallenge(h.challengeForB, NOW * 1000);
+    const cc = consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", h.kpB.nodeId, NOW);
+    // cc.verifierNodeId = kpB.nodeId (responder) but signerRole=RESPONDER
+    // → expected verifier = initiator → REJECT
+    expect(() => createVerifiedTranscript({
+      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
+      proofA: h.proofA, consumedChallenge: cc, now: NOW,
+    })).toThrow(/verifierNodeId.*does not match/i);
   });
 });
 
@@ -452,11 +510,11 @@ describe("R-002-P1 v4: Genuine full pipeline (both directions)", () => {
     // For responder-side: consume challengeForA (B generated, A signed)
     const cache = new ChallengeCache();
     cache.registerChallenge(h.challengeForA, NOW * 1000);
-    const cc = consumeChallengeForTranscript(cache, h.challengeForA, "INITIATOR", NOW);
+    // signerRole=INITIATOR (A signed proofA, B issued challengeForA) → verifier = responder (kpB.nodeId)
+    const cc = consumeChallengeForTranscript(cache, h.challengeForA, "INITIATOR", h.kpB.nodeId, NOW);
     const vt = createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
-      freshnessVerifierNodeId: h.kpB.nodeId,
     });
     const responderLink = createAuthenticatedLink({
       localNodeId: h.kpB.nodeId, remoteNode: authNodeA,
