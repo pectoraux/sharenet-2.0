@@ -46,9 +46,9 @@ where the actual verification level is lower than originally claimed.
 | ID | Priority | Description | Status |
 |----|----------|-------------|--------|
 | R-001 | P0 | Protocol freeze reconciliation | ✅ DONE (`ed61a1a`) |
-| R-002 | P0 | Fresh possession proof for LINK_UP | ⚠️ OPEN (P1 follow-up: state-machine transitions still caller-driven) |
-| R-003 | P0 | RouteAcceptance signature binding | ✅ CLOSED — acceptance binding + canonical commitment_root / route_id derivation |
-| R-004 | P0 | Commitment verifies signatures | ✅ CLOSED — commitment_root = BLAKE3(proposal_digest || acceptance_root || commitment_nonce); route_id = toHex(commitment_root); signature over commitment_root |
+| R-002 | P0 | Fresh possession proof for LINK_UP | ✅ CLOSED — AuthenticatedLink proof artifact (v1-v7): verified handshake, NodeId binding, wire binding, challenge freshness/replay (ConsumedChallenge), evidence-carrying state machine |
+| R-003 | P0 | RouteAcceptance signature binding | ⚠️ PARTIAL — canonical Merkle root + route_id derivation ✅; normative schema reconciliation: spec now matches implementation ✅; Python vector consumption pending |
+| R-004 | P0 | Commitment verifies signatures | ⚠️ PARTIAL — acceptance sig verification ✅; commitment signature over Merkle root ✅; independent verifyRouteCommitment() ✅; immutable artifact ✅; Python vector consumption pending |
 | R-005 | P0 | Truthful gate system | ✅ DONE (this update) — tracker reconciled to HEAD |
 | R-006 | P1 | Architecture test upgrades | ⚠️ PARTIAL: setupCircuit legacy-bypass CLOSED by R-008 hardening; broader vector/arch invariants remain |
 | R-007 | P1 | Vectors as mandatory inputs | ⚠️ OPEN (vectors cover identity/encoding/advertisement/link only; routing/circuit/service vectors absent) |

@@ -103,50 +103,67 @@ Routing uses four distinct object types. They MUST NOT be conflated.
 
 ### 5.1 RouteProposal
 
-Emitted by the source. Describes the proposed path, the service class,
-and the requested bandwidth.
+Emitted by the source. Describes the proposed path and the negotiated
+service terms.
+
+Per R-003/R-004 final reconciliation: `RouteProposal` does NOT contain
+a `routeId` field. The only route identity is the `commitment_root`
+(derived via the Merkle construction in §5.3.1). A caller-chosen
+pre-ID MUST NOT influence the final `route_id`.
 
 ```
 RouteProposal = {
-  proposal_version:   1,
-  source_id:          text,
-  source_pubkey:      bstr .size 32,
-  destination_id:     text,
-  hops:               [+ text],    ; ordered NodeId list, excluding source
-  service_class:      text,        ; e.g. "internet-egress-https"
-  requested_bps:      uint,
-  requested_duration: uint,        ; seconds
-  proposal_nonce:     bstr .size 16,
-  proposal_sequence:  uint,        ; source's monotonic counter
-  expiry:             uint,        ; Unix seconds
-  signature:          bstr .size 64, ; Ed25519 by source
+  hops:               [+ RouteHop],   ; ordered hop descriptors
+  requirementDigest:  text,           ; hex of BLAKE3-256 of ServiceRequirement
+  expiry:             uint,           ; Unix seconds
+  initiatorNodeId:    text,           ; NodeId of the source
+  agreementDigest:    text,           ; hex of BLAKE3-256 of negotiated terms
+}
+
+RouteHop = {
+  nodeId:        text,                ; NodeId of the hop
+  capability:    text,                ; "MESH_RELAY" | "INTERNET_GATEWAY" | ...
+  endpoint:      text,                ; e.g. "10.0.0.1:7788"
+  linkUp:        bool,                ; MUST be true for committed routes
+  serviceAgreement?: ServiceAgreement, ; optional at proposal, required at commitment
 }
 ```
 
 Signature domain: `"SHARENET/ROUTE/PROPOSAL/1"`.
 
+The canonical encoding for signing and Merkle leaf construction uses
+integer-keyed CBOR maps (ADR-0004) over the semantically-significant
+fields. The `routeId` field is NOT included in the proposal or its
+canonical encoding.
+
 ### 5.2 RouteAcceptance
 
-Emitted by **each hop** (and by the destination) in response to a
-RouteProposal. Acceptance is per-hop: a hop accepts the proposal as
-it applies to that hop's role in the path.
+Emitted by **each hop** in response to a RouteProposal. Acceptance is
+per-hop: a hop accepts the proposal as it applies to that hop's role
+in the path.
+
+Per R-003: the acceptance cryptographically binds the exact proposal,
+hop descriptor, and service agreement via carried digests (no TOCTOU).
 
 ```
 RouteAcceptance = {
-  acceptance_version:  1,
-  proposal_hash:        bstr .size 32, ; BLAKE3-256 of canonical RouteProposal
-  acceptor_id:          text,
-  acceptor_pubkey:      bstr .size 32,
-  accepted_role:        "relay" | "gateway",
-  accepted_bps:         uint,        ; may be less than requested
-  accepted_duration:    uint,
-  acceptance_nonce:     bstr .size 16,
-  expiry:               uint,
-  signature:            bstr .size 64, ; Ed25519 by acceptor
+  proposalDigestHex:  text,           ; hex of BLAKE3-256 of canonical RouteProposal
+  hopIndex:           uint,           ; which hop this acceptance is for
+  hopDigestHex:       text,           ; hex of BLAKE3-256 of canonical HopDescriptor
+  serviceDigestHex:   text,           ; hex of BLAKE3-256 of canonical ServiceAgreement
+  acceptorNodeId:     text,           ; NodeId of the acceptor
+  acceptanceNonce:   bstr .size 16,   ; fresh per-acceptance nonce
+  expiry:             uint,           ; Unix seconds
+  signature:         bstr .size 64,   ; Ed25519 by acceptor
 }
 ```
 
 Signature domain: `"SHARENET/ROUTE/ACCEPTANCE/1"`.
+
+The acceptance signature payload binds: `domain || proposal_digest ||
+hop_index || hop_digest || service_digest || acceptor_node_id ||
+nonce || expiry`. The digests are carried explicitly (not recomputed
+from mutable objects) to prevent TOCTOU.
 
 ### 5.3 RouteCommitment
 

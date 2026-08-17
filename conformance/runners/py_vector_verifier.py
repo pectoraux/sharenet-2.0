@@ -380,7 +380,119 @@ def verify_vector(data: dict) -> dict:
     elif vid.startswith("V-LINK-HANDSHAKE-") or vid.startswith("V-LINK-AUTH-"):
         return verify_handshake_vector(data)
 
+    elif vid.startswith("V-ROUTE-COMMIT-"):
+        return verify_route_commit_vector(data)
+
     return {"id": vid, "passed": False, "expected": "known type", "actual": "unknown type"}
+
+
+# -----------------------------------------------------------------------
+# Route commitment vector verification (added for R-003/R-004)
+# -----------------------------------------------------------------------
+
+MERKLE_DOMAIN = b"SHARENET/ROUTE/COMMITMENT/MERKLE/1"
+LEAF_TYPE_PROPOSAL = 0x00
+LEAF_TYPE_ACCEPTANCE = 0x01
+NODE_TYPE_INTERNAL = 0x02
+
+
+def _canonical_encode_proposal(proposal: dict) -> bytes:
+    """Canonical CBOR encoding of a RouteProposal for the Merkle leaf."""
+    m = {}
+    m[1] = [h["nodeId"] for h in proposal["hops"]]
+    m[2] = [h["capability"] for h in proposal["hops"]]
+    m[3] = [h["endpoint"] for h in proposal["hops"]]
+    m[4] = [h["linkUp"] for h in proposal["hops"]]
+    m[5] = proposal["requirementDigest"]
+    m[6] = proposal["expiry"]
+    m[7] = proposal["initiatorNodeId"]
+    m[8] = proposal["agreementDigest"]
+    return cbor2.dumps(m, canonical=True)
+
+
+def _canonical_encode_acceptance(acc: dict) -> bytes:
+    """Canonical CBOR encoding of a RouteAcceptance for the Merkle leaf."""
+    m = {}
+    m[1] = acc["proposalDigestHex"]
+    m[2] = acc["hopIndex"]
+    m[3] = acc["hopDigestHex"]
+    m[4] = acc["serviceDigestHex"]
+    m[5] = acc["acceptorNodeId"]
+    m[6] = bytes.fromhex(acc["acceptanceNonceHex"])
+    m[7] = acc["expiry"]
+    m[8] = bytes.fromhex(acc["signatureHex"])
+    return cbor2.dumps(m, canonical=True)
+
+
+def _compute_proposal_leaf(proposal: dict) -> bytes:
+    domain = MERKLE_DOMAIN
+    body = _canonical_encode_proposal(proposal)
+    return blake3.blake3(domain + bytes([LEAF_TYPE_PROPOSAL]) + body).digest()
+
+
+def _compute_acceptance_leaf(acc: dict, hop_index: int) -> bytes:
+    domain = MERKLE_DOMAIN
+    body = _canonical_encode_acceptance(acc)
+    index_bytes = struct.pack(">I", hop_index)  # u32be
+    return blake3.blake3(domain + bytes([LEAF_TYPE_ACCEPTANCE]) + index_bytes + body).digest()
+
+
+def _compute_parent(left: bytes, right: bytes) -> bytes:
+    domain = MERKLE_DOMAIN
+    return blake3.blake3(domain + bytes([NODE_TYPE_INTERNAL]) + left + right).digest()
+
+
+def _compute_commitment_root(proposal: dict, acceptances: list) -> bytes:
+    """Compute the canonical Merkle commitment_root."""
+    leaves = [_compute_proposal_leaf(proposal)]
+    for i, acc in enumerate(acceptances):
+        leaves.append(_compute_acceptance_leaf(acc, i))
+
+    level = leaves
+    while len(level) > 1:
+        next_level = []
+        for i in range(0, len(level), 2):
+            left = level[i]
+            right = level[i + 1] if i + 1 < len(level) else left  # duplicate last if odd
+            next_level.append(_compute_parent(left, right))
+        level = next_level
+
+    return level[0]
+
+
+def _derive_route_id(commitment_root: bytes) -> str:
+    return "route:" + commitment_root.hex()
+
+
+def verify_route_commit_vector(data: dict) -> dict:
+    """Verify a V-ROUTE-COMMIT-* vector (canonical Merkle commitment_root)."""
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            proposal = v["proposal"]
+            acceptances = v["acceptances"]
+
+            root = _compute_commitment_root(proposal, acceptances)
+            root_hex = root.hex()
+            route_id = _derive_route_id(root)
+
+            if root_hex != v["expectedCommitmentRootHex"]:
+                failures.append(f'{v["name"]}: root {root_hex} != {v["expectedCommitmentRootHex"]}')
+            elif route_id != v["expectedRouteId"]:
+                failures.append(f'{v["name"]}: routeId {route_id} != {v["expectedRouteId"]}')
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} route-commit vectors match",
+        "actual": f"{len(vectors)} route-commit vectors match" if passed else f"FAILED: {'; '.join(failures)}",
+    }
 
 
 # -----------------------------------------------------------------------

@@ -909,3 +909,51 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-003/R-004 final reconciliation: RouteProposal no longer has a caller-chosen routeId; the only route identity is commitment_root. Golden vectors are frozen and consumed by the canonical conformance system. Independent verifyRouteCommitment() provides a WeakSet-free verification path. All three audit requirements are addressed.
+
+---
+Task ID: R-003/R-004-spec-reconciliation
+Agent: main (Z.ai Code)
+Task: Final routing-spec reconciliation pass — reconcile spec/07 with implementation, add Python vector handler, update MILESTONES.md, add schema-divergence conformance test.
+
+Work Log:
+- Reconciled spec/07-routing.md §5.1-5.2 with the implementation:
+  - §5.1 RouteProposal: replaced the old CDDL schema (proposal_version, source_id, source_pubkey, destination_id, hops: [+ text], service_class, requested_bps, requested_duration, proposal_nonce, proposal_sequence, expiry, signature) with the implementation's actual schema (hops: [+ RouteHop], requirementDigest, expiry, initiatorNodeId, agreementDigest).
+  - Added RouteHop schema definition (nodeId, capability, endpoint, linkUp, serviceAgreement?).
+  - §5.2 RouteAcceptance: replaced the old CDDL schema (acceptance_version, proposal_hash, acceptor_id, acceptor_pubkey, accepted_role, accepted_bps, accepted_duration, acceptance_nonce, expiry, signature) with the implementation's actual schema (proposalDigestHex, hopIndex, hopDigestHex, serviceDigestHex, acceptorNodeId, acceptanceNonce, expiry, signature).
+  - Documented the acceptance signature payload binding.
+  - Documented that routeId is NOT in the proposal (R-003/R-004 final reconciliation).
+  - Preserved the now-correct §5.3.1 (Merkle construction), §5.3.2 (signature), §5.4 (route_id format).
+
+- Updated MILESTONES.md:
+  - R-002: ✅ CLOSED (was ⚠️ OPEN — stale)
+  - R-003: ⚠️ PARTIAL (canonical Merkle ✅, normative schema ✅, Python vector pending)
+  - R-004: ⚠️ PARTIAL (independent verifier ✅, immutable ✅, Python vector pending)
+  - Updated descriptions to reflect the new Merkle construction (not the old flat hash)
+
+- Added Python verifier handler for V-ROUTE-COMMIT-001:
+  - `verify_route_commit_vector()` in `py_vector_verifier.py`
+  - Independent Python implementation of the Merkle tree:
+    - `_compute_proposal_leaf()` — BLAKE3(domain || u8(0x00) || canonicalEncode(Proposal))
+    - `_compute_acceptance_leaf()` — BLAKE3(domain || u8(0x01) || u32be(i) || canonicalEncode(Acceptance))
+    - `_compute_parent()` — BLAKE3(domain || u8(0x02) || left || right)
+    - `_compute_commitment_root()` — bottom-up Merkle tree with duplicate-last odd-node handling
+    - `_derive_route_id()` — "route:" + lowercase_hex(root)
+  - Uses cbor2 with canonical=True for CBOR encoding
+  - Python verifier now passes 20/20 vectors (was 19/20 — V-ROUTE-COMMIT-001 was "unknown type")
+
+- Created `tests/r003-r004-schema-conformance.test.ts` (5 tests):
+  - RouteProposal implementation fields match spec/07 §5.1 (exact field set, no routeId)
+  - RouteAcceptance implementation fields match spec/07 §5.2 (exact field set)
+  - RouteHop implementation fields match spec/07 §5.1 RouteHop (exact field set)
+  - spec/07-routing.md §5.1 documents the same fields as the implementation
+  - spec/07-routing.md §5.2 documents the same RouteAcceptance fields as the implementation
+  - This test FAILS if the spec or implementation changes without the other being updated.
+
+Stage Summary:
+- Tests: 311 → 316 pass, 0 fail (+5 schema-conformance tests). 844 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 20/20 vectors pass.
+- Python conformance runner: 20/20 vectors pass (was 19/20 — V-ROUTE-COMMIT-001 now consumed).
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The normative spec and implementation now have exactly one canonical schema for RouteProposal and RouteAcceptance. The golden vector is consumed by both TS and Python. A conformance test fails if the schemas diverge.
