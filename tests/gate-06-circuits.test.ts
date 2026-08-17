@@ -18,7 +18,6 @@ import {
   type RouteProposal,
   signRouteAcceptance,
   createRouteCommitment,
-  createCommittedRoute,
   PROPOSAL_TO_CIRCUIT_FORBIDDEN,
 } from "@reference/routing/route";
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -32,13 +31,18 @@ import {
   encryptPayload,
   decryptPayload,
   CircuitReplayGuard,
+  CIRCUIT_REPLAY_MODEL,
   UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN,
-  CIRCUIT_EXPIRY_SECONDS,
 } from "@reference/circuit/circuit";
+import {
+  createBrandedCommittedRoute,
+  isBrandedCommittedRoute,
+  type BrandedCommittedRoute,
+} from "@reference/transport/validated-types";
 
 const REFERENCE_NOW = 1786876545;
 
-function makeCommittedRoute(numHops = 2) {
+function makeBrandedRoute(numHops = 2) {
   const kps = Array.from({ length: numHops }, () => generateNodeKeypair());
   const initiator = generateNodeKeypair();
 
@@ -71,10 +75,12 @@ function makeCommittedRoute(numHops = 2) {
 
   const commitmentResult = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, initiator.secretKey, REFERENCE_NOW);
   if (!commitmentResult.ok) throw new Error("failed to create commitment");
-  return { route: createCommittedRoute(commitmentResult.commitment), kps, initiator };
+  // R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute.
+  const branded = createBrandedCommittedRoute(commitmentResult.commitment);
+  return { route: branded, kps, initiator };
 }
 
-function makeRelayX25519Keys(route: ReturnType<typeof makeCommittedRoute>["route"]) {
+function makeRelayX25519Keys(route: BrandedCommittedRoute) {
   return route.hops.map((hop, i) => {
     const sk = randomBytes(32);
     const pk = x25519.getPublicKey(sk);
@@ -85,7 +91,8 @@ function makeRelayX25519Keys(route: ReturnType<typeof makeCommittedRoute>["route
 describe("GATE-06: Circuits and encrypted forwarding", () => {
   // --- 1. Circuit setup from committed route ---
   test("circuit setup from committed route succeeds", () => {
-    const { route } = makeCommittedRoute(2);
+    const { route } = makeBrandedRoute(2);
+    expect(isBrandedCommittedRoute(route)).toBe(true);
     const relayKeys = makeRelayX25519Keys(route);
     const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
     expect(circuit.circuitIdHex.length).toBe(64); // 32 bytes hex
@@ -96,7 +103,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
 
   // --- 2. Circuit ID is deterministic for same route + initiator key ---
   test("circuit ID is deterministic", () => {
-    const { route } = makeCommittedRoute(1);
+    const { route } = makeBrandedRoute(1);
     const relayKeys = makeRelayX25519Keys(route);
     const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
     const circuitId2 = deriveCircuitId(route.routeId, circuit.initiatorX25519PublicKey);
@@ -105,7 +112,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
 
   // --- 3. Onion encryption: each relay decrypts one layer ---
   test("onion encrypt/decrypt: each relay peels one layer", () => {
-    const { route } = makeCommittedRoute(2);
+    const { route } = makeBrandedRoute(2);
     const relayKeys = makeRelayX25519Keys(route);
     const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
 
@@ -189,14 +196,24 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
     expect(() => decryptPayload(keyB, nonce, ciphertext)).toThrow();
   });
 
-  // --- 10. Expired circuit ---
-  test("expired circuit: setup with past expiry", () => {
-    const { route } = makeCommittedRoute(1);
+  // --- 10. Circuit expiry is propagated from the branded committed route ---
+  // R-008 hardening: the genuine pipeline (createRouteCommitment) rejects
+  // expired acceptances, so an expired branded route is genuinely impossible.
+  // The old test spread the route to override expiry — that now correctly
+  // fails the WeakSet brand check (a copy is not a genuine branded route).
+  // This test now verifies (a) the route's expiry is propagated to the circuit
+  // and (b) a property-copy of the branded route is rejected by setupCircuit.
+  test("circuit expiry is propagated from the branded committed route; copy rejected", () => {
+    const { route } = makeBrandedRoute(1);
     const relayKeys = makeRelayX25519Keys(route);
-    // Use a route that expires in the past (manually override)
-    const expiredRoute = { ...route, expiry: REFERENCE_NOW - 100 };
-    const circuit = setupCircuit(expiredRoute, relayKeys, REFERENCE_NOW);
-    expect(circuit.expiry).toBeLessThan(REFERENCE_NOW);
+    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
+    expect(circuit.expiry).toBe(route.expiry);
+    expect(circuit.expiry).toBeGreaterThan(REFERENCE_NOW);
+
+    // A property-copy is NOT a genuine branded route (WeakSet identity check).
+    const copiedRoute = { ...route, expiry: REFERENCE_NOW - 100 };
+    expect(isBrandedCommittedRoute(copiedRoute)).toBe(false);
+    expect(() => setupCircuit(copiedRoute as any, relayKeys, REFERENCE_NOW)).toThrow();
   });
 
   // --- 11. Uncommitted route → circuit FORBIDDEN ---
@@ -239,7 +256,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
 
   // --- 15. Full onion encrypt → relay decrypt → gateway decrypt chain ---
   test("full chain: A → Relay → Gateway encrypted test payload", () => {
-    const { route } = makeCommittedRoute(2);
+    const { route } = makeBrandedRoute(2);
     const relayKeys = makeRelayX25519Keys(route);
     const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
 
@@ -264,14 +281,14 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
 
   // --- 16. Circuit setup fails with wrong number of relay keys ---
   test("circuit setup fails with mismatched relay key count", () => {
-    const { route } = makeCommittedRoute(2);
+    const { route } = makeBrandedRoute(2);
     const relayKeys = makeRelayX25519Keys(route).slice(0, 1); // only 1 key for 2 hops
     expect(() => setupCircuit(route, relayKeys, REFERENCE_NOW)).toThrow();
   });
 
   // --- 17. Circuit setup fails with mismatched node IDs ---
   test("circuit setup fails with mismatched node IDs", () => {
-    const { route } = makeCommittedRoute(2);
+    const { route } = makeBrandedRoute(2);
     const wrongKeys = route.hops.map((hop, i) => {
       const sk = randomBytes(32);
       const pk = x25519.getPublicKey(sk);
@@ -286,7 +303,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
 
   // --- 18. Multiple sequential packets with increasing sequence ---
   test("multiple packets: sequential sequence numbers accepted", () => {
-    const { route } = makeCommittedRoute(1);
+    const { route } = makeBrandedRoute(1);
     const relayKeys = makeRelayX25519Keys(route);
     const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
 
@@ -296,5 +313,43 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
       const { decrypted } = relayDecrypt(circuit, 0, BigInt(i), encryptedPayload);
       expect(new TextDecoder().decode(decrypted)).toBe(`packet ${i}`);
     }
+  });
+
+  // --- 19. R-008 freeze: circuit replay model is ORDERED_STREAM ---
+  // Per R-008 hardening: the data-plane replay model is frozen as
+  // ORDERED_STREAM semantics before R-009. This test codifies the freeze
+  // so a silent switch to a sliding-window / out-of-order model would
+  // be caught by CI.
+  test("R-008 freeze: circuit replay model is ORDERED_STREAM (strictly increasing; backfill rejected)", () => {
+    // The frozen model constant is published and equals ORDERED_STREAM.
+    expect(CIRCUIT_REPLAY_MODEL).toBe("ORDERED_STREAM");
+
+    const guard = new CircuitReplayGuard();
+
+    // Ordered-stream: strictly increasing. 1, 2, 3 accepted.
+    expect(guard.checkAndRecord(1n).ok).toBe(true);
+    expect(guard.checkAndRecord(2n).ok).toBe(true);
+    expect(guard.checkAndRecord(3n).ok).toBe(true);
+
+    // Equal sequence rejected (replay).
+    const eq = guard.checkAndRecord(3n);
+    expect(eq.ok).toBe(false);
+    if (!eq.ok) expect(eq.reason).toContain("replay");
+
+    // Lower sequence rejected (stale / out-of-order).
+    const lower = guard.checkAndRecord(2n);
+    expect(lower.ok).toBe(false);
+    if (!lower.ok) expect(lower.reason).toContain("≤");
+
+    // A gap (skip 4, jump to 5) IS accepted under ORDERED_STREAM —
+    // the model is strictly-increasing, not contiguous. The gap is the
+    // sender's choice; the receiver only enforces monotonic increase.
+    const gap = guard.checkAndRecord(5n);
+    expect(gap.ok).toBe(true);
+
+    // Back-filling the gap (4, after 5) is rejected — no out-of-order.
+    const backfill = guard.checkAndRecord(4n);
+    expect(backfill.ok).toBe(false);
+    if (!backfill.ok) expect(backfill.reason).toContain("≤");
   });
 });

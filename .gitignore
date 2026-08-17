@@ -61,3 +61,6 @@ prompt
 server.log
 # Skills directory
 /skills/
+# tool output artifacts (read tool)
+/tool-results/
+/tool-results

@@ -104,7 +104,9 @@ describe("R-006H4: Serialization boundary — deserialized proof objects are rej
     expect(() => createBrandedCommittedRoute(deserialized)).toThrow();
   });
 
-  // 3. Serialize BrandedCommittedRoute → deserialize → setupCircuit MUST FAIL
+  // 3. Serialize BrandedCommittedRoute → deserialize → isBrandedCommittedRoute MUST FAIL
+  //    (and therefore setupCircuit, which requires a genuine branded route,
+  //     MUST also reject the deserialized copy — per R-008 hardening.)
   test("deserialized BrandedCommittedRoute → rejected by isBrandedCommittedRoute", () => {
     const kp = generateNodeKeypair();
     const proposal: RouteProposal = {

@@ -31,7 +31,6 @@ import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { randomBytes } from "@noble/hashes/utils.js";
 import { signMessage, verifySignature } from "../identity/keys";
 import { canonicalEncode, toHex, fromHex } from "../encoding/cbor";
-import type { CommittedRoute } from "../routing/route";
 import { isBrandedCommittedRoute, type BrandedCommittedRoute } from "../transport/validated-types";
 
 // -----------------------------------------------------------------------
@@ -41,6 +40,27 @@ import { isBrandedCommittedRoute, type BrandedCommittedRoute } from "../transpor
 export const CIRCUIT_KEY_DOMAIN = "SHARENET/CIRCUIT/KEY/1";
 export const CIRCUIT_POSSESSION_DOMAIN = "SHARENET/CIRCUIT/POSSESSION/1";
 export const CIRCUIT_ID_DOMAIN = "SHARENET/CIRCUIT/ID/1";
+
+/**
+ * Circuit replay model — FROZEN before R-009.
+ *
+ * Per spec/08 §4.5 and the R-008 hardening: the circuit data-plane replay
+ * model is **ORDERED_STREAM** semantics. This is a protocol freeze:
+ * R-009 (circuit packet semantics) MUST build on this model and MUST NOT
+ * silently switch to a sliding-window / out-of-order acceptance model
+ * without an explicit spec amendment.
+ *
+ * ORDERED_STREAM means:
+ *   - frame_sequence is strictly increasing per circuit (starts at 1)
+ *   - a receiver rejects any frame whose sequence is <= the highest
+ *     sequence already accepted on that circuit
+ *   - there is no out-of-order acceptance window (gap tolerance is 0)
+ *   - the sequence floor persists across re-key (spec/14 §3)
+ *
+ * This constant exists so conformance/architecture tests can assert the
+ * frozen model rather than reverse-engineering it from the guard.
+ */
+export const CIRCUIT_REPLAY_MODEL = "ORDERED_STREAM" as const;
 
 /** AEAD key size (256 bits / 32 bytes for ChaCha20-Poly1305). */
 export const AEAD_KEY_BYTES = 32;
@@ -187,9 +207,14 @@ export function decryptPayload(
 /**
  * Replay protection for a single circuit.
  *
- * Per GATE-06: replay protection via monotonic sequence numbers.
+ * Per GATE-06 and the R-008 hardening freeze: this guard implements the
+ * **ORDERED_STREAM** replay model (see `CIRCUIT_REPLAY_MODEL`).
+ *
  * Each circuit tracks the highest sequence number seen and rejects
- * any packet with a lower or equal sequence number.
+ * any frame whose sequence is `<=` the highest accepted sequence.
+ * There is no out-of-order/sliding-window acceptance: gap tolerance
+ * is 0. This is the frozen data-plane replay contract that R-009
+ * (circuit packet semantics) MUST build on.
  */
 export class CircuitReplayGuard {
   private highestSeq = 0n;
@@ -274,40 +299,54 @@ export interface RelayCircuitKeys {
 }
 
 /**
- * Set up a circuit from a CommittedRoute.
+ * Set up a circuit from a BrandedCommittedRoute.
  *
- * This is the ONLY function that creates an ActiveCircuit.
- * It requires a CommittedRoute (not a RouteProposal — per spec/00 §31).
+ * This is the ONLY function that creates an ActiveCircuit from the
+ * single-process (non-distributed) path. It requires a genuine
+ * `BrandedCommittedRoute` — the unforgeable proof artifact produced by
+ * `createBrandedCommittedRoute`, which itself consumes a genuine
+ * `RouteCommitment` from `createRouteCommitment`.
  *
- * Per R-006 hardening: this function accepts BOTH:
- *   1. A BrandedCommittedRoute (unforgeable, from createBrandedCommittedRoute)
- *   2. A legacy CommittedRoute (for backward compatibility with existing tests)
+ * Per R-008 hardening (closing the legacy bypass flagged in the
+ * trust-boundary audit): the legacy `CommittedRoute` acceptance path is
+ * **REMOVED**. Every circuit construction path now requires a genuine
+ * branded route. There is no structural-trust fallback.
  *
- * If a BrandedCommittedRoute is passed, the brand is verified at runtime.
- * If a legacy CommittedRoute is passed, the structural type is trusted (transitional).
+ * The runtime WeakSet membership check (`isBrandedCommittedRoute`) is
+ * the **first** operation. This guarantees:
+ *   - a plain object matching the shape is REJECTED (not in the WeakSet)
+ *   - a legacy `CommittedRoute` (from `createCommittedRoute`) is REJECTED
+ *   - a `RouteProposal` is REJECTED
+ *   - a property-copy of a genuine branded route is REJECTED
+ *     (`{ ...branded }` is a new object, not in the WeakSet)
+ *   - a deserialized branded route is REJECTED
  *
- * A plain object or RouteProposal will fail at runtime because it lacks
- * the required fields (hops, routeId, expiry, etc.) OR lacks the brand.
+ * Only an object that transited `createBrandedCommittedRoute` is
+ * accepted. The TypeScript signature `route: BrandedCommittedRoute` is
+ * the compile-time boundary; the WeakSet check is the runtime boundary.
  *
- * The initiator generates an X25519 keypair, performs ECDH with each relay's
- * X25519 public key, and derives per-hop AEAD keys via HKDF.
+ * The initiator generates an X25519 keypair, performs ECDH with each
+ * relay's X25519 public key, and derives per-hop AEAD keys via HKDF.
  */
 export function setupCircuit(
-  route: CommittedRoute | BrandedCommittedRoute,
+  route: BrandedCommittedRoute,
   relayX25519PublicKeys: Array<{ hopIndex: number; nodeId: string; x25519PublicKey: Uint8Array }>,
   now: number,
 ): ActiveCircuit {
-  // R-006 hardening: if this is a BrandedCommittedRoute, verify the brand.
-  // If it's a plain CommittedRoute (legacy), accept it structurally.
-  // If it's neither (plain object, RouteProposal, topology data), it will
-  // fail below because it lacks the required fields.
-  if (isBrandedCommittedRoute(route)) {
-    // Branded route — the brand was set by createBrandedCommittedRoute
-    // which already verified all acceptance signatures and hop validation.
+  // R-008 hardening: runtime brand boundary — the FIRST check.
+  // This is genuinely unforgeable (WeakSet tracks object identity, not
+  // property values). There is no legacy bypass.
+  if (!isBrandedCommittedRoute(route)) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: setupCircuit rejected — route is not a genuine " +
+        "BrandedCommittedRoute (WeakSet membership check failed). Per R-008 " +
+        "hardening, every circuit construction path requires a genuine branded " +
+        "route produced by createBrandedCommittedRoute (which consumes a genuine " +
+        "RouteCommitment from createRouteCommitment). Legacy CommittedRoute, " +
+        "RouteProposal, plain objects, property-copies, and deserialized routes " +
+        "are all rejected. The legacy structural-trust path has been removed.",
+    );
   }
-  // Non-branded routes (legacy CommittedRoute) are accepted structurally
-  // for backward compatibility. A future hardening pass can make the
-  // brand mandatory.
 
   // Validate: the route must have hops
   if (route.hops.length === 0) {

@@ -48,7 +48,6 @@ import {
   deriveCircuitId,
   onionEncrypt,
   relayDecrypt,
-  setupCircuit,
 } from "@reference/circuit/circuit";
 
 const NOW = 1786876545;

@@ -65,6 +65,70 @@ export type ForwardingLifecycle = "INSTALLED" | "ACTIVE" | "EXPIRED" | "CLOSED";
 /** Circuit expiry in seconds (1 hour). */
 export const CIRCUIT_EXPIRY_SECONDS = 3600;
 
+/**
+ * Maximum ACK age (TTL) — an ack must be CONSUMED (processed by the
+ * initiator) within this many seconds of `ackTimestamp`, regardless of
+ * the looser `ackExpiry`. This bounds the replay window: even when an
+ * ack carries a 1-hour absolute expiry, it must still be fresh on a
+ * relative scale. Per R-008 hardening.
+ */
+export const ACK_MAX_AGE_SECONDS = 120; // 2 minutes
+
+/**
+ * Maximum tolerated clock skew — `ackTimestamp` may be at most this many
+ * seconds in the future relative to the initiator's `now`. Acks dated
+ * further into the future are rejected as malformed / replay-with-skew.
+ * Per R-008 hardening.
+ */
+export const ACK_MAX_CLOCK_SKEW_SECONDS = 60; // 1 minute
+
+/**
+ * Legal forwarding-lifecycle transitions (R-008 hardening).
+ *
+ *   INSTALLED → ACTIVE        (circuit fully established: all acks verified)
+ *   INSTALLED → EXPIRED       (ack expired before the circuit completed)
+ *   INSTALLED → CLOSED        (operator/relay aborted during setup)
+ *   ACTIVE  → EXPIRED         (valid_until reached)
+ *   ACTIVE  → CLOSED          (teardown)
+ *
+ * EXPIRED and CLOSED are terminal. Any other transition is rejected.
+ */
+const LEGAL_LIFECYCLE_TRANSITIONS: Record<ForwardingLifecycle, ForwardingLifecycle[]> = {
+  INSTALLED: ["ACTIVE", "EXPIRED", "CLOSED"],
+  ACTIVE: ["EXPIRED", "CLOSED"],
+  EXPIRED: [],
+  CLOSED: [],
+};
+
+/**
+ * Transition a relay's forwarding lifecycle state.
+ *
+ * Per R-008 hardening: the lifecycle is a real state machine, not a free
+ * string assignment. Illegal transitions are rejected. This makes the
+ * forwarding-state progression auditable and prevents a relay from
+ * silently re-activating expired/closed forwarding state.
+ */
+export function transitionForwardingLifecycle(
+  from: ForwardingLifecycle,
+  to: ForwardingLifecycle,
+): { ok: true } | { ok: false; reason: string } {
+  if (!LEGAL_LIFECYCLE_TRANSITIONS[from].includes(to)) {
+    return {
+      ok: false,
+      reason: `illegal forwarding-lifecycle transition: ${from} → ${to}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Check whether a forwarding state is terminal (no further traffic).
+ * Per spec/08 §6: EXPIRED and CLOSED MUST zeroize derived keys.
+ */
+export function isTerminalForwardingLifecycle(s: ForwardingLifecycle): boolean {
+  return s === "EXPIRED" || s === "CLOSED";
+}
+
 // -----------------------------------------------------------------------
 // CircuitSetupRequest (Initiator → Relay)
 // -----------------------------------------------------------------------
@@ -331,9 +395,31 @@ export function processCircuitSetupAck(
     return { ok: false, reason: `initiator X25519 pubkey mismatch (transcript binding)` };
   }
 
-  // 5. Verify ack expiry (R-008H: lifecycle)
+  // 5. ACK freshness (R-008 hardening): the ack is rejected unless it is
+  //    BOTH unexpired AND recently-issued AND not dated too far in the
+  //    future. Three independent bounds:
+  //
+  //    a) ackExpiry > now            — absolute deadline (existing check)
+  //    b) ackExpiry > ackTimestamp   — sanity: expiry must follow creation
+  //    c) ackTimestamp <= now+SKEW   — reject acks dated far in the future
+  //    d) now - ackTimestamp <= AGE  — reject acks consumed too long after
+  //                                     issuance (relative freshness / TTL)
+  //
+  //    (c) and (d) are what bound the replay window independently of the
+  //    (looser) 1-hour absolute expiry: even an unexpired ack becomes
+  //    unusable once it is more than ACK_MAX_AGE_SECONDS old, and an ack
+  //    carrying a future timestamp is treated as malformed/replay.
   if (ack.ackExpiry <= now) {
     return { ok: false, reason: `ack ${expectedHopIndex} expired (expiry ${ack.ackExpiry} <= now ${now})` };
+  }
+  if (ack.ackExpiry <= ack.ackTimestamp) {
+    return { ok: false, reason: `ack ${expectedHopIndex} malformed (expiry ${ack.ackExpiry} <= timestamp ${ack.ackTimestamp})` };
+  }
+  if (ack.ackTimestamp > now + ACK_MAX_CLOCK_SKEW_SECONDS) {
+    return { ok: false, reason: `ack ${expectedHopIndex} future-skewed (timestamp ${ack.ackTimestamp} > now+${ACK_MAX_CLOCK_SKEW_SECONDS})` };
+  }
+  if (now - ack.ackTimestamp > ACK_MAX_AGE_SECONDS) {
+    return { ok: false, reason: `ack ${expectedHopIndex} stale (age ${now - ack.ackTimestamp}s > max ${ACK_MAX_AGE_SECONDS}s)` };
   }
 
   // 6. Verify relay signature (binds routeId + digest + hopIndex + keys + nonce + timestamps)

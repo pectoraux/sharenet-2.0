@@ -141,6 +141,41 @@ Sequence floors persist across circuit re-key events (see
 `spec/14-security.md` §3); a re-key MUST continue the counter from
 the prior floor.
 
+#### 4.5.1 Frozen Replay Model (R-008 hardening)
+
+The reference implementation freezes the data-plane replay model as
+**ORDERED_STREAM** semantics:
+
+- `frame_sequence` is strictly increasing per circuit (starts at 1).
+- A receiver rejects any frame whose sequence is `<=` the highest
+  sequence already accepted on that circuit.
+- There is no out-of-order acceptance window: gap tolerance is 0.
+
+This freeze is recorded as the constant `CIRCUIT_REPLAY_MODEL =
+"ORDERED_STREAM"` in `reference/circuit/circuit.ts` and is asserted by
+conformance tests. R-009 (circuit packet semantics) MUST build on this
+model and MUST NOT silently switch to a sliding-window / out-of-order
+acceptance model without an explicit spec amendment.
+
+### 4.5b ACK Freshness (R-008 hardening)
+
+A `CircuitSetupAck` carries both an absolute deadline (`ackExpiry`) and
+a creation timestamp (`ackTimestamp`). The initiator MUST reject an ack
+unless ALL of the following hold:
+
+1. `ackExpiry > now` — the ack has not passed its absolute deadline.
+2. `ackExpiry > ackTimestamp` — sanity: the deadline follows creation.
+3. `ackTimestamp <= now + ACK_MAX_CLOCK_SKEW_SECONDS` — the ack is not
+   dated too far in the future (rejects replay-with-skew / malformed
+   acks).
+4. `now - ackTimestamp <= ACK_MAX_AGE_SECONDS` — the ack is consumed
+   within a bounded relative freshness window (TTL), independent of the
+   looser absolute expiry.
+
+Bounds (3) and (4) are what make a captured ack unusable shortly after
+issuance, even when its absolute `ackExpiry` is generous (e.g. 1 hour).
+This bounds the setup-phase replay window to `ACK_MAX_AGE_SECONDS`.
+
 ### 4.6 Route / Circuit Binding
 
 Every data frame carries, as AEAD associated data:

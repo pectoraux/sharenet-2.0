@@ -32,7 +32,7 @@ where the actual verification level is lower than originally claimed.
 | GATE-03 | Secure authenticated directed links | IMPLEMENTED | `d4a241c` | `evidence/GATE-03.json` | 3-message handshake implemented + vectors; NO real TCP integration (R-002 pending) |
 | GATE-04 | Discovery and topology hints | IMPLEMENTED | `26eda87` | `evidence/GATE-04.json` | Hint store + propagation; NO 3-node real-process test |
 | GATE-05 | Service negotiation and route commitment | IMPLEMENTED | `9004c0e` | `evidence/GATE-05.json` | Route types + acceptance; R-003/R-004 pending (acceptance binding + sig verification) |
-| GATE-06 | Circuits and encrypted forwarding | IMPLEMENTED | `fdf49f0` | `evidence/GATE-06.json` | X25519+AEAD+onion; NO distributed relay setup (R-008 pending) |
+| GATE-06 | Circuits and encrypted forwarding | LOCALLY_VERIFIED | `fdf49f0` | `evidence/GATE-06.json` | X25519+AEAD+onion; distributed relay setup + ACK freshness + ORDERED_STREAM replay freeze (R-008 hardened); setupCircuit requires BrandedCommittedRoute exclusively |
 | GATE-07 | Mode A Internet gateway | IMPLEMENTED | `997b0a0` | `evidence/GATE-07.json` | Policy layer; NO real Internet forwarding (R-010 pending) |
 | GATE-08 | Recovery | IMPLEMENTED | `38c38b0` | `evidence/GATE-08.json` | Recovery state machine; NO real-process failure test |
 | GATE-09 | Linux transparent networking | DESIGNED | `4213295` | `evidence/GATE-09.json` | TUN adapter interface; NO actual /dev/net/tun (R-012 pending) |
@@ -46,14 +46,14 @@ where the actual verification level is lower than originally claimed.
 | ID | Priority | Description | Status |
 |----|----------|-------------|--------|
 | R-001 | P0 | Protocol freeze reconciliation | ✅ DONE (`ed61a1a`) |
-| R-002 | P0 | Fresh possession proof for LINK_UP | ⏳ PENDING |
-| R-003 | P0 | RouteAcceptance signature binding | ⏳ PENDING |
-| R-004 | P0 | Commitment verifies signatures | ⏳ PENDING |
-| R-005 | P0 | Truthful gate system | ✅ DONE (this update) |
-| R-006 | P1 | Architecture test upgrades | ⏳ PENDING |
-| R-007 | P1 | Vectors as mandatory inputs | ⏳ PENDING |
-| R-008 | P1 | Distributed circuit setup | ⏳ PENDING |
-| R-009 | P1 | Circuit packet semantics | ⏳ PENDING |
+| R-002 | P0 | Fresh possession proof for LINK_UP | ⚠️ OPEN (P1 follow-up: state-machine transitions still caller-driven) |
+| R-003 | P0 | RouteAcceptance signature binding | ⚠️ OPEN (commitment-root / route-identity follow-up) |
+| R-004 | P0 | Commitment verifies signatures | ⚠️ OPEN (commitment is not yet the full canonical commitment_root artifact) |
+| R-005 | P0 | Truthful gate system | ✅ DONE (this update) — tracker reconciled to HEAD |
+| R-006 | P1 | Architecture test upgrades | ⚠️ PARTIAL: setupCircuit legacy-bypass CLOSED by R-008 hardening; broader vector/arch invariants remain |
+| R-007 | P1 | Vectors as mandatory inputs | ⚠️ OPEN (vectors cover identity/encoding/advertisement/link only; routing/circuit/service vectors absent) |
+| R-008 | P1 | Distributed circuit setup + hardening | ✅ HARDENED: setupCircuit requires BrandedCommittedRoute exclusively (no legacy bypass); ACK freshness (ackTimestamp/ackExpiry + max age/TTL + clock skew); forwarding-lifecycle state machine; circuit replay model frozen as ORDERED_STREAM before R-009 |
+| R-009 | P1 | Circuit packet semantics | ⏳ PENDING (builds on the R-008 ORDERED_STREAM freeze) |
 | R-010 | P1 | Real gateway forwarding | ⏳ PENDING |
 | R-011 | P1 | Real multiprocess network test | ⏳ PENDING |
 | R-012 | P1 | Platform (TUN/VpnService) | ⏳ PENDING |

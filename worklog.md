@@ -360,3 +360,46 @@ Stage Summary:
 - **Vercel**: Project created and fully configured (framework, build settings, 5 env vars). Deployment is rate-limited today but will succeed once the daily quota resets. Production URL will be https://sharenet-2-0.vercel.app once the first deployment lands.
 - **Secrets**: All four user-provided secrets (Neon password, GitHub PAT, Vercel token, sandbox admin password) were used ONLY as runtime environment variables for the commands that needed them. None were written to any committed file, none appear in git history, none leaked into dev.log. The `.env` file (gitignored) contains the Neon connection strings for local dev only.
 - **ROTATION REMINDER**: User confirmed they will rotate the PAT and Vercel token. Also recommend rotating: the Neon database password (it was pasted in chat), the bootstrap admin password (set to a placeholder on Vercel; user should set their own), and the demo account passwords (random per-boot, already safe).
+
+---
+Task ID: R-008-hardening
+Agent: main (Z.ai Code)
+Task: R-008 hardening — close the setupCircuit legacy-bypass, enforce ACK freshness, freeze the circuit replay model as ORDERED_STREAM before R-009. (6 explicit requirements from the trust-boundary audit.)
+
+Work Log:
+- Audited current `setupCircuit()` in `reference/circuit/circuit.ts`: it accepted `CommittedRoute | BrandedCommittedRoute` and structurally trusted the legacy path — exactly the legacy bypass the audit flagged.
+- Hardened `setupCircuit()`:
+  - Changed signature to `setupCircuit(route: BrandedCommittedRoute, ...)` (removed the `CommittedRoute` union member — compile-time boundary).
+  - Made `isBrandedCommittedRoute(route)` the FIRST runtime operation; throws a descriptive ARCHITECTURE VIOLATION on any non-genuine route. Removed the legacy structural-trust fallback.
+  - Removed the now-unused `import type { CommittedRoute }`.
+- Added ACK freshness enforcement to `processCircuitSetupAck()` in `reference/circuit/distributed-setup.ts`:
+  - `ACK_MAX_AGE_SECONDS = 120` (relative TTL), `ACK_MAX_CLOCK_SKEW_SECONDS = 60` (future-skew tolerance).
+  - Four independent bounds checked before signature verification: `ackExpiry > now`, `ackExpiry > ackTimestamp` (sanity), `ackTimestamp <= now + SKEW`, `now - ackTimestamp <= AGE`.
+  - Added a forwarding-lifecycle state machine: `transitionForwardingLifecycle()` + `isTerminalForwardingLifecycle()` enforcing INSTALLED→{ACTIVE,EXPIRED,CLOSED}, ACTIVE→{EXPIRED,CLOSED}; EXPIRED/CLOSED terminal.
+- Froze the circuit data-plane replay model as ORDERED_STREAM before R-009:
+  - Added `CIRCUIT_REPLAY_MODEL = "ORDERED_STREAM"` constant + freeze doc in `reference/circuit/circuit.ts`.
+  - Updated `CircuitReplayGuard` JSDoc to reference the frozen model.
+  - Added spec/08-circuits.md §4.5.1 (frozen replay model) + §4.5b (ACK freshness) normative text.
+- Migrated `tests/gate-06-circuits.test.ts`:
+  - `makeCommittedRoute()` → `makeBrandedRoute()` returning a genuine `BrandedCommittedRoute`.
+  - Migrated the "expired circuit" test (which spread the route, breaking the WeakSet) into a propagation + copy-rejection test.
+  - Added test 19: ORDERED_STREAM freeze test (strictly increasing; equal/lower/backfill rejected; forward-gap accepted).
+  - Cleaned unused imports.
+- Created `tests/r008h-setup-circuit-trust-boundary.test.ts` (6 tests): legacy CommittedRoute / plain object / RouteProposal / property-copy / JSON-round-trip all REJECTED; genuine branded ACCEPTED.
+- Created `tests/r008h-ack-freshness.test.ts` (21 tests): expired / malformed / future-skewed / stale acks REJECTED; fresh + both boundaries ACCEPT (using genuinely-signed acks at controlled creation time); cross-circuit replay REJECTED; forwarding-lifecycle legal/illegal transitions + terminal recognition.
+- Strengthened architecture test #12 to actually call `setupCircuit` (legacy + copied routes both throw at the runtime brand boundary) without breaking the 24-test count.
+- Fixed a PRE-EXISTING duplicate-import bug in `src/lib/sharenet/architecture-tests.ts` (`signAdvertisement`/`verifyAdvertisement` imported twice) that was causing `POST /api/sharenet/architecture/run` to 500 under SWC. Route now returns 401 (auth) correctly.
+- Updated `tests/r006h4-serialization-boundary.test.ts` stale comment (it tests `isBrandedCommittedRoute`, now correctly noting setupCircuit also rejects the deserialized copy per R-008).
+- Removed unused `setupCircuit` import from `tests/r008-distributed-circuit.test.ts`.
+- Verified R-003 (`r003-route-acceptance-binding.test.ts`) and R-006 (`r006h2-adversarial-validated-types.test.ts`, `r006h4-serialization-boundary.test.ts`) trust-boundary tests are preserved unchanged.
+- Browser self-verification: `/` renders cleanly, zero console/page errors, all interactive panels present.
+
+Stage Summary:
+- Tests: 222 → 250 pass, 0 fail (+28 new: 6 setup-circuit trust-boundary + 21 ack-freshness/lifecycle + 1 ORDERED_STREAM freeze). 693 expect() calls.
+- Architecture tests: 24/24 pass (test #12 strengthened to exercise setupCircuit directly).
+- Lint: clean (0 errors).
+- Dev server: healthy (`/` → 200; architecture API now 401-auth instead of 500-compile).
+- R-008 closure criterion MET: "every circuit construction path requires a genuine BrandedCommittedRoute; there must be no legacy bypass." Both `setupCircuit` (single-process) and `establishDistributedCircuit` (distributed) require genuine branded routes; the WeakSet brand check is the first runtime operation in each.
+- Circuit replay model FROZEN as ORDERED_STREAM — R-009 must build on this.
+- Truthful MILESTONES.md: R-008 ✅ HARDENED; R-006 PARTIAL (setupCircuit bypass closed); R-002-P1 / R-003 / R-004 / R-007 remain OPEN exactly as the audit found them.
+- Follow-ups NOT in scope of this task (per the audit's recommended order): R-002-P1 (evidence-carrying state-machine transitions), R-003/R-004 (canonical commitment_root), R-007 (vector expansion to routing/circuit/service layers).

@@ -79,7 +79,10 @@ import {
   type ValidatedHop,
   type BrandedCommittedRoute,
 } from "@reference/transport/validated-types";
-import { signAdvertisement, verifyAdvertisement } from "@reference/advertisement/advertisement";
+// Note: signAdvertisement + verifyAdvertisement are already imported above
+// (lines 29-34). The duplicate import below was removed — SWC rejects
+// duplicate-name imports and the architecture API route was 500ing on
+// POST /api/sharenet/architecture/run because of it.
 import { signRouteAcceptance, createRouteCommitment, createCommittedRoute, type RouteCommitment } from "@reference/routing/route";
 import type { ServiceAgreement } from "@reference/routing/service-negotiation";
 
@@ -483,10 +486,25 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       const brandedRoute = createBrandedCommittedRoute(comm2.commitment);
       const brandedRecognized = isBrandedCommittedRoute(brandedRoute);
 
+      // R-008 hardening: exercise setupCircuit directly at the runtime brand
+      // boundary. The brand check is the FIRST operation, so no relay X25519
+      // keys are required to prove the negative paths — a legacy
+      // CommittedRoute and a property-copy of the branded route must both be
+      // rejected before any hop/key validation runs.
+      const legacyRoute = createCommittedRoute(comm2.commitment);
+      const legacyNotBranded = !isBrandedCommittedRoute(legacyRoute);
+      let legacySetupThrew = false;
+      try { setupCircuit(legacyRoute as unknown as Parameters<typeof setupCircuit>[0], [], Math.floor(Date.now() / 1000)); } catch { legacySetupThrew = true; }
+
+      const copiedBranded = { ...brandedRoute };
+      const copiedNotBranded = !isBrandedCommittedRoute(copiedBranded);
+      let copiedSetupThrew = false;
+      try { setupCircuit(copiedBranded as unknown as Parameters<typeof setupCircuit>[0], [], Math.floor(Date.now() / 1000)); } catch { copiedSetupThrew = true; }
+
       return {
-        passed: plainNotBranded && proposalNotBranded && unbrandedThrew && proposalGuardThrew && brandedRecognized,
-        expected: "plain object not branded; RouteProposal not branded; UNBRANDED_ROUTE_FORBIDDEN + PROPOSAL_TO_CIRCUIT_FORBIDDEN throw; BrandedCommittedRoute recognized",
-        actual: `plain not branded=${plainNotBranded}, proposal not branded=${proposalNotBranded}, unbranded guard=${unbrandedThrew}, proposal guard=${proposalGuardThrew}, branded recognized=${brandedRecognized}`,
+        passed: plainNotBranded && proposalNotBranded && unbrandedThrew && proposalGuardThrew && brandedRecognized && legacyNotBranded && legacySetupThrew && copiedNotBranded && copiedSetupThrew,
+        expected: "plain/proposal not branded; guards throw; branded recognized; R-008 hardening: legacy CommittedRoute + copied branded route both REJECTED by setupCircuit",
+        actual: `plain not branded=${plainNotBranded}, proposal not branded=${proposalNotBranded}, unbranded guard=${unbrandedThrew}, proposal guard=${proposalGuardThrew}, branded recognized=${brandedRecognized}, legacy not branded=${legacyNotBranded}, legacy setup threw=${legacySetupThrew}, copied not branded=${copiedNotBranded}, copied setup threw=${copiedSetupThrew}`,
       };
     }),
   );
