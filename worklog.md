@@ -529,3 +529,52 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The AuthenticatedLink now proves: authenticated Node identity + fresh mutual possession + exact transcript + exact directional LinkId (recomputed, not trusted) + valid bounded lifetime — and works symmetrically for both initiator and responder directions.
+
+---
+Task ID: R-002-P1-hardening-v3
+Agent: main (Z.ai Code)
+Task: Close the final two semantic gaps in AuthenticatedLink: (1) wire/message binding — derive ALL trusted inputs from decoded wire bytes, not duplicate caller-supplied fields; (2) use-time freshness — createValidatedHop enforces link.expiresAt > now; (3) freshness provenance — link establishment bounded to transcript verification time.
+
+Work Log:
+- Refactored `createVerifiedTranscript` in `reference/transport/authenticated-link.ts`:
+  - NEW API: takes only `{ initiateBytes, acceptBytes, proofA, verifiedAt }` — no duplicate caller-supplied fields.
+  - Internally decodes Initiate/Accept wire messages via `decodeMessage()`.
+  - Extracts advertisements from the decoded messages → `advertisementFromHex()` → `verifyAdvertisement()`.
+  - Derives NodeIds + publicKeys from the VERIFIED advertisements (not from the caller).
+  - Derives nonces + challenges from the decoded wire messages.
+  - Derives proofB from the decoded Accept message.
+  - Recomputes linkIdBytes from the decoded nonces + derived NodeIds.
+  - Verifies both possession proofs against the derived values.
+  - The ONLY non-wire input is `proofA` (from the Confirm message — it's the message that completes the transcript).
+  - Added `MAX_TRANSCRIPT_AGE_SECONDS = 300` + `LINK_CLOCK_SKEW_SECONDS = 60` constants.
+
+- Added use-time freshness to `createValidatedHop` in `reference/transport/validated-types.ts`:
+  - NEW signature: `createValidatedHop(link, endpoint, capability, saDigest, now)` — 5th parameter.
+  - Enforces `link.expiresAt > now` — a stale AuthenticatedLink cannot produce a ValidatedHop.
+  - Added `isLinkFresh(link, now)` helper.
+
+- Added freshness provenance to `createAuthenticatedLink`:
+  - Enforces `establishedAt` within `[vt.verifiedAt - SKEW, vt.verifiedAt + MAX_TRANSCRIPT_AGE]`.
+  - A stale transcript (verified long ago) cannot produce a fresh link.
+  - A future-dated establishment (before the transcript was verified) is rejected as clock skew.
+  - Added `transcriptVerifiedAt` field to AuthenticatedLink.
+
+- Updated `tests/helpers/branded-route-helper.ts`: `runHandshake` now passes only `initiateBytes`, `acceptBytes`, `proofA`, `verifiedAt` to `createVerifiedTranscript`. Updated `createValidatedHop` call to pass `now`.
+
+- Updated all `createValidatedHop` callers to pass `now`:
+  - `tests/r006h2-adversarial-validated-types.test.ts` (1 call — the positive pipeline test)
+  - `src/lib/sharenet/architecture-tests.ts` (6 calls — tests #11, #15)
+  - `tests/r002p1-authenticated-link.test.ts` (all calls)
+
+- Rewrote `tests/r002p1-authenticated-link.test.ts` (23 tests) with the new v3 API:
+  - Wire/message binding: tampered Initiate bytes → reject, tampered Accept bytes → reject, wrong proofA → reject, wrong proofB (from different handshake) → reject, expired advertisement in Initiate → reject.
+  - Freshness provenance: stale transcript → reject, future-dated establishment → reject, boundary at MAX_TRANSCRIPT_AGE → accept.
+  - Use-time freshness: stale link → cannot create ValidatedHop, boundary at expiresAt → reject, isLinkFresh helper.
+  - Genuine full pipeline (both directions): initiator-side + responder-side succeed.
+
+Stage Summary:
+- Tests: 273 → 274 pass, 0 fail. 746 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The AuthenticatedLink now proves: authenticated Node identity + genuine wire transcript (all inputs derived from decoded bytes) + mutual fresh possession + exact directional LinkId (recomputed) + valid bounded lifetime + freshness-bound to transcript verification time. ValidatedHop enforces use-time freshness (link.expiresAt > now).

@@ -217,6 +217,7 @@ describe("R-006H3: Unforgeable trust chain at every construction boundary", () =
         ctx.hops[0]!.endpoint,
         ctx.capabilities[0] as string,
         ctx.validatedHops[0]!.serviceAgreementDigest,
+        NOW,
       ),
     )).toBe(true);
 

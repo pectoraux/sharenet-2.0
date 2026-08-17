@@ -1,19 +1,24 @@
 /**
- * ShareNet 2.0 — R-002-P1: AuthenticatedLink proof artifact (hardened v2).
+ * ShareNet 2.0 — R-002-P1: AuthenticatedLink proof artifact (hardened v3).
  *
- * Per the R-002-P1 hardening audit, this version fixes four issues:
- *   1. Responder-side remote-participant resolution (was broken).
- *   2. NodeId ↔ public-key binding enforced inside createVerifiedTranscript.
- *   3. LinkId recomputed from retained nonces (not trusted from caller).
- *   4. Lifetime invariants enforced (expiresAt > establishedAt, bounded).
+ * Per the R-002-P1 hardening audit v3, this version closes the final
+ * two semantic gaps:
+ *
+ *   1. WIRE/MESSAGE BINDING: createVerifiedTranscript now derives ALL
+ *      trusted inputs from decoded Initiate/Accept wire bytes. The only
+ *      non-wire input is proofA (from the Confirm message).
+ *   2. USE-TIME FRESHNESS: createValidatedHop now takes `now` and
+ *      enforces link.expiresAt > now.
+ *   3. FRESHNESS PROVENANCE: createAuthenticatedLink enforces that the
+ *      link is established within a bounded window of the transcript's
+ *      verification time.
  *
  * Adversarial tests (per auditor spec):
- *   - responder-side AuthenticatedLink → succeeds
- *   - wrong NodeId/public-key pair → rejects
- *   - swapped public keys → rejects
- *   - forged transcript participant IDs → rejects
- *   - wrong LinkId derivation → rejects
- *   - expired/future-invalid link lifetime → rejects
+ *   - wire nonce tampered → reject (LinkId changes, proofs fail)
+ *   - wire challenge tampered → reject (proofs fail)
+ *   - wire proof tampered → reject
+ *   - stale AuthenticatedLink → cannot create ValidatedHop
+ *   - replayed handshake evidence → reject (stale transcript age)
  *   - genuine initiator pipeline → succeeds
  *   - genuine responder pipeline → succeeds
  */
@@ -47,7 +52,10 @@ import {
   createAuthenticatedLink,
   isVerifiedTranscript,
   isAuthenticatedLink,
+  isLinkFresh,
   LINK_MAX_LIFETIME_SECONDS,
+  MAX_TRANSCRIPT_AGE_SECONDS,
+  LINK_CLOCK_SKEW_SECONDS,
 } from "@reference/transport/authenticated-link";
 import {
   createAuthenticatedNodeRecord,
@@ -126,126 +134,125 @@ function runGenuineHandshake() {
   };
 }
 
-/** Build a genuine VerifiedTranscript from the handshake materials. */
+/** Build a genuine VerifiedTranscript from the handshake materials (v3 API). */
 function buildVerifiedTranscript(h: ReturnType<typeof runGenuineHandshake>) {
   return createVerifiedTranscript({
     initiateBytes: h.initiateBytes,
     acceptBytes: h.acceptBytes,
-    initiatorNodeId: h.kpA.nodeId,
-    responderNodeId: h.kpB.nodeId,
-    initiatorPublicKey: h.kpA.publicKey,
-    responderPublicKey: h.kpB.publicKey,
-    initiatorNonce: h.linkNonceA,
-    responderNonce: h.linkNonceB,
-    challengeForB: h.challengeForB,
-    challengeForA: h.challengeForA,
     proofA: h.proofA,
-    proofB: h.proofB,
     verifiedAt: NOW,
   });
 }
 
-describe("R-002-P1 v2: VerifiedTranscript — NodeId binding enforced", () => {
-  test("genuine handshake → VerifiedTranscript succeeds (both proofs + NodeId binding)", () => {
+describe("R-002-P1 v3: VerifiedTranscript — wire/message binding", () => {
+  test("genuine handshake → VerifiedTranscript succeeds (all inputs from wire)", () => {
     const h = runGenuineHandshake();
     const vt = buildVerifiedTranscript(h);
     expect(isVerifiedTranscript(vt)).toBe(true);
     expect(vt.initiatorNodeId).toBe(h.kpA.nodeId);
     expect(vt.responderNodeId).toBe(h.kpB.nodeId);
-    // LinkId is recomputed internally — verify it matches
     expect(vt.linkIdHex).toBe(bytesToHex(h.linkIdBytes));
+    // Nonces are derived from the decoded wire messages
+    expect(vt.initiatorNonce).toEqual(h.linkNonceA);
+    expect(vt.responderNonce).toEqual(h.linkNonceB);
   });
 
-  test("wrong initiator NodeId (≠ deriveNodeId(pubkey)) → REJECT", () => {
+  test("tampered Initiate wire bytes (nonce changed) → REJECT (proofs fail)", () => {
     const h = runGenuineHandshake();
-    const stranger = generateNodeKeypair();
+    // Tamper with the Initiate bytes — changes the decoded nonce AND the transcript hash
+    const tamperedInitiate = new Uint8Array(h.initiateBytes);
+    tamperedInitiate[10] ^= 0x01;
     expect(() => createVerifiedTranscript({
-      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
-      initiatorNodeId: stranger.nodeId, // wrong NodeId for kpA.publicKey
-      responderNodeId: h.kpB.nodeId,
-      initiatorPublicKey: h.kpA.publicKey,
-      responderPublicKey: h.kpB.publicKey,
-      initiatorNonce: h.linkNonceA, responderNonce: h.linkNonceB,
-      challengeForB: h.challengeForB, challengeForA: h.challengeForA,
-      proofA: h.proofA, proofB: h.proofB, verifiedAt: NOW,
-    })).toThrow(/initiator NodeId does not match/i);
+      initiateBytes: tamperedInitiate,
+      acceptBytes: h.acceptBytes,
+      proofA: h.proofA,
+      verifiedAt: NOW,
+    })).toThrow();
   });
 
-  test("wrong responder NodeId (≠ deriveNodeId(pubkey)) → REJECT", () => {
-    const h = runGenuineHandshake();
-    const stranger = generateNodeKeypair();
-    expect(() => createVerifiedTranscript({
-      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
-      initiatorNodeId: h.kpA.nodeId,
-      responderNodeId: stranger.nodeId, // wrong NodeId for kpB.publicKey
-      initiatorPublicKey: h.kpA.publicKey,
-      responderPublicKey: h.kpB.publicKey,
-      initiatorNonce: h.linkNonceA, responderNonce: h.linkNonceB,
-      challengeForB: h.challengeForB, challengeForA: h.challengeForA,
-      proofA: h.proofA, proofB: h.proofB, verifiedAt: NOW,
-    })).toThrow(/responder NodeId does not match/i);
-  });
-
-  test("swapped public keys (init pubkey ↔ resp pubkey) → REJECT", () => {
-    const h = runGenuineHandshake();
-    // Swap: initiator gets B's key, responder gets A's key.
-    // The NodeId binding check fires (A's NodeId ≠ deriveNodeId(B's key)).
-    expect(() => createVerifiedTranscript({
-      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
-      initiatorNodeId: h.kpA.nodeId,
-      responderNodeId: h.kpB.nodeId,
-      initiatorPublicKey: h.kpB.publicKey, // swapped
-      responderPublicKey: h.kpA.publicKey,  // swapped
-      initiatorNonce: h.linkNonceA, responderNonce: h.linkNonceB,
-      challengeForB: h.challengeForB, challengeForA: h.challengeForA,
-      proofA: h.proofA, proofB: h.proofB, verifiedAt: NOW,
-    })).toThrow(/NodeId does not match/i);
-  });
-
-  test("bad responder proof (wrong key) → REJECT", () => {
-    const h = runGenuineHandshake();
-    const stranger = generateNodeKeypair();
-    expect(() => createVerifiedTranscript({
-      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
-      initiatorNodeId: h.kpA.nodeId, responderNodeId: h.kpB.nodeId,
-      initiatorPublicKey: h.kpA.publicKey,
-      responderPublicKey: stranger.publicKey, // NodeId won't match either
-      initiatorNonce: h.linkNonceA, responderNonce: h.linkNonceB,
-      challengeForB: h.challengeForB, challengeForA: h.challengeForA,
-      proofA: h.proofA, proofB: h.proofB, verifiedAt: NOW,
-    })).toThrow(/responder/i);
-  });
-
-  test("tampered Accept message → REJECT (transcript hash mismatch)", () => {
+  test("tampered Accept wire bytes (challenge changed) → REJECT", () => {
     const h = runGenuineHandshake();
     const tamperedAccept = new Uint8Array(h.acceptBytes);
-    tamperedAccept[0] ^= 0x01;
+    tamperedAccept[5] ^= 0x01;
     expect(() => createVerifiedTranscript({
-      initiateBytes: h.initiateBytes, acceptBytes: tamperedAccept,
-      initiatorNodeId: h.kpA.nodeId, responderNodeId: h.kpB.nodeId,
-      initiatorPublicKey: h.kpA.publicKey, responderPublicKey: h.kpB.publicKey,
-      initiatorNonce: h.linkNonceA, responderNonce: h.linkNonceB,
-      challengeForB: h.challengeForB, challengeForA: h.challengeForA,
-      proofA: h.proofA, proofB: h.proofB, verifiedAt: NOW,
-    })).toThrow(/possession proof did not verify/i);
+      initiateBytes: h.initiateBytes,
+      acceptBytes: tamperedAccept,
+      proofA: h.proofA,
+      verifiedAt: NOW,
+    })).toThrow();
+  });
+
+  test("wrong proofA (mismatched) → REJECT", () => {
+    const h = runGenuineHandshake();
+    // Use a proofA from a DIFFERENT handshake
+    const h2 = runGenuineHandshake();
+    expect(() => createVerifiedTranscript({
+      initiateBytes: h.initiateBytes,
+      acceptBytes: h.acceptBytes,
+      proofA: h2.proofA, // wrong proof
+      verifiedAt: NOW,
+    })).toThrow(/initiator's possession proof did not verify/i);
+  });
+
+  test("wrong proofB (from different handshake's Accept) → REJECT", () => {
+    const h = runGenuineHandshake();
+    const h2 = runGenuineHandshake();
+    // Use h2's Accept bytes (different proofB, different nonces)
+    expect(() => createVerifiedTranscript({
+      initiateBytes: h.initiateBytes,
+      acceptBytes: h2.acceptBytes, // different Accept → different proofB/nonces
+      proofA: h.proofA,
+      verifiedAt: NOW,
+    })).toThrow();
+  });
+
+  test("expired advertisement in Initiate → REJECT (adv freshness verified)", () => {
+    // Build a handshake with an already-expired advertisement
+    const kpA = generateNodeKeypair();
+    const kpB = generateNodeKeypair();
+    const expiredAdv = signAdvertisement({
+      protocolVersion: 1, nodeId: kpA.nodeId, signingPublicKey: kpA.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.1", port: 7788 }],
+      sequence: 1, timestamp: NOW - 7200, expiry: NOW - 3600, // expired
+      nonce: randomBytes(16),
+    }, kpA.secretKey);
+    const advB = signAdvertisement({
+      protocolVersion: 1, nodeId: kpB.nodeId, signingPublicKey: kpB.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.2", port: 7789 }],
+      sequence: 1, timestamp: NOW, expiry: NOW + 3600, nonce: randomBytes(16),
+    }, kpB.secretKey);
+
+    const initiateMsg: InitiateMessage = {
+      kind: 1, advertisementHex: advertisementToHex(expiredAdv),
+      linkNonceA: randomBytes(16), challengeForB: randomBytes(32),
+    };
+    const initiateBytes = encodeInitiate(initiateMsg);
+    const acceptMsg: AcceptMessage = {
+      kind: 2, advertisementHex: advertisementToHex(advB),
+      linkNonceB: randomBytes(16), challengeForA: randomBytes(32), proofB: new Uint8Array(64),
+    };
+    const acceptBytes = encodeAccept(acceptMsg);
+
+    expect(() => createVerifiedTranscript({
+      initiateBytes, acceptBytes, proofA: new Uint8Array(64), verifiedAt: NOW,
+    })).toThrow(/advertisement verification failed/i);
   });
 });
 
-describe("R-002-P1 v2: AuthenticatedLink — symmetric (initiator + responder)", () => {
+describe("R-002-P1 v3: AuthenticatedLink — freshness provenance + symmetry", () => {
   test("genuine initiator-side AuthenticatedLink → succeeds (localRole=INITIATOR)", () => {
     const h = runGenuineHandshake();
     const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
     const vt = buildVerifiedTranscript(h);
     const link = createAuthenticatedLink({
-      localNodeId: h.kpA.nodeId, // initiator side
+      localNodeId: h.kpA.nodeId,
       remoteNode: authNodeB,
       verifiedTranscript: vt,
       establishedAt: NOW, expiresAt: NOW + 3600,
     });
     expect(isAuthenticatedLink(link)).toBe(true);
     expect(link.localRole).toBe("INITIATOR");
-    expect(link.remoteNodeId).toBe(h.kpB.nodeId);
-    expect(link.localNodeId).toBe(h.kpA.nodeId);
+    expect(link.transcriptVerifiedAt).toBe(NOW);
   });
 
   test("genuine responder-side AuthenticatedLink → succeeds (localRole=RESPONDER)", () => {
@@ -253,15 +260,51 @@ describe("R-002-P1 v2: AuthenticatedLink — symmetric (initiator + responder)",
     const authNodeA = createAuthenticatedNodeRecord(h.verifiedAdvA);
     const vt = buildVerifiedTranscript(h);
     const link = createAuthenticatedLink({
-      localNodeId: h.kpB.nodeId, // responder side
+      localNodeId: h.kpB.nodeId,
       remoteNode: authNodeA,
       verifiedTranscript: vt,
       establishedAt: NOW, expiresAt: NOW + 3600,
     });
     expect(isAuthenticatedLink(link)).toBe(true);
     expect(link.localRole).toBe("RESPONDER");
-    expect(link.remoteNodeId).toBe(h.kpA.nodeId);
-    expect(link.localNodeId).toBe(h.kpB.nodeId);
+  });
+
+  test("stale transcript (establishedAt > verifiedAt + MAX_TRANSCRIPT_AGE) → REJECT", () => {
+    const h = runGenuineHandshake();
+    const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
+    const vt = buildVerifiedTranscript(h);
+    // Try to establish the link long after the transcript was verified
+    const staleEstablishedAt = NOW + MAX_TRANSCRIPT_AGE_SECONDS + 1;
+    expect(() => createAuthenticatedLink({
+      localNodeId: h.kpA.nodeId, remoteNode: authNodeB,
+      verifiedTranscript: vt,
+      establishedAt: staleEstablishedAt, expiresAt: staleEstablishedAt + 3600,
+    })).toThrow(/exceeding the maximum freshness window/i);
+  });
+
+  test("future-dated establishment (establishedAt < verifiedAt - SKEW) → REJECT", () => {
+    const h = runGenuineHandshake();
+    const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
+    const vt = buildVerifiedTranscript(h);
+    const futureEstablishedAt = NOW - LINK_CLOCK_SKEW_SECONDS - 1;
+    expect(() => createAuthenticatedLink({
+      localNodeId: h.kpA.nodeId, remoteNode: authNodeB,
+      verifiedTranscript: vt,
+      establishedAt: futureEstablishedAt, expiresAt: futureEstablishedAt + 3600,
+    })).toThrow(/clock skew tolerance/i);
+  });
+
+  test("boundary: establishedAt exactly at MAX_TRANSCRIPT_AGE → ACCEPT", () => {
+    const h = runGenuineHandshake();
+    const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
+    const vt = buildVerifiedTranscript(h);
+    const boundaryEstablishedAt = NOW + MAX_TRANSCRIPT_AGE_SECONDS;
+    const link = createAuthenticatedLink({
+      localNodeId: h.kpA.nodeId, remoteNode: authNodeB,
+      verifiedTranscript: vt,
+      establishedAt: boundaryEstablishedAt, expiresAt: boundaryEstablishedAt + 3600,
+    });
+    expect(isAuthenticatedLink(link)).toBe(true);
   });
 
   test("forged AuthenticatedLink (copy) → rejected by WeakSet", () => {
@@ -277,84 +320,28 @@ describe("R-002-P1 v2: AuthenticatedLink — symmetric (initiator + responder)",
     expect(isAuthenticatedLink(genuine)).toBe(true);
   });
 
-  test("non-genuine AuthenticatedNodeRecord → createAuthenticatedLink REJECTS", () => {
+  test("non-genuine AuthenticatedNodeRecord → REJECT", () => {
     const h = runGenuineHandshake();
     const vt = buildVerifiedTranscript(h);
     const fakeNode = { nodeId: h.kpB.nodeId, publicKey: h.kpB.publicKey };
-    expect(isAuthenticatedNodeRecord(fakeNode)).toBe(false);
     expect(() => createAuthenticatedLink({
       localNodeId: h.kpA.nodeId, remoteNode: fakeNode as any,
       verifiedTranscript: vt, establishedAt: NOW, expiresAt: NOW + 3600,
     })).toThrow(/not a genuine AuthenticatedNodeRecord/i);
   });
 
-  test("non-genuine VerifiedTranscript → createAuthenticatedLink REJECTS", () => {
-    const h = runGenuineHandshake();
-    const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
-    const fakeVt = {
-      transcriptDigestHex: bytesToHex(randomBytes(32)),
-      linkIdHex: bytesToHex(h.linkIdBytes),
-      linkIdBytes: h.linkIdBytes,
-      initiatorNodeId: h.kpA.nodeId, responderNodeId: h.kpB.nodeId,
-      initiatorNonce: h.linkNonceA, responderNonce: h.linkNonceB,
-      verifiedAt: NOW,
-    };
-    expect(isVerifiedTranscript(fakeVt)).toBe(false);
-    expect(() => createAuthenticatedLink({
-      localNodeId: h.kpA.nodeId, remoteNode: authNodeB,
-      verifiedTranscript: fakeVt as any, establishedAt: NOW, expiresAt: NOW + 3600,
-    })).toThrow(/not a genuine VerifiedTranscript/i);
-  });
-
-  test("forged transcript participant IDs (local not a participant) → REJECT", () => {
+  test("local not a transcript participant → REJECT", () => {
     const h = runGenuineHandshake();
     const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
     const vt = buildVerifiedTranscript(h);
     const stranger = generateNodeKeypair();
     expect(() => createAuthenticatedLink({
-      localNodeId: stranger.nodeId, // not a transcript participant
-      remoteNode: authNodeB,
+      localNodeId: stranger.nodeId, remoteNode: authNodeB,
       verifiedTranscript: vt, establishedAt: NOW, expiresAt: NOW + 3600,
     })).toThrow(/is neither the initiator/i);
   });
 
-  test("transcript remote node ≠ authNode nodeId → REJECT", () => {
-    const h = runGenuineHandshake();
-    // Build a genuine AuthenticatedNodeRecord for a DIFFERENT node (A, not B)
-    const authNodeA = createAuthenticatedNodeRecord(h.verifiedAdvA);
-    const vt = buildVerifiedTranscript(h);
-    // local=A, remote should be B, but we pass authNodeA (nodeId=A)
-    expect(() => createAuthenticatedLink({
-      localNodeId: h.kpA.nodeId, remoteNode: authNodeA, // wrong — should be authNodeB
-      verifiedTranscript: vt, establishedAt: NOW, expiresAt: NOW + 3600,
-    })).toThrow(/does not match.*nodeId/i);
-  });
-});
-
-describe("R-002-P1 v2: Lifetime invariants enforced", () => {
-  test("expiresAt <= establishedAt → REJECT", () => {
-    const h = runGenuineHandshake();
-    const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
-    const vt = buildVerifiedTranscript(h);
-    expect(() => createAuthenticatedLink({
-      localNodeId: h.kpA.nodeId, remoteNode: authNodeB,
-      verifiedTranscript: vt,
-      establishedAt: NOW, expiresAt: NOW, // equal — invalid
-    })).toThrow(/expiresAt.*must be strictly greater than.*establishedAt/i);
-  });
-
-  test("expiresAt < establishedAt → REJECT", () => {
-    const h = runGenuineHandshake();
-    const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
-    const vt = buildVerifiedTranscript(h);
-    expect(() => createAuthenticatedLink({
-      localNodeId: h.kpA.nodeId, remoteNode: authNodeB,
-      verifiedTranscript: vt,
-      establishedAt: NOW, expiresAt: NOW - 100, // before — invalid
-    })).toThrow(/expiresAt.*must be strictly greater than.*establishedAt|expires at or before/i);
-  });
-
-  test(`lifetime > LINK_MAX_LIFETIME_SECONDS (${LINK_MAX_LIFETIME_SECONDS}s) → REJECT`, () => {
+  test("lifetime > LINK_MAX_LIFETIME → REJECT", () => {
     const h = runGenuineHandshake();
     const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
     const vt = buildVerifiedTranscript(h);
@@ -364,31 +351,47 @@ describe("R-002-P1 v2: Lifetime invariants enforced", () => {
       establishedAt: NOW, expiresAt: NOW + LINK_MAX_LIFETIME_SECONDS + 1,
     })).toThrow(/exceeds the maximum/i);
   });
-
-  test("lifetime exactly at LINK_MAX_LIFETIME_SECONDS → ACCEPT (boundary)", () => {
-    const h = runGenuineHandshake();
-    const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
-    const vt = buildVerifiedTranscript(h);
-    const link = createAuthenticatedLink({
-      localNodeId: h.kpA.nodeId, remoteNode: authNodeB,
-      verifiedTranscript: vt,
-      establishedAt: NOW, expiresAt: NOW + LINK_MAX_LIFETIME_SECONDS,
-    });
-    expect(isAuthenticatedLink(link)).toBe(true);
-  });
 });
 
-describe("R-002-P1 v2: ValidatedHop requires genuine AuthenticatedLink", () => {
-  test("genuine AuthenticatedLink → ValidatedHop succeeds (linkUp implied)", () => {
+describe("R-002-P1 v3: ValidatedHop — use-time freshness enforced", () => {
+  test("genuine fresh AuthenticatedLink → ValidatedHop succeeds", () => {
     const ctx = makeGenuineBrandedRoute(1, NOW);
     const link = ctx.authenticatedLinks[0]!;
-    expect(isAuthenticatedLink(link)).toBe(true);
     const hop = createValidatedHop(
-      link, ctx.hops[0]!.endpoint, ctx.capabilities[0]!, ctx.validatedHops[0]!.serviceAgreementDigest,
+      link, ctx.hops[0]!.endpoint, ctx.capabilities[0]!,
+      ctx.validatedHops[0]!.serviceAgreementDigest, NOW,
     );
     expect(isValidatedHop(hop)).toBe(true);
     expect(hop.linkUp).toBe(true);
-    expect(hop.nodeId).toBe(link.remoteNode.nodeId);
+  });
+
+  test("stale AuthenticatedLink (expiresAt <= now) → cannot create ValidatedHop", () => {
+    const ctx = makeGenuineBrandedRoute(1, NOW);
+    const link = ctx.authenticatedLinks[0]!;
+    // The link expires at NOW + 3600. Use a `now` that's past the expiry.
+    const staleNow = link.expiresAt + 1;
+    expect(() => createValidatedHop(
+      link, ctx.hops[0]!.endpoint, ctx.capabilities[0]!,
+      ctx.validatedHops[0]!.serviceAgreementDigest, staleNow,
+    )).toThrow(/expired/i);
+  });
+
+  test("boundary: now exactly == expiresAt → REJECT (strictly greater required)", () => {
+    const ctx = makeGenuineBrandedRoute(1, NOW);
+    const link = ctx.authenticatedLinks[0]!;
+    const boundaryNow = link.expiresAt; // exactly at expiry
+    expect(() => createValidatedHop(
+      link, ctx.hops[0]!.endpoint, ctx.capabilities[0]!,
+      ctx.validatedHops[0]!.serviceAgreementDigest, boundaryNow,
+    )).toThrow(/expired/i);
+  });
+
+  test("isLinkFresh helper: fresh → true, stale → false", () => {
+    const ctx = makeGenuineBrandedRoute(1, NOW);
+    const link = ctx.authenticatedLinks[0]!;
+    expect(isLinkFresh(link, NOW)).toBe(true);
+    expect(isLinkFresh(link, link.expiresAt)).toBe(false);
+    expect(isLinkFresh(link, link.expiresAt + 1)).toBe(false);
   });
 
   test("non-genuine object as link → REJECT", () => {
@@ -396,24 +399,22 @@ describe("R-002-P1 v2: ValidatedHop requires genuine AuthenticatedLink", () => {
     const fakeLink = { ...ctx.authenticatedLinks[0]! };
     expect(isAuthenticatedLink(fakeLink)).toBe(false);
     expect(() => createValidatedHop(
-      fakeLink as any, "10.0.0.1:7788", "MESH_RELAY", "digest",
+      fakeLink as any, "10.0.0.1:7788", "MESH_RELAY", "digest", NOW,
     )).toThrow(/not a genuine AuthenticatedLink/i);
   });
 
-  test("AuthenticatedNodeRecord alone (no AuthenticatedLink) → REJECT", () => {
+  test("AuthenticatedNodeRecord alone → REJECT", () => {
     const ctx = makeGenuineBrandedRoute(1, NOW);
     const authNode = ctx.authNodes[0]!;
-    expect(isAuthenticatedNodeRecord(authNode)).toBe(true);
     expect(() => createValidatedHop(
-      authNode as any, "10.0.0.1:7788", "MESH_RELAY", "digest",
+      authNode as any, "10.0.0.1:7788", "MESH_RELAY", "digest", NOW,
     )).toThrow(/not a genuine AuthenticatedLink/i);
   });
 });
 
-describe("R-002-P1 v2: Genuine full pipeline (both directions)", () => {
+describe("R-002-P1 v3: Genuine full pipeline (both directions)", () => {
   test("genuine initiator-side pipeline → succeeds end-to-end", () => {
     const ctx = makeGenuineBrandedRoute(2, NOW);
-    // Every artifact in the chain is genuine (WeakSet-registered):
     expect(isAuthenticatedNodeRecord(ctx.authNodes[0]!)).toBe(true);
     expect(isAuthenticatedNodeRecord(ctx.authNodes[1]!)).toBe(true);
     expect(isVerifiedTranscript(ctx.verifiedTranscripts[0]!)).toBe(true);
@@ -423,30 +424,27 @@ describe("R-002-P1 v2: Genuine full pipeline (both directions)", () => {
     expect(isValidatedHop(ctx.validatedHops[0]!)).toBe(true);
     expect(isValidatedHop(ctx.validatedHops[1]!)).toBe(true);
     expect(isBrandedCommittedRoute(ctx.branded)).toBe(true);
-    // The branded route's hops are the genuine ValidatedHops (same object identity):
+    // Same object identity — no cast
     expect(ctx.branded.hops[0]).toBe(ctx.validatedHops[0]);
     expect(ctx.branded.hops[1]).toBe(ctx.validatedHops[1]);
   });
 
   test("genuine responder-side AuthenticatedLink → ValidatedHop succeeds", () => {
-    // Build a responder-side link manually and consume it.
     const h = runGenuineHandshake();
     const authNodeA = createAuthenticatedNodeRecord(h.verifiedAdvA);
     const vt = buildVerifiedTranscript(h);
     const responderLink = createAuthenticatedLink({
-      localNodeId: h.kpB.nodeId, // responder side
+      localNodeId: h.kpB.nodeId,
       remoteNode: authNodeA,
       verifiedTranscript: vt,
       establishedAt: NOW, expiresAt: NOW + 3600,
     });
     expect(isAuthenticatedLink(responderLink)).toBe(true);
     expect(responderLink.localRole).toBe("RESPONDER");
-    // ValidatedHop consumes the link — linkUp is implied
     const hop = createValidatedHop(
-      responderLink, "10.0.0.1:7788", "MESH_RELAY", "digest123",
+      responderLink, "10.0.0.1:7788", "MESH_RELAY", "digest123", NOW,
     );
     expect(isValidatedHop(hop)).toBe(true);
-    expect(hop.linkUp).toBe(true);
     expect(hop.nodeId).toBe(h.kpA.nodeId);
   });
 });

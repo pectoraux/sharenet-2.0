@@ -161,21 +161,12 @@ function runHandshake(
     transcriptAfterAccept, linkIdBytes, challengeForA, ROLE_INITIATOR,
   );
 
-  // Create the genuine VerifiedTranscript (verifies BOTH proofs + NodeId binding
-  // + recomputes the LinkId from the nonces — R-002-P1 hardening v2)
+  // Create the genuine VerifiedTranscript — v3 API: derive everything from
+  // the decoded wire bytes (initiateBytes + acceptBytes + proofA only).
   return createVerifiedTranscript({
     initiateBytes,
     acceptBytes,
-    initiatorNodeId: initiatorKp.nodeId,
-    responderNodeId: responderKp.nodeId,
-    initiatorPublicKey: initiatorKp.publicKey,
-    responderPublicKey: responderKp.publicKey,
-    initiatorNonce: linkNonceA,
-    responderNonce: linkNonceB,
-    challengeForB,
-    challengeForA,
     proofA,
-    proofB,
     verifiedAt: now,
   });
 }
@@ -308,6 +299,7 @@ export function makeGenuineBrandedRoute(
         endpoints[i]!,
         capabilities[i]!,
         saDigestHex,
+        now,
       ),
     );
   }

@@ -121,29 +121,25 @@ export interface ValidatedHop {
 /**
  * The ONLY function that creates a ValidatedHop.
  *
- * Per R-002-P1 (Principal Architect refinement): ValidatedHop now consumes
- * a genuine `AuthenticatedLink` (WeakSet-registered) instead of the
- * previous `(AuthenticatedNodeRecord, linkUp: boolean)` pair. This
- * removes the caller-supplied trust boolean — `linkUp` is no longer a
- * value the caller can set to `true`; it is implied by the genuine link
- * artifact, which itself consumes a genuine `VerifiedTranscript` (the
- * cryptographic evidence that the 3-message handshake completed).
+ * Per R-002-P1 hardening v3: ValidatedHop consumes a genuine
+ * `AuthenticatedLink` (WeakSet-registered) AND enforces use-time
+ * freshness (`link.expiresAt > now`). A stale link cannot produce an
+ * executable hop.
  *
  * Requires:
  *   1. A genuine AuthenticatedLink (WeakSet-verified)
  *      — which transitively requires a genuine AuthenticatedNodeRecord
- *      + a genuine VerifiedTranscript (both possession proofs verified).
- *   2. A service agreement digest (service was negotiated)
- *
- * Per R-006H2: a RemoteNodeHint or raw NodeId string will fail
- * isAuthenticatedLink() because they were never added to the WeakSet
- * by createAuthenticatedLink().
+ *      + a genuine VerifiedTranscript (derived from decoded wire bytes).
+ *   2. `link.expiresAt > now` (use-time freshness — the link must not
+ *      be expired at the point where it becomes an executable hop).
+ *   3. A service agreement digest (service was negotiated).
  */
 export function createValidatedHop(
   link: AuthenticatedLink,
   endpoint: string,
   capability: string,
   serviceAgreementDigest: string,
+  now: number,
 ): ValidatedHop {
   if (!isAuthenticatedLink(link)) {
     throw new Error(
@@ -151,11 +147,19 @@ export function createValidatedHop(
         "AuthenticatedLink (WeakSet membership check failed). Per R-002-P1, " +
         "only a genuine AuthenticatedLink (produced by createAuthenticatedLink, " +
         "which consumes a genuine AuthenticatedNodeRecord + a genuine " +
-        "VerifiedTranscript) can produce a ValidatedHop. The previous " +
-        "caller-supplied `linkUp: boolean` trust bit has been removed — " +
-        "linkUp is now implied by the genuine link artifact. Copying " +
-        "properties from a genuine AuthenticatedLink is insufficient — " +
-        "the WeakSet registry tracks object identity, not property values.",
+        "VerifiedTranscript) can produce a ValidatedHop.",
+    );
+  }
+  // R-002-P1 hardening v3: USE-TIME FRESHNESS.
+  // The link must not be expired at the point where it becomes an
+  // executable hop. A genuine-but-stale link cannot produce a ValidatedHop.
+  if (link.expiresAt <= now) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: cannot create ValidatedHop — the AuthenticatedLink " +
+        `is expired (expiresAt=${link.expiresAt}, now=${now}). Per R-002-P1 ` +
+        "hardening v3, a genuine link that has passed its expiry MUST NOT " +
+        "produce an executable hop. Use-time freshness is enforced at this " +
+        "construction boundary.",
     );
   }
   const node = link.remoteNode;
@@ -164,7 +168,7 @@ export function createValidatedHop(
     capability,
     endpoint,
     authenticatedNode: node,
-    linkUp: true, // implied by the genuine AuthenticatedLink — no longer caller-supplied
+    linkUp: true, // implied by the genuine + fresh AuthenticatedLink
     serviceAgreementDigest,
   };
   validatedHopRegistry.add(hop);

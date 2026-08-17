@@ -390,13 +390,13 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       // is NOT an AuthenticatedLink — it lacks the WeakSet brand.
       let hintToHopThrew = false;
       try {
-        createValidatedHop(hint as any, hint.subjectEndpointHint, "MESH_RELAY", "");
+        createValidatedHop(hint as any, hint.subjectEndpointHint, "MESH_RELAY", "", Math.floor(Date.now() / 1000));
       } catch { hintToHopThrew = true; }
 
       // Negative: a raw NodeId string is also not an AuthenticatedLink
       let stringToHopThrew = false;
       try {
-        createValidatedHop({ nodeId: subject.nodeId } as any, "10.0.0.5:7788", "MESH_RELAY", "");
+        createValidatedHop({ nodeId: subject.nodeId } as any, "10.0.0.5:7788", "MESH_RELAY", "", Math.floor(Date.now() / 1000));
       } catch { stringToHopThrew = true; }
 
       // Negative: an AuthenticatedNodeRecord alone is NOT an AuthenticatedLink.
@@ -414,7 +414,7 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       try {
         // authNode is genuine but is NOT an AuthenticatedLink — the WeakSet
         // check (isAuthenticatedLink) fails.
-        createValidatedHop(authNode as any, "10.0.0.5:7788", "MESH_RELAY", "");
+        createValidatedHop(authNode as any, "10.0.0.5:7788", "MESH_RELAY", "", Math.floor(Date.now() / 1000));
       } catch { authNodeWithoutLinkThrew = true; }
 
       // Positive: a genuine AuthenticatedLink (from the full handshake pipeline)
@@ -425,6 +425,7 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
         brandedCtx.hops[0]!.endpoint,
         brandedCtx.capabilities[0]!,
         brandedCtx.validatedHops[0]!.serviceAgreementDigest,
+        now,
       );
       const validHopIsBranded = isValidatedHop(validHop);
 
@@ -621,7 +622,7 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       // R-002-P1: createValidatedHop requires a genuine AuthenticatedLink (not authNode + boolean)
       let fakeToHopThrew = false;
       try {
-        createValidatedHop(fakeNode as any, "10.0.0.5:7788", "MESH_RELAY", "");
+        createValidatedHop(fakeNode as any, "10.0.0.5:7788", "MESH_RELAY", "", Math.floor(Date.now() / 1000));
       } catch { fakeToHopThrew = true; }
 
       // Positive: a genuine AuthenticatedNodeRecord IS recognized
@@ -643,6 +644,7 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
         brandedCtx2.hops[0]!.endpoint,
         brandedCtx2.capabilities[0]!,
         brandedCtx2.validatedHops[0]!.serviceAgreementDigest,
+        now,
       );
       const hopBranded = isValidatedHop(validHop);
 
