@@ -403,3 +403,43 @@ Stage Summary:
 - Circuit replay model FROZEN as ORDERED_STREAM — R-009 must build on this.
 - Truthful MILESTONES.md: R-008 ✅ HARDENED; R-006 PARTIAL (setupCircuit bypass closed); R-002-P1 / R-003 / R-004 / R-007 remain OPEN exactly as the audit found them.
 - Follow-ups NOT in scope of this task (per the audit's recommended order): R-002-P1 (evidence-carrying state-machine transitions), R-003/R-004 (canonical commitment_root), R-007 (vector expansion to routing/circuit/service layers).
+
+---
+Task ID: R-006-construction-boundary
+Agent: main (Z.ai Code)
+Task: Fix the R-006 construction-boundary defect — createBrandedCommittedRoute() was unsafely casting commitment.proposal.hops from RouteHop[] to ValidatedHop[]. Remove the cast; require genuine ValidatedHop[] from the WeakSet registry. Add adversarial tests. Re-run suite + push.
+
+Work Log:
+- Identified the defect: `createBrandedCommittedRoute(commitment)` did `commitment.proposal.hops as unknown as ValidatedHop[]` — a forgery. The hops were ordinary RouteHop objects, never registered in the validatedHopRegistry WeakSet, never produced through the genuine verifyAdvertisement → createAuthenticatedNodeRecord → createValidatedHop pipeline.
+- Fixed `createBrandedCommittedRoute` in `reference/transport/validated-types.ts`:
+  - Signature changed: `(commitment: RouteCommitment)` → `(commitment: RouteCommitment, validatedHops: ValidatedHop[])`.
+  - Removed `commitment.proposal.hops as unknown as ValidatedHop[]` cast.
+  - Added: count check (validatedHops.length === commitment.proposal.hops.length).
+  - Added: per-hop WeakSet membership check (isValidatedHop) — rejects ordinary RouteHop, forged shapes, copies.
+  - Added: per-hop field matching (nodeId/endpoint/capability) — rejects genuine-but-unrelated ValidatedHop for a different node.
+  - The resulting `BrandedCommittedRoute.hops` = the genuine `validatedHops[]` (no cast).
+- Created `tests/helpers/branded-route-helper.ts`:
+  - `makeGenuineBrandedRoute(numHops, now)` builds the FULL proof-carrying pipeline: generateNodeKeypair → signAdvertisement → verifyAdvertisement → createAuthenticatedNodeRecord → createValidatedHop → RouteProposal → signRouteAcceptance → createRouteCommitment → createBrandedCommittedRoute(commitment, validatedHops).
+  - Returns a rich context object (branded, commitment, proposal, hops, validatedHops, authNodes, kps, initiator, hopPublicKeys, serviceAgreements, capabilities, now).
+  - Added `@tests/*` path alias to tsconfig.json so test files can import the helper via `@tests/helpers/branded-route-helper`.
+- Updated all callers of `createBrandedCommittedRoute`:
+  - `tests/r008-distributed-circuit.test.ts`: `setupRoute` now uses the shared helper.
+  - `tests/r008h-ack-freshness.test.ts`: `setupRoute` now uses the shared helper.
+  - `tests/r008h-setup-circuit-trust-boundary.test.ts`: `makeGenuineBrandedRoute` wraps the shared helper (1-hop). Added new test: "R-006 boundary: genuine RouteCommitment + ordinary RouteHop[] → createBrandedCommittedRoute REJECTS" (proves the unsafe cast is gone).
+  - `tests/gate-06-circuits.test.ts`: `makeBrandedRoute` now uses the shared helper.
+  - `tests/r006h2-adversarial-validated-types.test.ts`: `makeGenuineCommitment` now returns `{ commitment, validatedHops }`. Test #3 (forged commitment) updated to pass `[]` for forged (rejects on commitment check) and `validatedHops` for genuine. Test #5 strengthened: now tests BOTH (a) fake commitment + ordinary hops AND (b) GENUINE commitment + ordinary RouteHops cast as ValidatedHop[] → isValidatedHop WeakSet check rejects. Test #6 updated to pass `[validatedHops]`.
+  - `tests/r006h4-serialization-boundary.test.ts`: test #2 (deserialized commitment) passes `[]` (rejects on commitment check). Test #3 (deserialized branded route) uses the shared helper to build a genuine branded route, then serializes it.
+  - `src/lib/sharenet/architecture-tests.ts`: test #12 updated to pass `[validHop]` (the genuine ValidatedHop already constructed inline in the test) to `createBrandedCommittedRoute(comm2.commitment, [validHop])`.
+- Added adversarial test proving the fix: a genuine RouteCommitment (from createRouteCommitment, WeakSet-registered) containing ordinary RouteHop[] CANNOT become a BrandedCommittedRoute — the ordinary hops are NOT in the validatedHopRegistry WeakSet and are rejected. This is in:
+  - `tests/r008h-setup-circuit-trust-boundary.test.ts` (test: "R-006 boundary: genuine RouteCommitment + ordinary RouteHop[] → createBrandedCommittedRoute REJECTS")
+  - `tests/r006h2-adversarial-validated-types.test.ts` (test #5b: "genuine commitment + ordinary hops → isValidatedHop rejects")
+- Verified the genuine AuthenticatedNodeRecord → ValidatedHop → RouteCommitment → BrandedCommittedRoute pipeline succeeds end-to-end (test #6 in r006h2, test #5 in r008h-trust-boundary).
+- Preserved all existing R-003/R-006/R-008 trust-boundary tests.
+
+Stage Summary:
+- Tests: 250 → 251 pass, 0 fail (+1 new R-006 boundary test in r008h-trust-boundary; r006h2 test #5 strengthened with case (b)). 695 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy (`/` → 200; zero browser errors).
+- The unsafe `as unknown as ValidatedHop[]` cast is GONE. Every BrandedCommittedRoute is now constructed ONLY from genuine ValidatedHop artifacts that transited the full proof-carrying pipeline (verifyAdvertisement → createAuthenticatedNodeRecord → createValidatedHop), each verified by WeakSet membership.
+- R-006 construction-boundary defect: CLOSED. The trust chain is now genuine end-to-end — no cast, no forgery, no bypass.

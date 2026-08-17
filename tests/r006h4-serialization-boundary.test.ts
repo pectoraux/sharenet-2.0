@@ -41,6 +41,7 @@ import {
   isBrandedCommittedRoute,
   isRouteCommitment,
 } from "@reference/transport/validated-types";
+import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
 
@@ -101,30 +102,19 @@ describe("R-006H4: Serialization boundary — deserialized proof objects are rej
 
     // The deserialized object is NOT in the WeakSet
     expect(isRouteCommitment(deserialized)).toBe(false);
-    expect(() => createBrandedCommittedRoute(deserialized)).toThrow();
+    expect(() => createBrandedCommittedRoute(deserialized, [])).toThrow();
   });
 
   // 3. Serialize BrandedCommittedRoute → deserialize → isBrandedCommittedRoute MUST FAIL
   //    (and therefore setupCircuit, which requires a genuine branded route,
   //     MUST also reject the deserialized copy — per R-008 hardening.)
   test("deserialized BrandedCommittedRoute → rejected by isBrandedCommittedRoute", () => {
-    const kp = generateNodeKeypair();
-    const proposal: RouteProposal = {
-      routeId: bytesToHex(randomBytes(32)),
-      hops: [{ nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
-      requirementDigest: bytesToHex(randomBytes(32)),
-      expiry: NOW + 3600,
-      initiatorNodeId: kp.nodeId,
-      agreementDigest: bytesToHex(randomBytes(32)),
-    };
-    const sa = new Map<number, ServiceAgreement>();
-    sa.set(0, { nodeId: kp.nodeId, capability: "MESH_RELAY", requirementDigest: proposal.requirementDigest, allocatedBandwidthBps: 1048576, expiry: proposal.expiry, policyVersion: 1 });
-    const hpk = new Map<string, Uint8Array>();
-    hpk.set(kp.nodeId, kp.publicKey);
-    const acc = [signRouteAcceptance(proposal, 0, proposal.hops[0]!, sa.get(0)!, kp.nodeId, kp.secretKey, proposal.expiry)];
-    const result = createRouteCommitment(proposal, acc, hpk, sa, kp.secretKey, NOW);
-    if (!result.ok) throw new Error("commitment failed");
-    const branded = createBrandedCommittedRoute(result.commitment);
+    // Use the shared helper to build a genuine branded route through the
+    // full proof-carrying pipeline (adv → authNode → validatedHop →
+    // commitment → branded). R-006 construction-boundary: the branded
+    // route's hops are genuine ValidatedHops (no cast).
+    const ctx = makeGenuineBrandedRouteHelper(1, NOW);
+    const branded = ctx.branded;
     expect(isBrandedCommittedRoute(branded)).toBe(true);
 
     // Serialize → deserialize

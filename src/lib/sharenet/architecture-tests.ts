@@ -483,7 +483,11 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       const acc2 = [signRouteAcceptance(proposal2, 0, proposal2.hops[0]!, sa2.get(0)!, kp.nodeId, kp.secretKey, proposal2.expiry)];
       const comm2 = createRouteCommitment(proposal2, acc2, hpk2, sa2, kp.secretKey, Math.floor(Date.now() / 1000));
       if (!comm2.ok) throw new Error("commitment failed for branded route test");
-      const brandedRoute = createBrandedCommittedRoute(comm2.commitment);
+      // R-006 construction-boundary: pass genuine ValidatedHop[] explicitly
+      // (no cast from RouteHop[]). The validHop was created above from a
+      // genuine AuthenticatedNodeRecord, and its nodeId/endpoint/capability
+      // match the commitment's hop.
+      const brandedRoute = createBrandedCommittedRoute(comm2.commitment, [validHop]);
       const brandedRecognized = isBrandedCommittedRoute(brandedRoute);
 
       // R-008 hardening: exercise setupCircuit directly at the runtime brand

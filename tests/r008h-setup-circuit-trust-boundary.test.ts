@@ -25,60 +25,29 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import {
-  generateNodeKeypair,
-  randomBytes,
-  bytesToHex,
-} from "@reference/identity/keys";
-import {
-  signRouteAcceptance,
-  createRouteCommitment,
-  createCommittedRoute,
-  type RouteProposal,
-  type RouteHop,
-} from "@reference/routing/route";
-import type { ServiceAgreement } from "@reference/routing/service-negotiation";
+import { randomBytes } from "@reference/identity/keys";
+import { createCommittedRoute } from "@reference/routing/route";
 import {
   createBrandedCommittedRoute,
   isBrandedCommittedRoute,
 } from "@reference/transport/validated-types";
 import { setupCircuit } from "@reference/circuit/circuit";
 import { x25519 } from "@noble/curves/ed25519.js";
+import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
 
-/** Build a genuine RouteCommitment + BrandedCommittedRoute for one hop. */
+/** Build a genuine 1-hop BrandedCommittedRoute through the full proof-carrying pipeline. */
 function makeGenuineBrandedRoute() {
-  const kp = generateNodeKeypair();
-  const initiator = generateNodeKeypair();
-
-  const hops: RouteHop[] = [
-    { nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true },
-  ];
-
-  const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
-    hops,
-    requirementDigest: bytesToHex(randomBytes(32)),
-    expiry: NOW + 3600,
-    initiatorNodeId: initiator.nodeId,
-    agreementDigest: bytesToHex(randomBytes(32)),
+  const ctx = makeGenuineBrandedRouteHelper(1, NOW);
+  return {
+    branded: ctx.branded,
+    commitment: ctx.commitment,
+    proposal: ctx.proposal,
+    kp: ctx.kps[0]!,
+    initiator: ctx.initiator,
+    validatedHops: ctx.validatedHops,
   };
-
-  const sa = new Map<number, ServiceAgreement>();
-  sa.set(0, {
-    nodeId: kp.nodeId, capability: "MESH_RELAY",
-    requirementDigest: proposal.requirementDigest,
-    allocatedBandwidthBps: 1048576, expiry: proposal.expiry, policyVersion: 1,
-  });
-  const hpk = new Map<string, Uint8Array>();
-  hpk.set(kp.nodeId, kp.publicKey);
-
-  const acc = [signRouteAcceptance(proposal, 0, hops[0]!, sa.get(0)!, kp.nodeId, kp.secretKey, proposal.expiry)];
-  const result = createRouteCommitment(proposal, acc, hpk, sa, initiator.secretKey, NOW);
-  if (!result.ok) throw new Error("commitment failed");
-  const branded = createBrandedCommittedRoute(result.commitment);
-  return { branded, commitment: result.commitment, proposal, kp, initiator };
 }
 
 /** Build a matching set of relay X25519 keys for a 1-hop branded route. */
@@ -152,6 +121,20 @@ describe("R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute
     expect(circuit.routeId).toBe(ctx.branded.routeId);
     expect(circuit.hops[0]!.forwardingKey.length).toBe(32);
     expect(circuit.hops[0]!.returnKey.length).toBe(32);
+  });
+
+  // R-006 construction-boundary: a genuine RouteCommitment containing
+  // ordinary RouteHop[] CANNOT become a BrandedCommittedRoute — the
+  // validatedHops are WeakSet-checked and ordinary RouteHops were never
+  // registered.
+  test("R-006 boundary: genuine RouteCommitment + ordinary RouteHop[] → createBrandedCommittedRoute REJECTS", () => {
+    const ctx = makeGenuineBrandedRoute();
+    // Pass the commitment's own hops (ordinary RouteHop[]) as the
+    // validatedHops — they are NOT in the WeakSet.
+    const ordinaryHops = ctx.commitment.proposal.hops as any;
+    expect(() => createBrandedCommittedRoute(ctx.commitment, ordinaryHops)).toThrow(
+      /not a genuine ValidatedHop|WeakSet membership check failed/i,
+    );
   });
 
   // 6. Exhaustive: NO non-genuine representation can reach circuit construction.

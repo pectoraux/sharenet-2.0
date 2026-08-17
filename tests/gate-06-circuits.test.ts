@@ -8,16 +8,9 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import { randomBytes, bytesToHex } from "@reference/identity/keys";
 import {
-  generateNodeKeypair,
-  randomBytes,
-  bytesToHex,
-} from "@reference/identity/keys";
-import {
-  type RouteHop,
   type RouteProposal,
-  signRouteAcceptance,
-  createRouteCommitment,
   PROPOSAL_TO_CIRCUIT_FORBIDDEN,
 } from "@reference/routing/route";
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -35,49 +28,16 @@ import {
   UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN,
 } from "@reference/circuit/circuit";
 import {
-  createBrandedCommittedRoute,
   isBrandedCommittedRoute,
   type BrandedCommittedRoute,
 } from "@reference/transport/validated-types";
+import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const REFERENCE_NOW = 1786876545;
 
 function makeBrandedRoute(numHops = 2) {
-  const kps = Array.from({ length: numHops }, () => generateNodeKeypair());
-  const initiator = generateNodeKeypair();
-
-  const hops: RouteHop[] = kps.map((kp, i) => ({
-    nodeId: kp.nodeId,
-    capability: i === kps.length - 1 ? "INTERNET_GATEWAY" : "MESH_RELAY",
-    endpoint: `10.0.0.${i + 1}:7788`,
-    linkUp: true,
-  }));
-
-  const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
-    hops,
-    requirementDigest: bytesToHex(randomBytes(32)),
-    expiry: REFERENCE_NOW + 3600,
-    initiatorNodeId: initiator.nodeId,
-    agreementDigest: bytesToHex(randomBytes(32)),
-  };
-
-  const serviceAgreements = new Map<number, any>();
-  const hopPublicKeys = new Map<string, Uint8Array>();
-  for (let i = 0; i < kps.length; i++) {
-    serviceAgreements.set(i, {nodeId:kps[i]!.nodeId,capability:hops[i]!.capability,requirementDigest:proposal.requirementDigest,allocatedBandwidthBps:1048576,expiry:proposal.expiry,policyVersion:1});
-    hopPublicKeys.set(kps[i]!.nodeId, kps[i]!.publicKey);
-  }
-
-  const acceptances = kps.map((kp, i) =>
-    signRouteAcceptance(proposal, i, hops[i]!, serviceAgreements.get(i)!, kp.nodeId, kp.secretKey, proposal.expiry),
-  );
-
-  const commitmentResult = createRouteCommitment(proposal, acceptances, hopPublicKeys, serviceAgreements, initiator.secretKey, REFERENCE_NOW);
-  if (!commitmentResult.ok) throw new Error("failed to create commitment");
-  // R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute.
-  const branded = createBrandedCommittedRoute(commitmentResult.commitment);
-  return { route: branded, kps, initiator };
+  const ctx = makeGenuineBrandedRouteHelper(numHops, REFERENCE_NOW);
+  return { route: ctx.branded, kps: ctx.kps, initiator: ctx.initiator };
 }
 
 function makeRelayX25519Keys(route: BrandedCommittedRoute) {

@@ -210,21 +210,33 @@ export function registerRouteCommitment(c: RouteCommitment): RouteCommitment {
 /**
  * The ONLY function that creates a BrandedCommittedRoute.
  *
- * Per R-006H3: this function consumes a GENUINE RouteCommitment —
- * verified by isRouteCommitment() WeakSet membership check. Only the
- * output of createRouteCommitment() (when ok: true) can produce a
- * BrandedCommittedRoute. A forged object matching the RouteCommitment
- * shape is REJECTED.
+ * Per R-006 construction-boundary fix: this function consumes BOTH:
+ *   1. A GENUINE RouteCommitment — verified by isRouteCommitment()
+ *      WeakSet membership check. Only the output of
+ *      createRouteCommitment() (when ok: true) is accepted.
+ *   2. A GENUINE ValidatedHop[] — one per hop, each verified by
+ *      isValidatedHop() WeakSet membership check. Only ValidatedHop
+ *      artifacts produced by createValidatedHop() are accepted.
  *
- * Per R-006H3: the legacy path that accepts ordinary RouteHop[] when
- * no ValidatedHops are present is REMOVED. A committed route must
- * contain genuine ValidatedHop artifacts or be cryptographically bound
- * to them through the commitment pipeline.
+ * The previous implementation UNSAFELY CAST `commitment.proposal.hops`
+ * (ordinary `RouteHop[]`) to `ValidatedHop[]` via
+ * `as unknown as ValidatedHop[]`. That cast was a forgery: the hops
+ * were never in the `validatedHopRegistry` WeakSet and were never
+ * produced through the genuine
+ * `verifyAdvertisement → createAuthenticatedNodeRecord → createValidatedHop`
+ * pipeline. This function now REQUIRES the genuine artifacts to be
+ * passed explicitly, and verifies each one.
+ *
+ * Per R-006: the matching check (nodeId/endpoint/capability) ensures
+ * each ValidatedHop corresponds to the hop the commitment was signed
+ * over — preventing a caller from substituting a genuine-but-unrelated
+ * ValidatedHop for a different node.
  */
 export function createBrandedCommittedRoute(
   commitment: RouteCommitment,
+  validatedHops: ValidatedHop[],
 ): BrandedCommittedRoute {
-  // Verify this is a genuine RouteCommitment from createRouteCommitment()
+  // 1. Verify this is a genuine RouteCommitment from createRouteCommitment()
   if (!isRouteCommitment(commitment)) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createBrandedCommittedRoute rejected — " +
@@ -235,9 +247,60 @@ export function createBrandedCommittedRoute(
     );
   }
 
+  // 2. R-006 construction-boundary fix: verify every hop is a genuine
+  //    ValidatedHop. The count must match the commitment's hop count.
+  if (validatedHops.length !== commitment.proposal.hops.length) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: createBrandedCommittedRoute rejected — " +
+        `validatedHops count (${validatedHops.length}) does not match ` +
+        `commitment hop count (${commitment.proposal.hops.length}). ` +
+        "Per R-006, every hop in a BrandedCommittedRoute MUST be a genuine " +
+        "ValidatedHop artifact from the WeakSet registry. The unsafe cast " +
+        "from RouteHop[] to ValidatedHop[] has been removed.",
+    );
+  }
+
+  // 3. Verify each validatedHop is genuine AND matches the corresponding
+  //    commitment hop (nodeId/endpoint/capability). This prevents a caller
+  //    from substituting a genuine-but-unrelated ValidatedHop for a
+  //    different node than the one the commitment was signed over.
+  for (let i = 0; i < validatedHops.length; i++) {
+    const vh = validatedHops[i]!;
+    if (!isValidatedHop(vh)) {
+      throw new Error(
+        "ARCHITECTURE VIOLATION: createBrandedCommittedRoute rejected — " +
+          `hop ${i} (nodeId=${vh.nodeId}) is not a genuine ValidatedHop ` +
+          "(WeakSet membership check failed). Per R-006 construction-boundary " +
+          "fix, the unsafe cast from RouteHop[] to ValidatedHop[] has been " +
+          "removed; only genuine ValidatedHop artifacts produced by " +
+          "createValidatedHop() (which consumes a genuine " +
+          "AuthenticatedNodeRecord) are accepted. An ordinary RouteHop, " +
+          "a forged object matching the ValidatedHop shape, or a " +
+          "property-copy of a genuine ValidatedHop will all fail this check.",
+      );
+    }
+    const ch = commitment.proposal.hops[i]!;
+    if (
+      vh.nodeId !== ch.nodeId ||
+      vh.endpoint !== ch.endpoint ||
+      vh.capability !== ch.capability
+    ) {
+      throw new Error(
+        "ARCHITECTURE VIOLATION: createBrandedCommittedRoute rejected — " +
+          `validatedHop ${i} (nodeId=${vh.nodeId}, endpoint=${vh.endpoint}, ` +
+          `capability=${vh.capability}) does not match commitment hop ${i} ` +
+          `(nodeId=${ch.nodeId}, endpoint=${ch.endpoint}, ` +
+          `capability=${ch.capability}). The branded route's hops MUST be ` +
+          "the same hops the commitment was signed over — a genuine " +
+          "ValidatedHop for a DIFFERENT node cannot substitute for a " +
+          "commitment hop.",
+      );
+    }
+  }
+
   const route: BrandedCommittedRoute = {
     routeId: commitment.routeId,
-    hops: commitment.proposal.hops as unknown as ValidatedHop[],
+    hops: validatedHops, // genuine ValidatedHop[] — NO CAST
     expiry: commitment.proposal.expiry,
     initiatorNodeId: commitment.proposal.initiatorNodeId,
     agreementDigest: commitment.proposal.agreementDigest,

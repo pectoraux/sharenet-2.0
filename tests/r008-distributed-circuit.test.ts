@@ -18,19 +18,6 @@ import {
   bytesToHex,
 } from "@reference/identity/keys";
 import {
-  signAdvertisement,
-  verifyAdvertisement,
-} from "@reference/advertisement/advertisement";
-import {
-  signRouteAcceptance,
-  createRouteCommitment,
-  type RouteProposal,
-  type RouteHop,
-} from "@reference/routing/route";
-import type { ServiceAgreement } from "@reference/routing/service-negotiation";
-import {
-  createAuthenticatedNodeRecord,
-  createBrandedCommittedRoute,
   isBrandedCommittedRoute,
 } from "@reference/transport/validated-types";
 import { x25519 } from "@noble/curves/ed25519.js";
@@ -49,52 +36,21 @@ import {
   onionEncrypt,
   relayDecrypt,
 } from "@reference/circuit/circuit";
+import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
 
 function setupRoute(numHops = 2) {
-  const kps = Array.from({ length: numHops }, () => generateNodeKeypair());
-  const initiator = generateNodeKeypair();
-
-  const hops: RouteHop[] = kps.map((kp, i) => ({
-    nodeId: kp.nodeId,
-    capability: i === kps.length - 1 ? "INTERNET_GATEWAY" : "MESH_RELAY",
-    endpoint: `10.0.0.${i + 1}:7788`,
-    linkUp: true,
-  }));
-
-  const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
-    hops,
-    requirementDigest: bytesToHex(randomBytes(32)),
-    expiry: NOW + 3600,
-    initiatorNodeId: initiator.nodeId,
-    agreementDigest: bytesToHex(randomBytes(32)),
+  const ctx = makeGenuineBrandedRouteHelper(numHops, NOW);
+  return {
+    kps: ctx.kps,
+    initiator: ctx.initiator,
+    hops: ctx.hops,
+    proposal: ctx.proposal,
+    sa: ctx.serviceAgreements,
+    hpk: ctx.hopPublicKeys,
+    branded: ctx.branded,
   };
-
-  const sa = new Map<number, ServiceAgreement>();
-  const hpk = new Map<string, Uint8Array>();
-  for (let i = 0; i < kps.length; i++) {
-    sa.set(i, {
-      nodeId: kps[i]!.nodeId,
-      capability: hops[i]!.capability as any,
-      requirementDigest: proposal.requirementDigest,
-      allocatedBandwidthBps: 1048576,
-      expiry: proposal.expiry,
-      policyVersion: 1,
-    });
-    hpk.set(kps[i]!.nodeId, kps[i]!.publicKey);
-  }
-
-  const acc = kps.map((kp, i) =>
-    signRouteAcceptance(proposal, i, hops[i]!, sa.get(i)!, kp.nodeId, kp.secretKey, proposal.expiry),
-  );
-
-  const result = createRouteCommitment(proposal, acc, hpk, sa, initiator.secretKey, NOW);
-  if (!result.ok) throw new Error("commitment failed");
-
-  const branded = createBrandedCommittedRoute(result.commitment);
-  return { kps, initiator, hops, proposal, sa, hpk, branded };
 }
 
 describe("R-008: Distributed circuit establishment", () => {
