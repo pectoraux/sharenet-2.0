@@ -1,0 +1,91 @@
+{
+  "id": "V-ROUTE-COMMIT-001",
+  "status": "draft",
+  "spec": "spec/07-routing.md §5.3.1 (FROZEN)",
+  "adr": "adr/0017-protocol-freeze-reconciliation.md",
+  "description": "Canonical Merkle commitment_root golden vectors. These vectors verify the exact BLAKE3-256 Merkle tree construction produces byte-stable output for the same logical inputs, enabling cross-implementation route identity verification.",
+  "statusNote": "draft — authored and verified against the reference TypeScript implementation. Cross-language ratification is PLANNED but NOT claimed until an independent consumer (Rust, Go, C) verifies these vectors.",
+  "algorithm": {
+    "domain": "SHARENET/ROUTE/COMMITMENT/MERKLE/1",
+    "leafTypes": {
+      "0x00": "proposal",
+      "0x01": "acceptance",
+      "0x02": "internal parent"
+    },
+    "proposalLeaf": "BLAKE3-256(domain || u8(0x00) || canonicalEncode(RouteProposal))",
+    "acceptanceLeaf": "BLAKE3-256(domain || u8(0x01) || u32be(hopIndex) || canonicalEncode(RouteAcceptance))",
+    "parent": "BLAKE3-256(domain || u8(0x02) || left(32) || right(32))",
+    "leafOrder": "[proposal_leaf, acceptance_leaf_0, acceptance_leaf_1, ...]",
+    "oddNodeHandling": "duplicate last node",
+    "singleLeaf": "leaf IS the root"
+  },
+  "routeIdFormat": "route_id = 'route:' + lowercase_hex(commitment_root)",
+  "vectors": [
+    {
+      "name": "single-hop-route",
+      "description": "2 leaves (proposal + 1 acceptance) → 1 parent = root",
+      "proposal": {
+        "routeId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "hops": [{ "nodeId": "node1", "capability": "MESH_RELAY", "endpoint": "10.0.0.1:7788", "linkUp": true }],
+        "requirementDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "expiry": 1786876545,
+        "initiatorNodeId": "initiator1",
+        "agreementDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "acceptances": [
+        {
+          "proposalDigestHex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "hopIndex": 0,
+          "hopDigestHex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "serviceDigestHex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "acceptorNodeId": "node1",
+          "acceptanceNonceHex": "0102030405060708090a0b0c0d0e0f10",
+          "expiry": 1786876545,
+          "signatureHex": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ],
+      "expectedCommitmentRootHex": "bc89ae9a85a75962a08943f47c0e455a98b00834efbd78a2778f5abbcb5f08c3",
+      "expectedRouteId": "route:bc89ae9a85a75962a08943f47c0e455a98b00834efbd78a2778f5abbcb5f08c3"
+    },
+    {
+      "name": "two-hop-route",
+      "description": "3 leaves (proposal + 2 acceptances) → odd → duplicate → 2 parents → 1 root",
+      "proposal": {
+        "routeId": "1111111111111111111111111111111111111111111111111111111111111111",
+        "hops": [
+          { "nodeId": "relay1", "capability": "MESH_RELAY", "endpoint": "10.0.0.1:7788", "linkUp": true },
+          { "nodeId": "gateway1", "capability": "INTERNET_GATEWAY", "endpoint": "10.0.0.2:7789", "linkUp": true }
+        ],
+        "requirementDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "expiry": 1786876545,
+        "initiatorNodeId": "initiator1",
+        "agreementDigest": "3333333333333333333333333333333333333333333333333333333333333333"
+      },
+      "acceptances": [
+        {
+          "proposalDigestHex": "4444444444444444444444444444444444444444444444444444444444444444",
+          "hopIndex": 0,
+          "hopDigestHex": "5555555555555555555555555555555555555555555555555555555555555555",
+          "serviceDigestHex": "6666666666666666666666666666666666666666666666666666666666666666",
+          "acceptorNodeId": "relay1",
+          "acceptanceNonceHex": "0a0b0c0d0e0f10111213141516171819",
+          "expiry": 1786876545,
+          "signatureHex": "0101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
+        },
+        {
+          "proposalDigestHex": "4444444444444444444444444444444444444444444444444444444444444444",
+          "hopIndex": 1,
+          "hopDigestHex": "7777777777777777777777777777777777777777777777777777777777777777",
+          "serviceDigestHex": "8888888888888888888888888888888888888888888888888888888888888888",
+          "acceptorNodeId": "gateway1",
+          "acceptanceNonceHex": "1a1b1c1d1e1f20212223242526272829",
+          "expiry": 1786876545,
+          "signatureHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202"
+        }
+      ],
+      "expectedCommitmentRootHex": "86d96b685e531625db0770b953985e3e28bb90b38fc6ebaafefbe6b7597f7c4d",
+      "expectedRouteId": "route:86d96b685e531625db0770b953985e3e28bb90b38fc6ebaafefbe6b7597f7c4d"
+    }
+  ],
+  "verification": "tests/r003-r004-commitment-root.test.ts computes the commitment_root from the vector inputs and asserts the expected hex."
+}

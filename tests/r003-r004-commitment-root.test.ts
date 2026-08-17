@@ -379,3 +379,74 @@ describe("R-003/R-004: Merkle commitment_root algorithm properties", () => {
     expect(deriveRouteId(root1)).not.toBe(deriveRouteId(root2));
   });
 });
+
+describe("R-003/R-004: Canonical golden vectors (V-ROUTE-COMMIT-001)", () => {
+  test("single-hop-route golden vector — exact commitment_root bytes match", () => {
+    const proposal: RouteProposal = {
+      routeId: "a".repeat(64),
+      hops: [{ nodeId: "node1", capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
+      requirementDigest: "b".repeat(64),
+      expiry: 1786876545,
+      initiatorNodeId: "initiator1",
+      agreementDigest: "c".repeat(64),
+    };
+    const acceptances: RouteAcceptance[] = [{
+      proposalDigestHex: "d".repeat(64),
+      hopIndex: 0,
+      hopDigestHex: "e".repeat(64),
+      serviceDigestHex: "f".repeat(64),
+      acceptorNodeId: "node1",
+      acceptanceNonce: new Uint8Array([1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16]),
+      expiry: 1786876545,
+      signature: new Uint8Array(64).fill(0),
+    }];
+    const root = computeCommitmentRoot(proposal, acceptances);
+    const rootHex = bytesToHex(root);
+    const routeId = deriveRouteId(root);
+    // Golden vector (FROZEN per spec/07 §5.3.1):
+    expect(rootHex).toBe("bc89ae9a85a75962a08943f47c0e455a98b00834efbd78a2778f5abbcb5f08c3");
+    expect(routeId).toBe("route:bc89ae9a85a75962a08943f47c0e455a98b00834efbd78a2778f5abbcb5f08c3");
+  });
+
+  test("two-hop-route golden vector — exact commitment_root bytes match (odd-node duplication)", () => {
+    const proposal: RouteProposal = {
+      routeId: "1".repeat(64),
+      hops: [
+        { nodeId: "relay1", capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true },
+        { nodeId: "gateway1", capability: "INTERNET_GATEWAY", endpoint: "10.0.0.2:7789", linkUp: true },
+      ],
+      requirementDigest: "2".repeat(64),
+      expiry: 1786876545,
+      initiatorNodeId: "initiator1",
+      agreementDigest: "3".repeat(64),
+    };
+    const acceptances: RouteAcceptance[] = [
+      {
+        proposalDigestHex: "4".repeat(64),
+        hopIndex: 0,
+        hopDigestHex: "5".repeat(64),
+        serviceDigestHex: "6".repeat(64),
+        acceptorNodeId: "relay1",
+        acceptanceNonce: new Uint8Array([10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25]),
+        expiry: 1786876545,
+        signature: new Uint8Array(64).fill(1),
+      },
+      {
+        proposalDigestHex: "4".repeat(64),
+        hopIndex: 1,
+        hopDigestHex: "7".repeat(64),
+        serviceDigestHex: "8".repeat(64),
+        acceptorNodeId: "gateway1",
+        acceptanceNonce: new Uint8Array([26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41]),
+        expiry: 1786876545,
+        signature: new Uint8Array(64).fill(2),
+      },
+    ];
+    const root = computeCommitmentRoot(proposal, acceptances);
+    const rootHex = bytesToHex(root);
+    const routeId = deriveRouteId(root);
+    // Golden vector (FROZEN per spec/07 §5.3.1):
+    expect(rootHex).toBe("86d96b685e531625db0770b953985e3e28bb90b38fc6ebaafefbe6b7597f7c4d");
+    expect(routeId).toBe("route:86d96b685e531625db0770b953985e3e28bb90b38fc6ebaafefbe6b7597f7c4d");
+  });
+});

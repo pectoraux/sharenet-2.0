@@ -830,3 +830,30 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-003/R-004 hardening v2: the commitment_root is now a canonical Merkle tree (not a flat hash), route_id is "route:" + hex(commitment_root), and RouteCommitment/CommittedRoute/BrandedCommittedRoute are all immutable (frozen + defensive copies).
+
+---
+Task ID: R-003/R-004-golden-vectors
+Agent: main (Z.ai Code)
+Task: Add canonical golden vectors for the commitment-root Merkle algorithm (point 6 from the R-003/R-004 audit).
+
+Work Log:
+- Created `conformance/vectors/V-ROUTE-COMMIT-001.json` — canonical golden vector for the Merkle commitment_root algorithm:
+  - Vector 1 "single-hop-route": 2 leaves (proposal + 1 acceptance) → 1 parent = root
+  - Vector 2 "two-hop-route": 3 leaves (proposal + 2 acceptances) → odd-node duplication → 2 parents → 1 root
+  - Each vector includes: exact proposal, acceptances, expected commitment_root hex, expected route_id
+  - The expected values were computed from the reference implementation and verified to be deterministic
+  - Documents the full algorithm: domain, leaf types (0x00=proposal, 0x01=acceptance, 0x02=parent), leaf encoding, ordering, odd-node handling, route_id format
+
+- Added V-ROUTE-COMMIT-001 to `conformance/vectors/MANIFEST.json` (first routing-layer vector).
+
+- Added 2 golden vector verification tests to `tests/r003-r004-commitment-root.test.ts`:
+  - "single-hop-route golden vector — exact commitment_root bytes match"
+  - "two-hop-route golden vector — exact commitment_root bytes match (odd-node duplication)"
+  - These tests construct the exact vector inputs and assert the expected hex output, providing byte-stable cross-implementation verification.
+
+Stage Summary:
+- Tests: 300 → 302 pass, 0 fail (+2 golden vector tests). 808 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-003/R-004 now have canonical golden vectors for the commitment-root Merkle algorithm. An independent implementation (Rust, Go, C) can verify byte-stability against these vectors.

@@ -20,6 +20,7 @@
     { "id": "V-LINK-AUTH-002", "protocol": "link", "schema_version": "1", "expected_result": "invalid challenge", "file": "V-LINK-AUTH-002.json" },
     { "id": "V-LINK-AUTH-003", "protocol": "link", "schema_version": "1", "expected_result": "wrong transcript", "file": "V-LINK-AUTH-003.json" },
     { "id": "V-LINK-AUTH-004", "protocol": "link", "schema_version": "1", "expected_result": "wrong identity", "file": "V-LINK-AUTH-004.json" },
-    { "id": "V-LINK-AUTH-005", "protocol": "link", "schema_version": "1", "expected_result": "replay attempt", "file": "V-LINK-AUTH-005.json" }
+    { "id": "V-LINK-AUTH-005", "protocol": "link", "schema_version": "1", "expected_result": "replay attempt", "file": "V-LINK-AUTH-005.json" },
+    { "id": "V-ROUTE-COMMIT-001", "protocol": "routing", "schema_version": "1", "expected_result": "canonical Merkle commitment_root", "file": "V-ROUTE-COMMIT-001.json" }
   ]
 }
