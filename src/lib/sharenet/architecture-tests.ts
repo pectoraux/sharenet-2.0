@@ -79,6 +79,9 @@ import {
   type ValidatedHop,
   type BrandedCommittedRoute,
 } from "@reference/transport/validated-types";
+import { signAdvertisement, verifyAdvertisement } from "@reference/advertisement/advertisement";
+import { signRouteAcceptance, createRouteCommitment, createCommittedRoute, type RouteCommitment } from "@reference/routing/route";
+import type { ServiceAgreement } from "@reference/routing/service-negotiation";
 
 export interface ArchTestResult {
   id: number;
@@ -395,17 +398,14 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       } catch { stringToHopThrew = true; }
 
       // Negative: ADV_VERIFIED-only link (linkUp=false) cannot produce ValidatedHop
-      const authNode = createAuthenticatedNodeRecord({
-        advertisement: {
-          nodeId: subject.nodeId,
-          signingPublicKey: subject.publicKey,
-          capabilities: ["MESH_RELAY"],
-          endpoints: [{ type: "tcp", address: "10.0.0.5", port: 7788 }],
-          sequence: 1,
-          expiry: now + 3600,
-        },
-        verifiedAt: now,
-      });
+      const authAdv = signAdvertisement({
+      protocolVersion: 1, nodeId: subject.nodeId, signingPublicKey: subject.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.5", port: 7788 }],
+      sequence: 1, timestamp: now, expiry: now + 3600, nonce: randomBytes(16),
+    }, subject.secretKey);
+    const authVerify = verifyAdvertisement(authAdv, now);
+    if (!authVerify.ok) throw new Error("auth adv verification failed");
+    const authNode = createAuthenticatedNodeRecord(authVerify.verified);
       let advVerifiedThrew = false;
       try {
         createValidatedHop(authNode, "10.0.0.5:7788", "MESH_RELAY", false, ""); // linkUp=false
@@ -455,24 +455,32 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
 
       // Positive: a BrandedCommittedRoute IS recognized by isBrandedCommittedRoute
       // (We construct one with a minimal ValidatedHop to prove the brand works)
-      const authNode = createAuthenticatedNodeRecord({
-        advertisement: {
-          nodeId: kp.nodeId, signingPublicKey: kp.publicKey,
-          capabilities: ["MESH_RELAY"],
-          endpoints: [{ type: "tcp", address: "10.0.0.1", port: 7788 }],
-          sequence: 1, expiry: Math.floor(Date.now() / 1000) + 3600,
-        },
-        verifiedAt: Math.floor(Date.now() / 1000),
-      });
+      const authAdv = signAdvertisement({
+      protocolVersion: 1, nodeId: kp.nodeId, signingPublicKey: kp.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.1", port: 7788 }],
+      sequence: 1, timestamp: Math.floor(Date.now() / 1000), expiry: Math.floor(Date.now() / 1000) + 3600, nonce: randomBytes(16),
+    }, kp.secretKey);
+    const authVerify = verifyAdvertisement(authAdv, Math.floor(Date.now() / 1000));
+    if (!authVerify.ok) throw new Error("auth adv verification failed");
+    const authNode = createAuthenticatedNodeRecord(authVerify.verified);
       const validHop = createValidatedHop(authNode, "10.0.0.1:7788", "MESH_RELAY", true, "digest");
-      const brandedRoute = createBrandedCommittedRoute({
+      // For BrandedCommittedRoute, we need a genuine RouteCommitment from createRouteCommitment
+      const proposal2: RouteProposal = {
         routeId: toHex(randomBytes(32)),
-        hops: [validHop],
+        hops: [{ nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
+        requirementDigest: toHex(randomBytes(32)),
         expiry: Math.floor(Date.now() / 1000) + 3600,
         initiatorNodeId: kp.nodeId,
-        agreementDigest: "digest",
-        committedAt: Math.floor(Date.now() / 1000),
-      });
+        agreementDigest: toHex(randomBytes(32)),
+      };
+      const sa2 = new Map<number, any>();
+      sa2.set(0, { nodeId: kp.nodeId, capability: "MESH_RELAY", requirementDigest: proposal2.requirementDigest, allocatedBandwidthBps: 1048576, expiry: proposal2.expiry, policyVersion: 1 });
+      const hpk2 = new Map<string, Uint8Array>();
+      hpk2.set(kp.nodeId, kp.publicKey);
+      const acc2 = [signRouteAcceptance(proposal2, 0, proposal2.hops[0]!, sa2.get(0)!, kp.nodeId, kp.secretKey, proposal2.expiry)];
+      const comm2 = createRouteCommitment(proposal2, acc2, hpk2, sa2, kp.secretKey, Math.floor(Date.now() / 1000));
+      if (!comm2.ok) throw new Error("commitment failed for branded route test");
+      const brandedRoute = createBrandedCommittedRoute(comm2.commitment);
       const brandedRecognized = isBrandedCommittedRoute(brandedRoute);
 
       return {
@@ -609,15 +617,14 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       } catch { fakeToHopThrew = true; }
 
       // Positive: a genuine AuthenticatedNodeRecord IS recognized
-      const authNode = createAuthenticatedNodeRecord({
-        advertisement: {
-          nodeId: subject.nodeId, signingPublicKey: subject.publicKey,
-          capabilities: ["MESH_RELAY"],
-          endpoints: [{ type: "tcp", address: "10.0.0.5", port: 7788 }],
-          sequence: 1, expiry: now + 3600,
-        },
-        verifiedAt: now,
-      });
+      const authAdv = signAdvertisement({
+      protocolVersion: 1, nodeId: subject.nodeId, signingPublicKey: subject.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.5", port: 7788 }],
+      sequence: 1, timestamp: now, expiry: now + 3600, nonce: randomBytes(16),
+    }, subject.secretKey);
+    const authVerify = verifyAdvertisement(authAdv, now);
+    if (!authVerify.ok) throw new Error("auth adv verification failed");
+    const authNode = createAuthenticatedNodeRecord(authVerify.verified);
       const authRecognized = isAuthenticatedNodeRecord(authNode);
 
       // Positive: AuthenticatedNodeRecord + LINK_UP → ValidatedHop succeeds
