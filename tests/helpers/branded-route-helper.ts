@@ -161,15 +161,17 @@ function runHandshake(
     transcriptAfterAccept, linkIdBytes, challengeForA, ROLE_INITIATOR,
   );
 
-  // Create the genuine VerifiedTranscript (verifies BOTH proofs)
+  // Create the genuine VerifiedTranscript (verifies BOTH proofs + NodeId binding
+  // + recomputes the LinkId from the nonces — R-002-P1 hardening v2)
   return createVerifiedTranscript({
     initiateBytes,
     acceptBytes,
-    linkIdBytes,
     initiatorNodeId: initiatorKp.nodeId,
     responderNodeId: responderKp.nodeId,
     initiatorPublicKey: initiatorKp.publicKey,
     responderPublicKey: responderKp.publicKey,
+    initiatorNonce: linkNonceA,
+    responderNonce: linkNonceB,
     challengeForB,
     challengeForA,
     proofA,

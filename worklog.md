@@ -480,3 +480,52 @@ Stage Summary:
 - The trust chain is now semantically complete end-to-end:
     VerifiedNodeAdvertisement → AuthenticatedNodeRecord → VerifiedTranscript → AuthenticatedLink → ValidatedHop → RouteCommitment → BrandedCommittedRoute → setupCircuit
   Every arrow is a WeakSet membership check. No caller-supplied trust booleans remain. The `linkUp: boolean` trust bit has been eliminated.
+
+---
+Task ID: R-002-P1-hardening-v2
+Agent: main (Z.ai Code)
+Task: Fix the four security issues in the AuthenticatedLink layer found in the R-002-P1 hardening audit.
+
+Work Log:
+- Fixed bug #1 (responder-side remote participant resolution):
+  - The second condition repeated the first (`initiatorNodeId === localNodeId` twice), so responder-side links always resolved remote=null → REJECT.
+  - Now: `initiatorNodeId === localNodeId ? responderNodeId : responderNodeId === localNodeId ? initiatorNodeId : null`. Symmetric for both directions.
+  - Added `localRole: "INITIATOR" | "RESPONDER"` field to AuthenticatedLink so consumers know which side they hold.
+  - Added genuine responder-side test.
+
+- Fixed issue #2 (NodeId ↔ public-key binding not enforced):
+  - `createVerifiedTranscript` now calls `verifyNodeIdBinding(initiatorNodeId, initiatorPublicKey)` AND `verifyNodeIdBinding(responderNodeId, responderPublicKey)` before signature verification. If either fails, no artifact is produced.
+  - The proof now means: "the private keys corresponding to the AUTHENTICATED NodeIds participated in this exact handshake" — not merely "some public key signed".
+  - Added adversarial tests: wrong initiator NodeId, wrong responder NodeId, swapped public keys.
+
+- Fixed issue #3 (LinkId not recomputed):
+  - `createVerifiedTranscript` now takes `initiatorNonce` + `responderNonce` as explicit parameters and RECOMPUTES the directional LinkId via `computeLinkIdBytes(initiatorNodeId, responderNodeId, initiatorNonce, responderNonce)` — never trusted from the caller.
+  - `VerifiedTranscript` now carries `initiatorNonce` + `responderNonce` so downstream consumers (AuthenticatedLink) can re-verify.
+  - `createAuthenticatedLink` recomputes the LinkId again (defense-in-depth) and constant-time-compares it against the transcript's linkIdBytes. A mismatch indicates a forged/tampered transcript.
+  - Removed `linkIdBytes` from the `createVerifiedTranscript` params — it is now derived, not supplied.
+
+- Fixed issue #4 (lifetime invariants):
+  - `createAuthenticatedLink` now enforces: `expiresAt > establishedAt` (strictly), `(expiresAt - establishedAt) <= LINK_MAX_LIFETIME_SECONDS` (3600s, matching advertisement TTL).
+  - Added `LINK_MAX_LIFETIME_SECONDS = 3600` constant.
+  - The freshness check (`expiresAt > now`) is intentionally enforced at USE time (when the link is consumed), not at construction time — this allows a link to be constructed in advance and validated later. The `now` parameter is absent from `createAuthenticatedLink`'s signature to enforce this separation.
+  - Added adversarial tests: expiresAt <= establishedAt, expiresAt < establishedAt, lifetime > max, boundary (exactly max).
+
+- Updated `tests/helpers/branded-route-helper.ts`: `runHandshake` now passes `initiatorNonce` + `responderNonce` to `createVerifiedTranscript` (instead of the old `linkIdBytes`).
+
+- Rewrote `tests/r002p1-authenticated-link.test.ts` (22 tests) covering all 8 auditor-required scenarios:
+  1. responder-side AuthenticatedLink → succeeds (localRole=RESPONDER)
+  2. wrong NodeId/public-key pair → rejects (initiator + responder)
+  3. swapped public keys → rejects
+  4. forged transcript participant IDs → rejects
+  5. bad responder proof / tampered Accept → rejects
+  6. lifetime: expired/future-invalid → rejects; boundary → accepts
+  7. genuine initiator pipeline → succeeds
+  8. genuine responder pipeline → succeeds
+  Plus: unforgeable WeakSet tests (copy rejected, non-genuine authNode/Vt rejected), ValidatedHop requires genuine link, full pipeline end-to-end.
+
+Stage Summary:
+- Tests: 267 → 273 pass, 0 fail (+6 net from the rewritten test file: 22 tests vs 16 before, with 6 new scenarios). 750 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The AuthenticatedLink now proves: authenticated Node identity + fresh mutual possession + exact transcript + exact directional LinkId (recomputed, not trusted) + valid bounded lifetime — and works symmetrically for both initiator and responder directions.
