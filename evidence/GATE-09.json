@@ -2,17 +2,17 @@
   "gate_id": "GATE-09",
   "gate_title": "Linux transparent networking",
   "commit_sha": "4213295afcab8279d0b9ecd3f4cec25ec0ba951a",
-  "commit_message": "GATE-09: Linux transparent networking — TUN adapter abstraction, DNS leak prevention, kill-switch, process lifecycle",
+  "commit_message": "GATE-09: Linux transparent networking \u2014 TUN adapter abstraction, DNS leak prevention, kill-switch, process lifecycle",
   "date": "2026-08-16",
   "scope_completed": [
     "TunAdapter interface (platform-agnostic: start/stop/isActive/getTunAddress/getMtu)",
     "TunPolicy (routeRanges, dnsServers, killSwitch, bypassDomains, blockIpv6)",
-    "DNS leak prevention: wouldDnsLeak() — rejects system DNS servers, blocks IPv6 AAAA queries when blockIpv6=true",
-    "Split tunneling: wouldBypassShareNet() — bypass domains for local traffic",
-    "KillSwitch: blocks all traffic when TUN is down (onTunStart/onTunStop/onTunFailure → block/unblock, enable/disable)",
-    "ProcessLifecycle: state machine (STOPPED→STARTING→RUNNING→DEGRADED→STOPPING→STOPPED), crash → auto-restart (max 3), kill-switch integration, event log",
+    "DNS leak prevention: wouldDnsLeak() \u2014 rejects system DNS servers, blocks IPv6 AAAA queries when blockIpv6=true",
+    "Split tunneling: wouldBypassShareNet() \u2014 bypass domains for local traffic",
+    "KillSwitch: blocks all traffic when TUN is down (onTunStart/onTunStop/onTunFailure \u2192 block/unblock, enable/disable)",
+    "ProcessLifecycle: state machine (STOPPED\u2192STARTING\u2192RUNNING\u2192DEGRADED\u2192STOPPING\u2192STOPPED), crash \u2192 auto-restart (max 3), kill-switch integration, event log",
     "LinuxTunConfig: platform-specific (interfaceName, address, netmask, MTU=1400, routes, DNS)",
-    "PLATFORM_PROTOCOL_SEMANTICS_FORBIDDEN architecture guard (spec/16 §1: platform adapters must NOT create protocol semantics)",
+    "PLATFORM_PROTOCOL_SEMANTICS_FORBIDDEN architecture guard (spec/16 \u00a71: platform adapters must NOT create protocol semantics)",
     "21 unit tests covering all policy/lifecycle/kill-switch scenarios"
   ],
   "commands_run": [
@@ -23,23 +23,43 @@
     "bun run tools/verify-gate.ts"
   ],
   "pass_fail_skipped": {
-    "lint": { "errors": 0, "warnings": 0 },
-    "unit": { "total": 125, "passed": 125, "failed": 0, "skipped": 0 },
-    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
-    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+    "lint": {
+      "errors": 0,
+      "warnings": 0
+    },
+    "unit": {
+      "total": 125,
+      "passed": 125,
+      "failed": 0,
+      "skipped": 0
+    },
+    "architecture": {
+      "total": 24,
+      "passed": 24,
+      "failed": 0,
+      "skipped": 0
+    },
+    "gate_verifier": {
+      "total_checks": 6,
+      "passed": 6,
+      "failed": 0
+    }
   },
   "vector_files_consumed": [],
   "vector_files_generated": [],
   "protocol_adr_references": [
-    "spec/16-platforms.md §1 (platform adapters must NOT create protocol semantics)",
-    "spec/16-platforms.md §2 (Linux TUN adapter)",
-    "spec/00 §10 (Development Phases — Phase 10: Desktop Networking)"
+    "spec/16-platforms.md \u00a71 (platform adapters must NOT create protocol semantics)",
+    "spec/16-platforms.md \u00a72 (Linux TUN adapter)",
+    "spec/00 \u00a710 (Development Phases \u2014 Phase 10: Desktop Networking)"
   ],
   "known_limitations": [
-    "Browser integration test (ordinary Linux browser reaches real HTTPS through ShareNet) is DEFERRED — it requires the full real-process stack: 3-message handshake → committed route → circuit setup → gateway forwarding → TUN device → browser. The protocol-core components all exist (GATE-03 through GATE-08), but they have not been wired together into a single end-to-end real-process integration. The unit tests prove the TUN adapter abstraction and policy/lifecycle correctness.",
+    "Browser integration test (ordinary Linux browser reaches real HTTPS through ShareNet) is DEFERRED \u2014 it requires the full real-process stack: 3-message handshake \u2192 committed route \u2192 circuit setup \u2192 gateway forwarding \u2192 TUN device \u2192 browser. The protocol-core components all exist (GATE-03 through GATE-08), but they have not been wired together into a single end-to-end real-process integration. The unit tests prove the TUN adapter abstraction and policy/lifecycle correctness.",
     "The TunAdapter interface is defined but not implemented for Linux (no real /dev/net/tun calls). A platform/linux/ implementation will use the interface but that requires root/system capabilities not available in the sandbox.",
     "DNS leak prevention is enforced at the policy level (wouldDnsLeak check), but actual DNS interception (redirecting system DNS to the ShareNet proxy) requires the TUN device to be active and routing DNS queries.",
     "The kill-switch blocks traffic logically (isBlocked() returns true), but actual network-level blocking (iptables/nftables rules) is not yet implemented."
   ],
-  "ready_for_next_gate": true
+  "ready_for_next_gate": false,
+  "verification_level": "DESIGNED",
+  "superseded_by_remediation": "R-005",
+  "original_ready_for_next_gate": true
 }

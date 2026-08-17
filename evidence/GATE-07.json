@@ -2,7 +2,7 @@
   "gate_id": "GATE-07",
   "gate_title": "Mode A Internet gateway",
   "commit_sha": "997b0a04129fade353f94ec833d4d586a21fdf37",
-  "commit_message": "GATE-07: Mode A Internet gateway — policy enforcement, SSRF protection, signed measurements, audit events",
+  "commit_message": "GATE-07: Mode A Internet gateway \u2014 policy enforcement, SSRF protection, signed measurements, audit events",
   "date": "2026-08-16",
   "scope_completed": [
     "GatewayRequestFrame/GatewayResponseFrame: request/response CBOR framing",
@@ -27,23 +27,43 @@
     "bun run tools/verify-gate.ts"
   ],
   "pass_fail_skipped": {
-    "lint": { "errors": 0, "warnings": 0 },
-    "unit": { "total": 92, "passed": 92, "failed": 0, "skipped": 0 },
-    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
-    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+    "lint": {
+      "errors": 0,
+      "warnings": 0
+    },
+    "unit": {
+      "total": 92,
+      "passed": 92,
+      "failed": 0,
+      "skipped": 0
+    },
+    "architecture": {
+      "total": 24,
+      "passed": 24,
+      "failed": 0,
+      "skipped": 0
+    },
+    "gate_verifier": {
+      "total_checks": 6,
+      "passed": 6,
+      "failed": 0
+    }
   },
   "vector_files_consumed": [],
   "vector_files_generated": [],
   "protocol_adr_references": [
-    "spec/09-internet-gateway.md (gateway model: capability ≠ policy ≠ authorization ≠ capacity ≠ measurement)",
-    "spec/00 §21 (capabilities: ≠ available ≠ authorized)",
-    "spec/14-security.md §4 (domain tags: SHARENET/GATEWAY/MEASUREMENT/1, SHARENET/GATEWAY/AUDIT/1)"
+    "spec/09-internet-gateway.md (gateway model: capability \u2260 policy \u2260 authorization \u2260 capacity \u2260 measurement)",
+    "spec/00 \u00a721 (capabilities: \u2260 available \u2260 authorized)",
+    "spec/14-security.md \u00a74 (domain tags: SHARENET/GATEWAY/MEASUREMENT/1, SHARENET/GATEWAY/AUDIT/1)"
   ],
   "known_limitations": [
-    "Real external HTTPS request through A → Relay(s) → Gateway is deferred — the unit tests prove the policy enforcement layer with in-memory state. The integration test will exercise the full circuit → gateway → real HTTPS path once the mini-services support the 3-message handshake + circuit setup + gateway forwarding.",
+    "Real external HTTPS request through A \u2192 Relay(s) \u2192 Gateway is deferred \u2014 the unit tests prove the policy enforcement layer with in-memory state. The integration test will exercise the full circuit \u2192 gateway \u2192 real HTTPS path once the mini-services support the 3-message handshake + circuit setup + gateway forwarding.",
     "The gateway policy layer is in reference/ (protocol core, no DB dependency). The service-layer DB-backed implementation in src/lib/sharenet/gateway.ts is the existing stub from the first deliverable; it should be updated to use the new reference/gateway/ types in a follow-up.",
-    "DNS resolution is not performed by the reference module — it accepts a resolved IP from the caller and checks it. The actual DNS lookup happens in the service layer (or mini-service).",
-    "Bandwidth shaping is informational (tracking only) — actual traffic shaping (token bucket, queue management) is not yet implemented."
+    "DNS resolution is not performed by the reference module \u2014 it accepts a resolved IP from the caller and checks it. The actual DNS lookup happens in the service layer (or mini-service).",
+    "Bandwidth shaping is informational (tracking only) \u2014 actual traffic shaping (token bucket, queue management) is not yet implemented."
   ],
-  "ready_for_next_gate": true
+  "ready_for_next_gate": false,
+  "verification_level": "IMPLEMENTED",
+  "superseded_by_remediation": "R-005",
+  "original_ready_for_next_gate": true
 }

@@ -3,126 +3,68 @@
 Per the Permanent Operating Rules (§A.2), every session must update this file.
 Advance only when `ready_for_next_gate: true` and CI verifies the gate evidence.
 
-| Gate | Title | Status | Commit | Evidence |
-|------|-------|--------|--------|----------|
-| GATE-00 | Stabilize the repository | ✅ COMPLETE | `cac00cc` | `evidence/GATE-00.json` |
-| GATE-01 | Conformance foundation | ✅ COMPLETE | `73eada1` | `evidence/GATE-01.json` |
-| GATE-02 | Identity and persistent advertisement state | ✅ COMPLETE | `2c6ac24` | `evidence/GATE-02.json` |
-| GATE-03 | Secure authenticated directed links | ✅ COMPLETE | `d4a241c` | `evidence/GATE-03.json` |
-| GATE-04 | Discovery and topology hints | ✅ COMPLETE | `26eda87` | `evidence/GATE-04.json` |
-| GATE-05 | Service negotiation and route commitment | ✅ COMPLETE | `9004c0e` | `evidence/GATE-05.json` |
-| GATE-06 | Circuits and encrypted forwarding | ✅ COMPLETE | `fdf49f0` | `evidence/GATE-06.json` |
-| GATE-07 | Mode A Internet gateway | ✅ COMPLETE | `997b0a0` | `evidence/GATE-07.json` |
-| GATE-08 | Recovery | ✅ COMPLETE | `38c38b0` | `evidence/GATE-08.json` |
-| GATE-09 | Linux transparent networking | ✅ COMPLETE | `4213295` | `evidence/GATE-09.json` |
-| GATE-10 | Android north-star | ✅ COMPLETE | `3f99279` | `evidence/GATE-10.json` |
-| GATE-11 | Contribution proofs | ✅ COMPLETE | `7d418a7` | `evidence/GATE-11.json` |
-| GATE-12 | Civic Points | ⏳ PENDING | — | — |
-| GATE-13 | Content, external crypto, compute | ⏳ PENDING | — | — |
+## Verification levels
 
-## Gate exit criteria summary
+Per R-005, a gate cannot become **COMPLETE** until it satisfies its designated
+verification level. The old "✅ COMPLETE" labels have been replaced with
+truthful verification levels:
 
-### GATE-00 — Stabilize the repository
-- lint: zero errors
-- unit: zero failures
-- architecture: zero failures/skips
-- no private-key material
-- gate verifier passes
-- `bun install --frozen-lockfile`, lint, unit, architecture tests all complete in a clean checkout
+| Level | Meaning |
+|-------|---------|
+| `DESIGNED` | Spec + ADR + types defined, no implementation |
+| `IMPLEMENTED` | Code exists but only unit-tested (no integration) |
+| `LOCALLY_VERIFIED` | Unit tests + architecture tests pass |
+| `MULTIPROCESS_VERIFIED` | Two+ independent processes exchange real traffic |
+| `REAL-NETWORK_VERIFIED` | Real sockets, real Internet, real external server |
+| `PLATFORM_VERIFIED` | Actual OS facilities (TUN/VpnService) exercised |
+| `NORTH-STAR_VERIFIED` | Android mobile data OFF + Wi-Fi OFF + Chrome → real HTTPS |
 
-### GATE-01 — Conformance foundation
-- CDDL/JSON schemas for NodeId, advertisement, link handshake, topology hint, route, circuit, gateway negotiation
-- Ratified NodeId and CBOR vectors
-- Real Ed25519 advertisement vectors: valid, invalid signature, expired, malformed, rollback
-- Vector runner reads files from `conformance/vectors/`; no runtime-only golden vectors
-- At least one independent Python verifier for NodeId/CBOR/advertisement vectors
+Old evidence files are preserved but marked as **SUPERSEDED** or **PARTIAL**
+where the actual verification level is lower than originally claimed.
 
-### GATE-02 — Identity and persistent advertisement state
-- Canonical CBOR advertisement encoding
-- Ed25519 verification
-- Timestamp/TTL/nonce validation
-- Persistent monotonic peer sequence floors
-- Atomic local persistence abstraction
-- `VerifiedNodeAdvertisement` and `AuthenticatedNodeRecord` as distinct types
-- No hosted database dependency in `reference/`
+## Gate status
 
-### GATE-03 — Secure authenticated directed links
-- Exact accepted handshake schema and ADR (ADR-0016 approved)
-- Challenge cache, expiration, replay rejection, failure reasons
-- Three-message possession-proof handshake
-- Directional LinkId with ratified BLAKE3 schema/vector
-- Real TCP integration: two independent processes
-- Tests for valid, tampered, replayed, wrong-role, wrong-LinkId proof
+| Gate | Title | Verification level | Commit | Evidence | Notes |
+|------|-------|-------------------|--------|----------|-------|
+| GATE-00 | Stabilize the repository | LOCALLY_VERIFIED | `cac00cc` | `evidence/GATE-00.json` | Stable baseline |
+| GATE-01 | Conformance foundation | LOCALLY_VERIFIED | `73eada1` | `evidence/GATE-01.json` | TS + Python verifiers pass 14/14 |
+| GATE-02 | Identity and persistent advertisement state | LOCALLY_VERIFIED | `2c6ac24` | `evidence/GATE-02.json` | Restart test passes; in-memory store |
+| GATE-03 | Secure authenticated directed links | IMPLEMENTED | `d4a241c` | `evidence/GATE-03.json` | 3-message handshake implemented + vectors; NO real TCP integration (R-002 pending) |
+| GATE-04 | Discovery and topology hints | IMPLEMENTED | `26eda87` | `evidence/GATE-04.json` | Hint store + propagation; NO 3-node real-process test |
+| GATE-05 | Service negotiation and route commitment | IMPLEMENTED | `9004c0e` | `evidence/GATE-05.json` | Route types + acceptance; R-003/R-004 pending (acceptance binding + sig verification) |
+| GATE-06 | Circuits and encrypted forwarding | IMPLEMENTED | `fdf49f0` | `evidence/GATE-06.json` | X25519+AEAD+onion; NO distributed relay setup (R-008 pending) |
+| GATE-07 | Mode A Internet gateway | IMPLEMENTED | `997b0a0` | `evidence/GATE-07.json` | Policy layer; NO real Internet forwarding (R-010 pending) |
+| GATE-08 | Recovery | IMPLEMENTED | `38c38b0` | `evidence/GATE-08.json` | Recovery state machine; NO real-process failure test |
+| GATE-09 | Linux transparent networking | DESIGNED | `4213295` | `evidence/GATE-09.json` | TUN adapter interface; NO actual /dev/net/tun (R-012 pending) |
+| GATE-10 | Android north-star | DESIGNED | `3f99279` | `evidence/GATE-10.json` | VPNService lifecycle model; NO real device test (R-012 pending) |
+| GATE-11 | Contribution proofs | IMPLEMENTED | `7d418a7` | `evidence/GATE-11.json` | Bilateral receipts + ledger; NO real measured service (R-013 pending) |
+| GATE-12 | Civic Points | PENDING | — | — | Blocked on R-011 (real network) + R-013 (contribution) |
+| GATE-13 | Content, external crypto, compute | PENDING | — | — | Blocked on GATE-12 |
 
-### GATE-04 — Discovery and topology hints
-- Endpoint discovery abstraction
-- `RemoteNodeHint` type
-- Signed propagation message
-- Separate propagation sequence floor
-- Bounded size, horizon, freshness, provenance, replay protection
-- Direct gateways and gateway hints as separate APIs
+## Remediation tracking
 
-### GATE-05 — Service negotiation and route commitment
-- `ServiceRequirement`, capability offer, policy check, capacity check, service agreement
-- `RouteProposal`, `RouteAcceptance`, `RouteCommitment`, `CommittedRoute`
-- Each hop requires authenticated node, `LINK_UP`, transport, role, policy, service compatibility
-- Acceptance signatures bind ordered hops, route ID, agreement digest, expiry
+| ID | Priority | Description | Status |
+|----|----------|-------------|--------|
+| R-001 | P0 | Protocol freeze reconciliation | ✅ DONE (`ed61a1a`) |
+| R-002 | P0 | Fresh possession proof for LINK_UP | ⏳ PENDING |
+| R-003 | P0 | RouteAcceptance signature binding | ⏳ PENDING |
+| R-004 | P0 | Commitment verifies signatures | ⏳ PENDING |
+| R-005 | P0 | Truthful gate system | ✅ DONE (this update) |
+| R-006 | P1 | Architecture test upgrades | ⏳ PENDING |
+| R-007 | P1 | Vectors as mandatory inputs | ⏳ PENDING |
+| R-008 | P1 | Distributed circuit setup | ⏳ PENDING |
+| R-009 | P1 | Circuit packet semantics | ⏳ PENDING |
+| R-010 | P1 | Real gateway forwarding | ⏳ PENDING |
+| R-011 | P1 | Real multiprocess network test | ⏳ PENDING |
+| R-012 | P1 | Platform (TUN/VpnService) | ⏳ PENDING |
+| R-013 | P1 | Contribution bound to real service | ⏳ PENDING |
+| R-014 | P2 | Persistence durability | ⏳ PENDING |
+| R-015 | P2 | Standalone protocol build | ⏳ PENDING |
 
-### GATE-06 — Circuits and encrypted forwarding
-- X25519 key agreement
-- HKDF/domain-separated key schedule
-- AEAD algorithm and nonce layout frozen in ADR/vectors
-- Replay protection
-- Route/circuit binding
-- Distributed relay setup, acknowledgements, possession proofs, expiration
-- Relays never receive application plaintext
+## Execution order (per the audit)
 
-### GATE-07 — Mode A Internet gateway
-- Request/response framing
-- DNS policy and resolution semantics
-- Destination allowlist
-- Private, loopback, link-local, metadata/SSRF blocking after DNS resolution
-- Per-peer/global quotas, shaping, rate limits, revocation
-- Signed service measurements and structured audit events
-- No open-proxy behavior
+```
+R-001 ✅ → R-005 ✅ → R-002 → R-003 → R-004 → R-006 → R-007 → R-008 → R-009 → R-011 → R-010 → Linux → Android → R-013 → Civic Points
+```
 
-### GATE-08 — Recovery
-- Link degradation/down detection
-- Affected-route invalidation
-- Alternative gateway discovery
-- New route/new circuit
-- No claim of arbitrary TCP migration
-
-### GATE-09 — Linux transparent networking
-- Linux TUN adapter
-- Local proxy/TUN policy
-- DNS leak prevention
-- Process lifecycle and kill-switch behavior
-- Browser integration test
-
-### GATE-10 — Android north-star
-- Android VPNService/TUN adapter only; no Android-specific protocol
-- Lifecycle, permission, reconnect, battery/background handling
-- Real relay/gateway topology
-- Reproducible device test script
-- Android mobile data OFF + Wi-Fi OFF + ordinary Chrome → real HTTPS
-
-### GATE-11 — Contribution proofs
-- Measured gateway/relay service
-- Signed bilateral receipts
-- Proof verification
-- Append-only contribution ledger
-- Fraud/replay/duplicate receipt tests
-
-### GATE-12 — Civic Points
-- Versioned valuation policy
-- Verified proof → points → resource redemption
-- No blockchain
-- No free peer-to-peer transferability
-- Routing remains independent of points
-
-### GATE-13 — Content, external crypto, compute
-1. Content-addressed storage/chunks/Merkle/manifests
-2. External signed-transaction transport (private keys stay local)
-3. Compute services
-Each requires its own ADR, schemas, vectors, security tests, integration proof.
+**real network before economics, protocol integrity before platform work.**

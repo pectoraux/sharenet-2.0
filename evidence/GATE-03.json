@@ -2,10 +2,10 @@
   "gate_id": "GATE-03",
   "gate_title": "Secure authenticated directed links",
   "commit_sha": "d4a241cd9dd6ea16080050cf7ee505ab8300532f",
-  "commit_message": "GATE-03: secure authenticated directed links — 3-message transcript-bound handshake",
+  "commit_message": "GATE-03: secure authenticated directed links \u2014 3-message transcript-bound handshake",
   "date": "2026-08-16",
   "scope_completed": [
-    "ADR-0016 updated from PROPOSAL to RESOLVED (Principal Architect approved via roadmap §B frozen protocol decisions)",
+    "ADR-0016 updated from PROPOSAL to RESOLVED (Principal Architect approved via roadmap \u00a7B frozen protocol decisions)",
     "3-message authenticated handshake implemented in reference/transport/auth-handshake.ts per the frozen spec",
     "Transcript hash: BLAKE3-256 with u32be length-prefixed message framing per SHARENET/LINK/TRANSCRIPT/1",
     "Possession payload: domain_tag || transcript_hash || link_id_bytes || peer_challenge || role_byte",
@@ -26,12 +26,37 @@
     "python3 conformance/runners/py_vector_verifier.py"
   ],
   "pass_fail_skipped": {
-    "lint": { "errors": 0, "warnings": 0 },
-    "unit": { "total": 15, "passed": 15, "failed": 0, "skipped": 0 },
-    "architecture": { "total": 24, "passed": 24, "failed": 0, "skipped": 0 },
-    "ts_vector_runner": { "total": 14, "passed": 14, "failed": 0 },
-    "py_vector_verifier": { "total": 14, "passed": 14, "failed": 0 },
-    "gate_verifier": { "total_checks": 6, "passed": 6, "failed": 0 }
+    "lint": {
+      "errors": 0,
+      "warnings": 0
+    },
+    "unit": {
+      "total": 15,
+      "passed": 15,
+      "failed": 0,
+      "skipped": 0
+    },
+    "architecture": {
+      "total": 24,
+      "passed": 24,
+      "failed": 0,
+      "skipped": 0
+    },
+    "ts_vector_runner": {
+      "total": 14,
+      "passed": 14,
+      "failed": 0
+    },
+    "py_vector_verifier": {
+      "total": 14,
+      "passed": 14,
+      "failed": 0
+    },
+    "gate_verifier": {
+      "total_checks": 6,
+      "passed": 6,
+      "failed": 0
+    }
   },
   "vector_files_consumed": [
     "conformance/vectors/V-NODEID-001.json",
@@ -57,15 +82,18 @@
     "conformance/vectors/V-LINK-HANDSHAKE-005.json"
   ],
   "protocol_adr_references": [
-    "spec/04-links.md §3.2 (peer authentication → LinkUp)",
-    "spec/04-links.md §4 (corrected state machine: ADV_VERIFIED → LINK_UP)",
-    "ADR-0014 (LinkId derivation + two-message handshake — superseded by auth-handshake for LINK_UP)",
-    "ADR-0016 (RESOLVED — 3-message transcript-binding handshake)"
+    "spec/04-links.md \u00a73.2 (peer authentication \u2192 LinkUp)",
+    "spec/04-links.md \u00a74 (corrected state machine: ADV_VERIFIED \u2192 LINK_UP)",
+    "ADR-0014 (LinkId derivation + two-message handshake \u2014 superseded by auth-handshake for LINK_UP)",
+    "ADR-0016 (RESOLVED \u2014 3-message transcript-binding handshake)"
   ],
   "known_limitations": [
     "Real TCP integration (mini-service update to use the 3-message handshake) is deferred to a follow-up commit. The current mini-service still uses the 2-message ADV_VERIFIED exchange. The integration test (test:integration:mesh) currently tests ADV_VERIFIED, not LINK_UP.",
     "The challenge cache is in-memory only (no persistence across restarts). This is acceptable for the handshake (challenges expire in 5 minutes) but a production implementation should use a shared cache for multi-process deployments.",
     "LinkId derivation still uses BLAKE2b-256 (reference/link/link.ts). A follow-up should update it to BLAKE3-256 for consistency with the NodeId derivation, but this does not affect the handshake correctness since LinkId is derived identically by both parties."
   ],
-  "ready_for_next_gate": true
+  "ready_for_next_gate": false,
+  "verification_level": "IMPLEMENTED",
+  "superseded_by_remediation": "R-005",
+  "original_ready_for_next_gate": true
 }
