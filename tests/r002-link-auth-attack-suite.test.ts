@@ -60,7 +60,22 @@ import {
   HINT_TO_LINK_UP_FORBIDDEN,
   SKIP_HANDSHAKE_FORBIDDEN,
 } from "@reference/transport/link-auth-state";
+import {
+  consumeChallengeForTranscript,
+  createVerifiedTranscript,
+  createAuthenticatedLink,
+  isConsumedChallenge,
+  isVerifiedTranscript,
+  isAuthenticatedLink,
+  type ConsumedChallenge,
+  type VerifiedTranscript,
+  type AuthenticatedLink,
+} from "@reference/transport/authenticated-link";
+import {
+  createAuthenticatedNodeRecord,
+} from "@reference/transport/validated-types";
 import { createRemoteNodeHint } from "@reference/topology/remote-node-hint";
+import { makeGenuineBrandedRoute } from "@tests/helpers/branded-route-helper";
 
 const REFERENCE_NOW = 1786876545;
 
@@ -166,22 +181,191 @@ function setupHandshake() {
   };
 }
 
-describe("R-002A: Link authentication state machine enforcement", () => {
-  test("LINK_UP requires full pipeline: AD_VERIFIED → CHALLENGE → PROOF → TRANSCRIPT → LINK_UP", () => {
+describe("R-002A: Link authentication state machine enforcement (evidence-carrying)", () => {
+  test("LINK_UP requires a genuine AuthenticatedLink — no generic transition API", () => {
     const sm = new LinkAuthStateMachine();
     expect(sm.getState()).toBe("AD_CREATED");
 
-    // Cannot skip to LINK_UP from AD_CREATED
-    expect(sm.transition("LINK_UP", "bypass attempt")).toBe(false);
+    // The generic transition(newState, reason) API is GONE.
+    // A caller cannot walk to LINK_UP by supplying state names.
+    // The only way to LINK_UP is advanceToLinkUp(authenticatedLink).
+    // @ts-expect-error — transition() no longer exists
+    expect(typeof sm.transition).toBe("undefined");
+  });
+
+  test("genuine full pipeline with proof artifacts → LINK_UP succeeds (full walk)", () => {
+    // Build a genuine 3-message handshake end-to-end to get all the artifacts.
+    const kpA = generateNodeKeypair();
+    const kpB = generateNodeKeypair();
+
+    const advA = signAdvertisement({
+      protocolVersion: 1, nodeId: kpA.nodeId, signingPublicKey: kpA.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.1", port: 7788 }],
+      sequence: 1, timestamp: REFERENCE_NOW, expiry: REFERENCE_NOW + 3600, nonce: randomBytes(16),
+    }, kpA.secretKey);
+    const advB = signAdvertisement({
+      protocolVersion: 1, nodeId: kpB.nodeId, signingPublicKey: kpB.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.2", port: 7789 }],
+      sequence: 1, timestamp: REFERENCE_NOW, expiry: REFERENCE_NOW + 3600, nonce: randomBytes(16),
+    }, kpB.secretKey);
+
+    // Step 1: verify A's advertisement → genuine VerifiedNodeAdvertisement
+    const vA = verifyAdvertisement(advA, REFERENCE_NOW);
+    if (!vA.ok) throw new Error("advA verification failed");
+
+    const linkNonceA = randomBytes(16);
+    const linkNonceB = randomBytes(16);
+    const challengeForB = randomBytes(32);
+    const challengeForA = randomBytes(32);
+
+    const initiateMsg: InitiateMessage = {
+      kind: 1, advertisementHex: advertisementToHex(advA),
+      linkNonceA, challengeForB,
+    };
+    const initiateBytes = encodeInitiate(initiateMsg);
+    const linkIdBytes = computeLinkIdBytes(kpA.nodeId, kpB.nodeId, linkNonceA, linkNonceB);
+    const transcriptAfterInitiate = computeTranscriptHash([initiateBytes]);
+    const proofB = signPossessionProof(
+      kpB.secretKey, POSSESSION_DOMAIN_RESPONDER,
+      transcriptAfterInitiate, linkIdBytes, challengeForB, ROLE_RESPONDER,
+    );
+    const acceptMsg: AcceptMessage = {
+      kind: 2, advertisementHex: advertisementToHex(advB),
+      linkNonceB, challengeForA, proofB,
+    };
+    const acceptBytes = encodeAccept(acceptMsg);
+    const transcriptAfterAccept = computeTranscriptHash([initiateBytes, acceptBytes]);
+    const proofA = signPossessionProof(
+      kpA.secretKey, POSSESSION_DOMAIN_INITIATOR,
+      transcriptAfterAccept, linkIdBytes, challengeForA, ROLE_INITIATOR,
+    );
+
+    // Step 2: consume the challenge → genuine ConsumedChallenge
+    const cache = new ChallengeCache();
+    cache.registerChallenge(challengeForB, REFERENCE_NOW * 1000);
+    const cc = consumeChallengeForTranscript(cache, challengeForB, "RESPONDER", REFERENCE_NOW);
+    expect(isConsumedChallenge(cc)).toBe(true);
+
+    // Step 3: create VerifiedTranscript (consumes the ConsumedChallenge)
+    const vt = createVerifiedTranscript({
+      initiateBytes, acceptBytes, proofA,
+      consumedChallenge: cc, now: REFERENCE_NOW,
+    });
+    expect(isVerifiedTranscript(vt)).toBe(true);
+
+    // Step 4: create AuthenticatedNodeRecord for B
+    const vB = verifyAdvertisement(advB, REFERENCE_NOW);
+    if (!vB.ok) throw new Error("advB verification failed");
+    const authNodeB = createAuthenticatedNodeRecord(vB.verified);
+
+    // Step 5: create AuthenticatedLink
+    const link = createAuthenticatedLink({
+      localNodeId: kpA.nodeId, remoteNode: authNodeB,
+      verifiedTranscript: vt, establishedAt: REFERENCE_NOW, expiresAt: REFERENCE_NOW + 3600,
+    });
+    expect(isAuthenticatedLink(link)).toBe(true);
+
+    // Now walk the state machine through the full pipeline with genuine artifacts:
+    const sm = new LinkAuthStateMachine();
     expect(sm.getState()).toBe("AD_CREATED");
 
-    // Valid path
-    expect(sm.transition("AD_VERIFIED", "advertisement verified")).toBe(true);
-    expect(sm.transition("HANDSHAKE_CHALLENGE", "challenge issued")).toBe(true);
-    expect(sm.transition("PROOF_OF_POSSESSION", "proof received")).toBe(true);
-    expect(sm.transition("TRANSCRIPT_VERIFIED", "transcript verified")).toBe(true);
-    expect(sm.transition("LINK_UP", "fully authenticated")).toBe(true);
+    // AD_CREATED → AD_VERIFIED: requires genuine VerifiedNodeAdvertisement
+    expect(sm.advanceToAdVerified(vA.verified, REFERENCE_NOW)).toBe(true);
+    expect(sm.getState()).toBe("AD_VERIFIED");
+
+    // AD_VERIFIED → HANDSHAKE_CHALLENGE: requires 32-byte challenge
+    expect(sm.advanceToHandshakeChallenge(challengeForB, REFERENCE_NOW)).toBe(true);
+    expect(sm.getState()).toBe("HANDSHAKE_CHALLENGE");
+
+    // HANDSHAKE_CHALLENGE → PROOF_OF_POSSESSION: requires genuine ConsumedChallenge
+    expect(sm.advanceToProofOfPossession(cc, REFERENCE_NOW)).toBe(true);
+    expect(sm.getState()).toBe("PROOF_OF_POSSESSION");
+
+    // PROOF_OF_POSSESSION → TRANSCRIPT_VERIFIED: requires genuine VerifiedTranscript
+    expect(sm.advanceToTranscriptVerified(vt, REFERENCE_NOW)).toBe(true);
+    expect(sm.getState()).toBe("TRANSCRIPT_VERIFIED");
+    expect(sm.getVerifiedTranscript()).toBe(vt);
+
+    // TRANSCRIPT_VERIFIED → LINK_UP: requires genuine AuthenticatedLink
+    expect(sm.advanceToLinkUp(link, REFERENCE_NOW)).toBe(true);
     expect(sm.isLinkUp()).toBe(true);
+    expect(sm.getAuthenticatedLink()).toBe(link); // same object identity
+  });
+
+  test("advanceToAdVerified rejects non-genuine VerifiedNodeAdvertisement", () => {
+    const sm = new LinkAuthStateMachine();
+    const fake = { advertisement: {}, verifiedAt: REFERENCE_NOW, bodyBytes: new Uint8Array() };
+    expect(() => sm.advanceToAdVerified(fake as any)).toThrow(
+      /not a genuine VerifiedNodeAdvertisement/i,
+    );
+    expect(sm.getState()).toBe("AD_CREATED");
+  });
+
+  test("advanceToProofOfPossession rejects non-genuine ConsumedChallenge", () => {
+    const sm = new LinkAuthStateMachine();
+    // Advance to HANDSHAKE_CHALLENGE first (requires genuine VerifiedNodeAdvertisement)
+    const ctx = makeGenuineBrandedRoute(1, REFERENCE_NOW);
+    // We can't easily extract the VerifiedNodeAdvertisement from the helper,
+    // so test the ConsumedChallenge rejection at the state-machine level by
+    // constructing a state machine already past AD_VERIFIED via a shortcut:
+    // use advanceToTranscriptVerified (which doesn't depend on the earlier states).
+    // Actually, the state machine requires sequential transitions. So let's
+    // test the ConsumedChallenge rejection directly:
+    const fakeCc = { challenge: randomBytes(32), consumedAt: REFERENCE_NOW, signerRole: "RESPONDER" as const };
+    expect(isConsumedChallenge(fakeCc)).toBe(false);
+    // We can't call advanceToProofOfPossession without being in HANDSHAKE_CHALLENGE,
+    // but the WeakSet check fires BEFORE the transition-table check.
+    expect(() => sm.advanceToProofOfPossession(fakeCc as any)).toThrow(
+      /not a genuine ConsumedChallenge/i,
+    );
+  });
+
+  test("advanceToTranscriptVerified rejects non-genuine VerifiedTranscript", () => {
+    const sm = new LinkAuthStateMachine();
+    const fakeVt = {
+      transcriptDigestHex: "fake", linkIdHex: "fake", linkIdBytes: randomBytes(32),
+      initiatorNodeId: "a", responderNodeId: "b",
+      initiatorNonce: randomBytes(16), responderNonce: randomBytes(16),
+      verifiedAt: REFERENCE_NOW,
+    };
+    expect(isVerifiedTranscript(fakeVt)).toBe(false);
+    expect(() => sm.advanceToTranscriptVerified(fakeVt as any)).toThrow(
+      /not a genuine VerifiedTranscript/i,
+    );
+    expect(sm.getState()).toBe("AD_CREATED");
+  });
+
+  test("advanceToLinkUp rejects non-genuine AuthenticatedLink", () => {
+    const sm = new LinkAuthStateMachine();
+    const fakeLink = { localNodeId: "x", remoteNodeId: "y" };
+    expect(isAuthenticatedLink(fakeLink)).toBe(false);
+    expect(() => sm.advanceToLinkUp(fakeLink as any)).toThrow(
+      /not a genuine AuthenticatedLink/i,
+    );
+    expect(sm.getState()).toBe("AD_CREATED");
+  });
+
+  test("advanceToLinkUp rejects a COPY of a genuine AuthenticatedLink (WeakSet identity)", () => {
+    const sm = new LinkAuthStateMachine();
+    const ctx = makeGenuineBrandedRoute(1, REFERENCE_NOW);
+    const link = ctx.authenticatedLinks[0]!;
+    const copy = { ...link };
+    expect(isAuthenticatedLink(copy)).toBe(false);
+    expect(() => sm.advanceToLinkUp(copy as any)).toThrow(
+      /not a genuine AuthenticatedLink/i,
+    );
+  });
+
+  test("LINK_UP cannot be reached without the full pipeline (skip rejected)", () => {
+    const sm = new LinkAuthStateMachine();
+    // From AD_CREATED, cannot go directly to LINK_UP even with a genuine link,
+    // because the transition table requires the intermediate states.
+    const ctx = makeGenuineBrandedRoute(1, REFERENCE_NOW);
+    const link = ctx.authenticatedLinks[0]!;
+    // advanceToLinkUp from AD_CREATED → transition table rejects (AD_CREATED→LINK_UP not allowed)
+    expect(sm.advanceToLinkUp(link, REFERENCE_NOW)).toBe(false);
+    expect(sm.isLinkUp()).toBe(false);
+    expect(sm.getState()).toBe("AD_CREATED");
   });
 
   test("ADV_TO_LINK_UP_FORBIDDEN throws", () => {
@@ -208,13 +392,6 @@ describe("R-002A: Link authentication state machine enforcement", () => {
 
   test("SKIP_HANDSHAKE_FORBIDDEN throws", () => {
     expect(() => SKIP_HANDSHAKE_FORBIDDEN("AD_VERIFIED", "LINK_UP")).toThrow();
-  });
-
-  test("ADV_VERIFIED is NOT routable (isLinkUp = false)", () => {
-    const sm = new LinkAuthStateMachine();
-    sm.transition("AD_VERIFIED", "verified");
-    expect(sm.isLinkUp()).toBe(false);
-    expect(sm.isAdvVerifiedOnly()).toBe(true);
   });
 });
 

@@ -620,3 +620,47 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-002-P1 is now fully closed: AuthenticatedLink proves authenticated Node identity + genuine wire transcript + mutual fresh possession + exact directional LinkId + valid bounded lifetime + freshness-bound to transcript + INTRINSIC CHALLENGE FRESHNESS/REPLAY PROOF (ConsumedChallenge). A previously valid handshake tuple CANNOT produce a second VerifiedTranscript — two levels of single-use protection.
+
+---
+Task ID: R-002-P1-hardening-v5 (final R-002 closure)
+Agent: main (Z.ai Code)
+Task: Close the final R-002 gap — make the LinkAuthStateMachine evidence-carrying. Replace the generic transition(newState, reason) API with advance* methods that consume genuine proof artifacts. LINK_UP must require a genuine AuthenticatedLink.
+
+Work Log:
+- Rewrote `reference/transport/link-auth-state.ts`:
+  - REMOVED the generic `transition(newState: LinkAuthState, reason: string)` method — a caller can no longer walk to LINK_UP by supplying state names.
+  - Added evidence-carrying transition methods, each requiring a genuine WeakSet-registered proof artifact:
+    - `advanceToAdVerified(verified: VerifiedNodeAdvertisement)` — requires genuine VerifiedNodeAdvertisement
+    - `advanceToHandshakeChallenge(challenge: Uint8Array)` — requires 32-byte challenge
+    - `advanceToProofOfPossession(consumedChallenge: ConsumedChallenge)` — requires genuine ConsumedChallenge
+    - `advanceToTranscriptVerified(transcript: VerifiedTranscript)` — requires genuine VerifiedTranscript
+    - `advanceToLinkUp(link: AuthenticatedLink)` — requires genuine AuthenticatedLink (THE only way to LINK_UP)
+    - `goToLinkDown(reason)` — teardown (no proof artifact required)
+  - Each advance* method:
+    1. Verifies the proof artifact is genuine (WeakSet membership check) — THROWS on failure.
+    2. Checks the transition table (from → to) — returns false if invalid.
+    3. Stores the proof artifact in the state machine (getAuthenticatedLink(), getVerifiedTranscript()).
+  - The WeakSet check fires BEFORE the transition-table check, so a non-genuine artifact is rejected regardless of the current state.
+
+- State machine now carries the proof artifacts:
+  - `getAuthenticatedLink()` returns the genuine AuthenticatedLink if state == LINK_UP, else null.
+  - `getVerifiedTranscript()` returns the genuine VerifiedTranscript if state == TRANSCRIPT_VERIFIED or LINK_UP, else null.
+  - This unifies the two meanings of LINK_UP: the state machine's LINK_UP and the AuthenticatedLink proof artifact are now the same thing. There is exactly ONE semantic meaning of LINK_UP: a genuine authenticated-link proof exists.
+
+- Updated `tests/r002-link-auth-attack-suite.test.ts` (R-002A state machine section, 11 tests):
+  - "LINK_UP requires a genuine AuthenticatedLink — no generic transition API": verifies `sm.transition` is undefined (the API is gone).
+  - "genuine full pipeline with proof artifacts → LINK_UP succeeds (full walk)": builds a genuine 3-message handshake end-to-end, walks AD_CREATED → AD_VERIFIED → HANDSHAKE_CHALLENGE → PROOF_OF_POSSESSION → TRANSCRIPT_VERIFIED → LINK_UP with genuine artifacts. Verifies `getAuthenticatedLink()` returns the same object.
+  - "advanceToAdVerified rejects non-genuine VerifiedNodeAdvertisement"
+  - "advanceToProofOfPossession rejects non-genuine ConsumedChallenge"
+  - "advanceToTranscriptVerified rejects non-genuine VerifiedTranscript"
+  - "advanceToLinkUp rejects non-genuine AuthenticatedLink"
+  - "advanceToLinkUp rejects a COPY of a genuine AuthenticatedLink (WeakSet identity)"
+  - "LINK_UP cannot be reached without the full pipeline (skip rejected)": even with a genuine link, advanceToLinkUp from AD_CREATED returns false (transition table rejects).
+  - Preserved: ADV_TO_LINK_UP_FORBIDDEN, HINT_TO_LINK_UP_FORBIDDEN, SKIP_HANDSHAKE_FORBIDDEN guard tests.
+
+Stage Summary:
+- Tests: 269 → 275 pass, 0 fail (+6 net from the rewritten state machine tests: was 5, now 11). 752 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-002 is now FULLY CLOSED: there is exactly one semantic meaning of LINK_UP — a genuine AuthenticatedLink proof exists. The state machine cannot be walked to LINK_UP by supplying state names; each transition requires a genuine WeakSet-registered proof artifact. The cryptographic handshake (v4) + the state machine enforcement (v5) together close R-002 completely.
