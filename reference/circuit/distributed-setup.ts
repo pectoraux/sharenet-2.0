@@ -59,6 +59,12 @@ import {
 export const CIRCUIT_SETUP_DOMAIN = "SHARENET/CIRCUIT/SETUP/1";
 export const CIRCUIT_ACK_DOMAIN = "SHARENET/CIRCUIT/ACK/1";
 
+/** Circuit forwarding lifecycle states. */
+export type ForwardingLifecycle = "INSTALLED" | "ACTIVE" | "EXPIRED" | "CLOSED";
+
+/** Circuit expiry in seconds (1 hour). */
+export const CIRCUIT_EXPIRY_SECONDS = 3600;
+
 // -----------------------------------------------------------------------
 // CircuitSetupRequest (Initiator → Relay)
 // -----------------------------------------------------------------------
@@ -102,28 +108,58 @@ export function circuitSetupSigningPayload(req: CircuitSetupRequest): Uint8Array
 export interface CircuitSetupAck {
   /** The route ID this ack is for. */
   routeId: string;
+  /** BLAKE3-256 of the canonical BrandedCommittedRoute (route commitment binding). */
+  routeCommitmentDigestHex: string;
   /** Which hop this relay occupies. */
   hopIndex: number;
   /** The relay's ephemeral X25519 public key. */
   relayX25519PublicKey: Uint8Array;
-  /** The relay's Ed25519 signature proving possession + route binding. */
+  /** The initiator's X25519 public key (transcript binding). */
+  initiatorX25519PublicKey: Uint8Array;
+  /** The relay's Ed25519 signature proving possession + route binding + transcript binding. */
   relaySignature: Uint8Array;
   /** Fresh nonce for replay protection (16 bytes). */
   ackNonce: Uint8Array;
+  /** Ack creation timestamp (unix seconds). */
+  ackTimestamp: number;
+  /** Ack expiry (unix seconds). */
+  ackExpiry: number;
 }
 
-/** Compute the signing payload for a circuit setup ack. */
+/**
+ * Compute the signing payload for a circuit setup ack.
+ *
+ * Per R-008H: the ack binds:
+ *   - routeId (route identity)
+ *   - routeCommitmentDigest (cryptographic binding to the exact committed route)
+ *   - hopIndex (which hop this relay occupies)
+ *   - relayX25519PublicKey (the relay's ephemeral key for this circuit)
+ *   - initiatorX25519PublicKey (transcript binding — the initiator's key for this circuit)
+ *   - ackNonce (fresh per-ack nonce for replay protection)
+ *   - ackTimestamp (when the ack was created)
+ *   - ackExpiry (when the ack expires)
+ *
+ * Mutating ANY of these fields invalidates the signature.
+ */
 export function circuitAckSigningPayload(
   routeId: string,
+  routeCommitmentDigestHex: string,
   hopIndex: number,
   relayX25519PublicKey: Uint8Array,
+  initiatorX25519PublicKey: Uint8Array,
   ackNonce: Uint8Array,
+  ackTimestamp: number,
+  ackExpiry: number,
 ): Uint8Array {
   const m = new Map<number, unknown>([
     [1, routeId],
-    [2, hopIndex],
-    [3, relayX25519PublicKey],
-    [4, ackNonce],
+    [2, routeCommitmentDigestHex],
+    [3, hopIndex],
+    [4, relayX25519PublicKey],
+    [5, initiatorX25519PublicKey],
+    [6, ackNonce],
+    [7, ackTimestamp],
+    [8, ackExpiry],
   ]);
   const body = canonicalEncode(m);
   const domain = new TextEncoder().encode(CIRCUIT_ACK_DOMAIN);
@@ -131,6 +167,20 @@ export function circuitAckSigningPayload(
   out.set(domain, 0);
   out.set(body, domain.length);
   return out;
+}
+
+/** Compute the route commitment digest (BLAKE3-256 of routeId + hops + expiry + initiator). */
+export function routeCommitmentDigest(route: BrandedCommittedRoute): Uint8Array {
+  const m = new Map<number, unknown>([
+    [1, route.routeId],
+    [2, route.hops.map((h) => h.nodeId)],
+    [3, route.hops.map((h) => h.capability)],
+    [4, route.hops.map((h) => h.endpoint)],
+    [5, route.expiry],
+    [6, route.initiatorNodeId],
+    [7, route.agreementDigest],
+  ]);
+  return blake3(canonicalEncode(m), { dkLen: 32 });
 }
 
 // -----------------------------------------------------------------------
@@ -143,20 +193,26 @@ export interface RelaySetupState {
   relayX25519PublicKey: Uint8Array;
   forwardingKey: Uint8Array;
   returnKey: Uint8Array;
-  installed: boolean;
+  lifecycle: ForwardingLifecycle;
+  installedAt: number;
+  expiresAt: number;
+  /** The ack nonce (for replay detection at the relay). */
+  ackNonce: Uint8Array;
 }
 
 /**
  * Handle a CircuitSetupRequest as a relay.
  *
- * Per R-008: the relay MUST:
+ * Per R-008H: the relay MUST:
  *   1. Verify the route is a genuine BrandedCommittedRoute (WeakSet check)
  *   2. Verify it occupies the specified hopIndex in the route
  *   3. Generate an ephemeral X25519 keypair
  *   4. Compute the shared secret with the initiator's X25519 public key
  *   5. Derive forwarding + return keys via HKDF
- *   6. Sign a possession proof (CIRCUIT_ACK_DOMAIN over routeId + hopIndex + relay_pubkey + nonce)
- *   7. Install forwarding state (ready to decrypt/encrypt traffic)
+ *   6. Compute routeCommitmentDigest (binds ack to the exact committed route)
+ *   7. Sign a possession proof binding: routeId + routeCommitmentDigest +
+ *      hopIndex + relay_pubkey + initiator_pubkey + nonce + timestamp + expiry
+ *   8. Install forwarding state with lifecycle = INSTALLED
  *
  * Returns the ack + the installed relay state.
  */
@@ -164,6 +220,7 @@ export function handleCircuitSetup(
   req: CircuitSetupRequest,
   relayEd25519SecretKey: Uint8Array,
   circuitIdBytes: Uint8Array,
+  now: number = Math.floor(Date.now() / 1000),
 ): { ok: true; ack: CircuitSetupAck; state: RelaySetupState } | { ok: false; reason: string } {
   // 1. Verify the route is genuine
   if (!isBrandedCommittedRoute(req.route)) {
@@ -185,29 +242,43 @@ export function handleCircuitSetup(
   // 5. Derive forwarding + return keys
   const keys = deriveHopKeys(sharedSecret, req.hopIndex, circuitIdBytes);
 
-  // 6. Sign possession proof
+  // 6. Compute route commitment digest
+  const commitDigest = routeCommitmentDigest(req.route);
+  const commitDigestHex = toHex(commitDigest);
+
+  // 7. Sign possession proof (binds route + hop + keys + transcript)
   const ackNonce = randomBytes(16);
+  const ackExpiry = now + CIRCUIT_EXPIRY_SECONDS;
   const payload = circuitAckSigningPayload(
-    req.route.routeId, req.hopIndex, relayX25519PublicKey, ackNonce,
+    req.route.routeId, commitDigestHex, req.hopIndex,
+    relayX25519PublicKey, req.initiatorX25519PublicKey,
+    ackNonce, now, ackExpiry,
   );
   const relaySignature = signMessage(relayEd25519SecretKey, payload);
 
-  // 7. Install forwarding state
+  // 8. Install forwarding state
   const state: RelaySetupState = {
     hopIndex: req.hopIndex,
     relayX25519SecretKey,
     relayX25519PublicKey,
     forwardingKey: keys.forwardingKey,
     returnKey: keys.returnKey,
-    installed: true,
+    lifecycle: "INSTALLED",
+    installedAt: now,
+    expiresAt: ackExpiry,
+    ackNonce,
   };
 
   const ack: CircuitSetupAck = {
     routeId: req.route.routeId,
+    routeCommitmentDigestHex: commitDigestHex,
     hopIndex: req.hopIndex,
     relayX25519PublicKey,
+    initiatorX25519PublicKey: req.initiatorX25519PublicKey,
     relaySignature,
     ackNonce,
+    ackTimestamp: now,
+    ackExpiry,
   };
 
   return { ok: true, ack, state };
@@ -232,33 +303,53 @@ export function handleCircuitSetup(
 export function processCircuitSetupAck(
   ack: CircuitSetupAck,
   expectedRouteId: string,
+  expectedRouteCommitmentDigestHex: string,
   expectedHopIndex: number,
+  expectedInitiatorX25519PublicKey: Uint8Array,
   relayEd25519PublicKey: Uint8Array,
   initiatorX25519SecretKey: Uint8Array,
   circuitIdBytes: Uint8Array,
+  now: number = Math.floor(Date.now() / 1000),
 ): { ok: true; hopKey: HopKeyMaterial } | { ok: false; reason: string } {
   // 1. Verify routeId matches
   if (ack.routeId !== expectedRouteId) {
     return { ok: false, reason: `routeId mismatch: expected ${expectedRouteId}, got ${ack.routeId}` };
   }
 
-  // 2. Verify hopIndex matches
+  // 2. Verify routeCommitmentDigest matches (R-008H: binds to exact committed route)
+  if (ack.routeCommitmentDigestHex !== expectedRouteCommitmentDigestHex) {
+    return { ok: false, reason: `routeCommitmentDigest mismatch: expected ${expectedRouteCommitmentDigestHex.slice(0, 16)}..., got ${ack.routeCommitmentDigestHex.slice(0, 16)}...` };
+  }
+
+  // 3. Verify hopIndex matches
   if (ack.hopIndex !== expectedHopIndex) {
     return { ok: false, reason: `hopIndex mismatch: expected ${expectedHopIndex}, got ${ack.hopIndex}` };
   }
 
-  // 3. Verify relay signature
+  // 4. Verify initiator X25519 pubkey matches (transcript binding)
+  if (!bytesEqual(ack.initiatorX25519PublicKey, expectedInitiatorX25519PublicKey)) {
+    return { ok: false, reason: `initiator X25519 pubkey mismatch (transcript binding)` };
+  }
+
+  // 5. Verify ack expiry (R-008H: lifecycle)
+  if (ack.ackExpiry <= now) {
+    return { ok: false, reason: `ack ${expectedHopIndex} expired (expiry ${ack.ackExpiry} <= now ${now})` };
+  }
+
+  // 6. Verify relay signature (binds routeId + digest + hopIndex + keys + nonce + timestamps)
   const payload = circuitAckSigningPayload(
-    ack.routeId, ack.hopIndex, ack.relayX25519PublicKey, ack.ackNonce,
+    ack.routeId, ack.routeCommitmentDigestHex, ack.hopIndex,
+    ack.relayX25519PublicKey, ack.initiatorX25519PublicKey,
+    ack.ackNonce, ack.ackTimestamp, ack.ackExpiry,
   );
   if (!verifySignature(relayEd25519PublicKey, payload, ack.relaySignature)) {
     return { ok: false, reason: `relay ${expectedHopIndex} signature invalid` };
   }
 
-  // 4. Compute shared secret
+  // 7. Compute shared secret
   const sharedSecret = x25519.getSharedSecret(initiatorX25519SecretKey, ack.relayX25519PublicKey);
 
-  // 5. Derive keys
+  // 8. Derive keys
   const keys = deriveHopKeys(sharedSecret, expectedHopIndex, circuitIdBytes);
 
   return {
@@ -271,6 +362,14 @@ export function processCircuitSetupAck(
       relayX25519PublicKey: ack.relayX25519PublicKey,
     },
   };
+}
+
+/** Constant-time byte equality. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
 }
 
 // -----------------------------------------------------------------------
@@ -307,10 +406,11 @@ export function establishDistributedCircuit(
     return { ok: false, reason: `expected ${route.hops.length} acks, got ${acks.length}` };
   }
 
-  // 3. Compute circuit ID
+  // 3. Compute circuit ID + route commitment digest
   const circuitId = deriveCircuitId(route.routeId, initiatorX25519PublicKey);
   const circuitIdHex = toHex(circuitId);
   const routeIdPrefix = parseInt(route.routeId.slice(0, 8), 16);
+  const commitDigestHex = toHex(routeCommitmentDigest(route));
 
   // 4. Process each ack
   const hopKeys: HopKeyMaterial[] = [];
@@ -324,10 +424,12 @@ export function establishDistributedCircuit(
       return { ok: false, reason: `no Ed25519 public key for relay ${i} (${hop.nodeId})` };
     }
 
-    // Process the ack
+    // Process the ack (with full binding verification)
     const result = processCircuitSetupAck(
-      ack, route.routeId, i, relayEd25519PubKey,
-      initiatorX25519SecretKey, circuitId,
+      ack, route.routeId, commitDigestHex, i,
+      initiatorX25519PublicKey,
+      relayEd25519PubKey,
+      initiatorX25519SecretKey, circuitId, now,
     );
     if (!result.ok) {
       return { ok: false, reason: result.reason };
