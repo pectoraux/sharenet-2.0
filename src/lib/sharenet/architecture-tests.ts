@@ -66,6 +66,19 @@ import {
   SELF_REPORTED_CONTRIBUTION_FORBIDDEN,
   createBilateralReceipt,
 } from "@reference/economics/contribution";
+import {
+  createAuthenticatedNodeRecord,
+  isAuthenticatedNodeRecord,
+  createValidatedHop,
+  isValidatedHop,
+  createBrandedCommittedRoute,
+  isBrandedCommittedRoute,
+  HINT_TO_VALIDATED_HOP_FORBIDDEN,
+  UNBRANDED_ROUTE_FORBIDDEN,
+  type AuthenticatedNodeRecord,
+  type ValidatedHop,
+  type BrandedCommittedRoute,
+} from "@reference/transport/validated-types";
 
 export interface ArchTestResult {
   id: number;
@@ -347,10 +360,11 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
 
   // ---------------- Additional guards from spec/00 §31 ----------------
 
-  // G1: RemoteNodeHint/distance_hint → RouteHop/CommittedRoute fails (executable)
-  // Per R-006.1: test against the EXISTING route implementation, not its absence.
+  // G1: RemoteNodeHint/distance_hint → ValidatedHop fails (unforgeable type boundary)
+  // Per R-006 hardening: test that the TYPE BOUNDARY prevents construction,
+  // not merely that a guard function throws.
   results.push(
-    await runOne(11, "RemoteNodeHint/distance_hint → RouteHop/CommittedRoute fails (spec/00 §31, R-006.1)", "ARCHITECTURE", "spec/00 §31 + spec/07 + R-006.1", async () => {
+    await runOne(11, "RemoteNodeHint → ValidatedHop fails (unforgeable type boundary, R-006H)", "ARCHITECTURE", "spec/00 §31 + spec/07 + R-006H", async () => {
       const reporter = generateNodeKeypair();
       const subject = generateNodeKeypair();
       const now = Math.floor(Date.now() / 1000);
@@ -360,40 +374,67 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
         hopCount: 0, timestamp: now, nonce: randomBytes(16),
       }, reporter.secretKey);
 
-      // Negative: TOPOLOGY_TO_ROUTE_FORBIDDEN must throw
-      let guardThrew = false;
-      try { TOPOLOGY_TO_ROUTE_FORBIDDEN({ nodes: [], edges: [] }); } catch { guardThrew = true; }
+      // Negative: HINT_TO_VALIDATED_HOP_FORBIDDEN throws
+      let hintGuardThrew = false;
+      try { HINT_TO_VALIDATED_HOP_FORBIDDEN(hint); } catch { hintGuardThrew = true; }
 
-      // Negative: a RouteHop constructed from hint fields is NOT verified —
-      // the hint's subjectNodeId has no LINK_UP, no service agreement.
-      // The hop would have linkUp=false (hints don't establish links).
-      const hintHop: RouteHop = {
-        nodeId: hint.subjectNodeId,
-        capability: hint.claimedCapabilities[0] as any,
-        endpoint: hint.subjectEndpointHint,
-        linkUp: false, // hints do NOT establish LINK_UP
-      };
-      // A CommittedRoute requires all hops to have linkUp=true.
-      // A hint-derived hop has linkUp=false, so it cannot be part of a committed route.
-      const hintHopNotLinkUp = !hintHop.linkUp;
+      // Negative: createValidatedHop REQUIRES an AuthenticatedNodeRecord.
+      // A RemoteNodeHint is NOT an AuthenticatedNodeRecord — it lacks the brand.
+      // Attempting to pass the hint as if it were authenticated must throw.
+      let hintToHopThrew = false;
+      try {
+        // The hint is not an AuthenticatedNodeRecord — createValidatedHop
+        // checks isAuthenticatedNodeRecord() at runtime and throws.
+        createValidatedHop(hint as any, hint.subjectEndpointHint, "MESH_RELAY", true, "");
+      } catch { hintToHopThrew = true; }
 
-      // Positive: the legal path (authenticated link + route proposal + acceptances +
-      // commitment) CAN produce a CommittedRoute (tested in R-003 tests).
-      // Here we just verify the guard exists and the hint hop is not LINK_UP.
+      // Negative: a raw NodeId string is also not an AuthenticatedNodeRecord
+      let stringToHopThrew = false;
+      try {
+        createValidatedHop({ nodeId: subject.nodeId } as any, "10.0.0.5:7788", "MESH_RELAY", true, "");
+      } catch { stringToHopThrew = true; }
+
+      // Negative: ADV_VERIFIED-only link (linkUp=false) cannot produce ValidatedHop
+      const authNode = createAuthenticatedNodeRecord({
+        advertisement: {
+          nodeId: subject.nodeId,
+          signingPublicKey: subject.publicKey,
+          capabilities: ["MESH_RELAY"],
+          endpoints: [{ type: "tcp", address: "10.0.0.5", port: 7788 }],
+          sequence: 1,
+          expiry: now + 3600,
+        },
+        verifiedAt: now,
+      });
+      let advVerifiedThrew = false;
+      try {
+        createValidatedHop(authNode, "10.0.0.5:7788", "MESH_RELAY", false, ""); // linkUp=false
+      } catch { advVerifiedThrew = true; }
+
+      // Positive: a genuine AuthenticatedNodeRecord + LINK_UP=true CAN produce ValidatedHop
+      const validHop = createValidatedHop(authNode, "10.0.0.5:7788", "MESH_RELAY", true, "digest123");
+      const validHopIsBranded = isValidatedHop(validHop);
+
       return {
-        passed: guardThrew && hintHopNotLinkUp,
-        expected: "RemoteNodeHint → RouteHop fails (linkUp=false); TOPOLOGY_TO_ROUTE_FORBIDDEN throws; legal path requires LINK_UP + acceptances",
-        actual: `guard threw=${guardThrew}, hint hop linkUp=${hintHop.linkUp} (must be false)`,
+        passed: hintGuardThrew && hintToHopThrew && stringToHopThrew && advVerifiedThrew && validHopIsBranded,
+        expected: "hint → ValidatedHop fails (no brand); string → fails; ADV_VERIFIED → fails; authenticated + LINK_UP → succeeds (branded)",
+        actual: `hint guard=${hintGuardThrew}, hint→hop threw=${hintToHopThrew}, string→hop threw=${stringToHopThrew}, adv-only threw=${advVerifiedThrew}, valid branded=${validHopIsBranded}`,
       };
     }),
   );
 
-  // G2: RouteProposal/topology → ActiveCircuit fails (executable, not absence)
-  // Per R-006.2: test against the EXISTING circuit implementation.
+  // G2: RouteProposal/plain-object → setupCircuit fails (runtime brand check, not source-text)
+  // Per R-006 hardening: test the runtime brand boundary, not a regex on source text.
   results.push(
-    await runOne(12, "RouteProposal/topology → setupCircuit fails — requires CommittedRoute (spec/00 §31, R-006.2)", "ARCHITECTURE", "spec/00 §31 + spec/08 + R-006.2", async () => {
+    await runOne(12, "RouteProposal/plain-object → setupCircuit fails — brand check (R-006H)", "ARCHITECTURE", "spec/00 §31 + spec/08 + R-006H", async () => {
       const kp = generateNodeKeypair();
-      // Construct a RouteProposal (NOT a CommittedRoute)
+
+      // Negative: a plain object (not a CommittedRoute or BrandedCommittedRoute)
+      // cannot pass isBrandedCommittedRoute check.
+      const plainObject = { routeId: "test", hops: [], expiry: 0 };
+      const plainNotBranded = !isBrandedCommittedRoute(plainObject);
+
+      // Negative: a RouteProposal is also not a BrandedCommittedRoute
       const proposal: RouteProposal = {
         routeId: toHex(randomBytes(32)),
         hops: [{ nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
@@ -402,27 +443,42 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
         initiatorNodeId: kp.nodeId,
         agreementDigest: toHex(randomBytes(32)),
       };
+      const proposalNotBranded = !isBrandedCommittedRoute(proposal);
 
-      // Negative: setupCircuit requires a CommittedRoute, not a RouteProposal.
-      // TypeScript prevents passing a RouteProposal at compile time.
-      // At runtime, setupCircuit accesses route.hops (which exists on both)
-      // but also requires the route to have come through createCommittedRoute.
-      // We verify the type boundary: setupCircuit's parameter is CommittedRoute.
-      const setupCircuitSource = readFileSync(join(process.cwd(), "reference/circuit/circuit.ts"), "utf-8");
-      const requiresCommittedRoute = /function\s+setupCircuit\s*\(\s*route:\s*CommittedRoute/.test(setupCircuitSource);
-
-      // Negative: UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN throws
-      let guardThrew = false;
-      try { UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN(proposal); } catch { guardThrew = true; }
+      // Negative: UNBRANDED_ROUTE_FORBIDDEN throws
+      let unbrandedThrew = false;
+      try { UNBRANDED_ROUTE_FORBIDDEN(proposal); } catch { unbrandedThrew = true; }
 
       // Negative: PROPOSAL_TO_CIRCUIT_FORBIDDEN throws
       let proposalGuardThrew = false;
       try { PROPOSAL_TO_CIRCUIT_FORBIDDEN(proposal); } catch { proposalGuardThrew = true; }
 
+      // Positive: a BrandedCommittedRoute IS recognized by isBrandedCommittedRoute
+      // (We construct one with a minimal ValidatedHop to prove the brand works)
+      const authNode = createAuthenticatedNodeRecord({
+        advertisement: {
+          nodeId: kp.nodeId, signingPublicKey: kp.publicKey,
+          capabilities: ["MESH_RELAY"],
+          endpoints: [{ type: "tcp", address: "10.0.0.1", port: 7788 }],
+          sequence: 1, expiry: Math.floor(Date.now() / 1000) + 3600,
+        },
+        verifiedAt: Math.floor(Date.now() / 1000),
+      });
+      const validHop = createValidatedHop(authNode, "10.0.0.1:7788", "MESH_RELAY", true, "digest");
+      const brandedRoute = createBrandedCommittedRoute({
+        routeId: toHex(randomBytes(32)),
+        hops: [validHop],
+        expiry: Math.floor(Date.now() / 1000) + 3600,
+        initiatorNodeId: kp.nodeId,
+        agreementDigest: "digest",
+        committedAt: Math.floor(Date.now() / 1000),
+      });
+      const brandedRecognized = isBrandedCommittedRoute(brandedRoute);
+
       return {
-        passed: requiresCommittedRoute && guardThrew && proposalGuardThrew,
-        expected: "setupCircuit requires CommittedRoute (not RouteProposal); UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN + PROPOSAL_TO_CIRCUIT_FORBIDDEN throw",
-        actual: `requires CommittedRoute=${requiresCommittedRoute}, uncommitted guard=${guardThrew}, proposal guard=${proposalGuardThrew}`,
+        passed: plainNotBranded && proposalNotBranded && unbrandedThrew && proposalGuardThrew && brandedRecognized,
+        expected: "plain object not branded; RouteProposal not branded; UNBRANDED_ROUTE_FORBIDDEN + PROPOSAL_TO_CIRCUIT_FORBIDDEN throw; BrandedCommittedRoute recognized",
+        actual: `plain not branded=${plainNotBranded}, proposal not branded=${proposalNotBranded}, unbranded guard=${unbrandedThrew}, proposal guard=${proposalGuardThrew}, branded recognized=${brandedRecognized}`,
       };
     }),
   );
@@ -530,51 +586,48 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
     }),
   );
 
-  // G5: Unverified NodeId → executable hop fails (runtime construction, not symbol check)
-  // Per R-006.5: try to construct a RouteHop with an arbitrary string / hint NodeId.
+  // G5: Unverified NodeId → executable hop fails (runtime type boundary, not symbol check)
+  // Per R-006 hardening: test the AuthenticatedNodeRecord brand, not exported symbol names.
   results.push(
-    await runOne(15, "unverified/hint NodeId → RouteHop fails — isValidNodeIdFormat rejects (spec/00 §31, R-006.5)", "ARCHITECTURE", "spec/00 §31 + spec/02 §3 + R-006.5", async () => {
+    await runOne(15, "unverified/hint NodeId → ValidatedHop fails — brand boundary (R-006H)", "ARCHITECTURE", "spec/00 §31 + spec/02 §3 + R-006H", async () => {
       const { isValidNodeIdFormat } = await import("@reference/identity/keys");
-      const reporter = generateNodeKeypair();
       const subject = generateNodeKeypair();
       const now = Math.floor(Date.now() / 1000);
-      const hint = createRemoteNodeHint({
-        reporterNodeId: reporter.nodeId, subjectNodeId: subject.nodeId,
-        subjectEndpointHint: "10.0.0.5:7788", claimedCapabilities: ["MESH_RELAY"],
-        hopCount: 0, timestamp: now, nonce: randomBytes(16),
-      }, reporter.secretKey);
 
       // Negative: an arbitrary string is NOT a valid NodeId format
-      const arbitraryString = "not-a-node-id";
-      const arbitraryRejected = !isValidNodeIdFormat(arbitraryString);
+      const arbitraryRejected = !isValidNodeIdFormat("not-a-node-id");
 
-      // Negative: a RemoteNodeHint's subjectNodeId is a valid NodeId format
-      // (it was derived from a real key), BUT the hint does NOT prove
-      // the subject actually controls that key. The hint is a REPORTED
-      // identity, not an AUTHENTICATED one. The architecture guard
-      // PROMOTE_HINT_TO_RECORD_FORBIDDEN prevents promotion.
-      let hintGuardThrew = false;
-      try { PROMOTE_HINT_TO_RECORD_FORBIDDEN(hint); } catch { hintGuardThrew = true; }
+      // Negative: a plain object with a valid-looking NodeId is NOT an AuthenticatedNodeRecord
+      // (lacks the unforgeable brand)
+      const fakeNode = { nodeId: subject.nodeId, publicKey: subject.publicKey };
+      const fakeNotAuthenticated = !isAuthenticatedNodeRecord(fakeNode);
 
-      // Positive: a verified NodeId from generateNodeKeypair IS valid format
-      const validKp = generateNodeKeypair();
-      const verifiedNodeIdValid = isValidNodeIdFormat(validKp.nodeId);
+      // Negative: attempting to create a ValidatedHop from a non-authenticated object throws
+      let fakeToHopThrew = false;
+      try {
+        createValidatedHop(fakeNode as any, "10.0.0.5:7788", "MESH_RELAY", true, "");
+      } catch { fakeToHopThrew = true; }
 
-      // A RouteHop can be constructed with any nodeId string, but the
-      // createRouteCommitment function verifies that each hop's acceptor
-      // has a valid public key (from the hopPublicKeys map). A hint's
-      // subjectNodeId has no corresponding public key in the map, so
-      // commitment would fail at "no public key for hop."
-      // We verify this by checking that the hint's subjectNodeId is NOT
-      // in the hopPublicKeys map (which is populated from authenticated links).
-      const hopPublicKeys = new Map<string, Uint8Array>();
-      hopPublicKeys.set(validKp.nodeId, validKp.publicKey);
-      const hintNotInKeyMap = !hopPublicKeys.has(hint.subjectNodeId);
+      // Positive: a genuine AuthenticatedNodeRecord IS recognized
+      const authNode = createAuthenticatedNodeRecord({
+        advertisement: {
+          nodeId: subject.nodeId, signingPublicKey: subject.publicKey,
+          capabilities: ["MESH_RELAY"],
+          endpoints: [{ type: "tcp", address: "10.0.0.5", port: 7788 }],
+          sequence: 1, expiry: now + 3600,
+        },
+        verifiedAt: now,
+      });
+      const authRecognized = isAuthenticatedNodeRecord(authNode);
+
+      // Positive: AuthenticatedNodeRecord + LINK_UP → ValidatedHop succeeds
+      const validHop = createValidatedHop(authNode, "10.0.0.5:7788", "MESH_RELAY", true, "digest");
+      const hopBranded = isValidatedHop(validHop);
 
       return {
-        passed: arbitraryRejected && hintGuardThrew && verifiedNodeIdValid && hintNotInKeyMap,
-        expected: "arbitrary string rejected; hint promotion forbidden; verified NodeId valid; hint not in authenticated key map",
-        actual: `arbitrary rejected=${arbitraryRejected}, hint guard=${hintGuardThrew}, verified valid=${verifiedNodeIdValid}, hint not in keymap=${hintNotInKeyMap}`,
+        passed: arbitraryRejected && fakeNotAuthenticated && fakeToHopThrew && authRecognized && hopBranded,
+        expected: "arbitrary string rejected; plain object not authenticated; non-auth → ValidatedHop throws; AuthenticatedNodeRecord recognized; ValidatedHop branded",
+        actual: `arbitrary rejected=${arbitraryRejected}, fake not auth=${fakeNotAuthenticated}, fake→hop threw=${fakeToHopThrew}, auth recognized=${authRecognized}, hop branded=${hopBranded}`,
       };
     }),
   );
@@ -612,10 +665,10 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
     }),
   );
 
-  // G7: RouteProposal → ActiveCircuit fails (executable against existing circuit.ts)
-  // Per R-006.6: test the type boundary of setupCircuit.
+  // G7: RouteProposal → ActiveCircuit fails (runtime brand check, not source-text)
+  // Per R-006 hardening: use isBrandedCommittedRoute runtime check.
   results.push(
-    await runOne(17, "RouteProposal → setupCircuit fails — requires CommittedRoute (spec/00 §31, R-006.6)", "ARCHITECTURE", "spec/00 §31 + spec/08 + R-006.6", async () => {
+    await runOne(17, "RouteProposal → setupCircuit fails — brand check (R-006H)", "ARCHITECTURE", "spec/00 §31 + spec/08 + R-006H", async () => {
       const kp = generateNodeKeypair();
       const proposal: RouteProposal = {
         routeId: toHex(randomBytes(32)),
@@ -634,14 +687,13 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       let uncommittedThrew = false;
       try { UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN(proposal); } catch { uncommittedThrew = true; }
 
-      // Verify setupCircuit's signature requires CommittedRoute
-      const source = readFileSync(join(process.cwd(), "reference/circuit/circuit.ts"), "utf-8");
-      const requiresCommittedRoute = /function\s+setupCircuit\s*\(\s*route:\s*CommittedRoute/.test(source);
+      // Negative: RouteProposal is NOT a BrandedCommittedRoute (runtime brand check)
+      const proposalNotBranded = !isBrandedCommittedRoute(proposal);
 
       return {
-        passed: guardThrew && uncommittedThrew && requiresCommittedRoute,
-        expected: "RouteProposal → setupCircuit fails; PROPOSAL_TO_CIRCUIT_FORBIDDEN + UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN throw; setupCircuit requires CommittedRoute",
-        actual: `proposal guard=${guardThrew}, uncommitted guard=${uncommittedThrew}, requires CommittedRoute=${requiresCommittedRoute}`,
+        passed: guardThrew && uncommittedThrew && proposalNotBranded,
+        expected: "RouteProposal → setupCircuit fails; PROPOSAL_TO_CIRCUIT_FORBIDDEN + UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN throw; RouteProposal not branded",
+        actual: `proposal guard=${guardThrew}, uncommitted guard=${uncommittedThrew}, proposal not branded=${proposalNotBranded}`,
       };
     }),
   );

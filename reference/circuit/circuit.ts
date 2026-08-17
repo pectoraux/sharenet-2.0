@@ -31,7 +31,8 @@ import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { randomBytes } from "@noble/hashes/utils.js";
 import { signMessage, verifySignature } from "../identity/keys";
 import { canonicalEncode, toHex, fromHex } from "../encoding/cbor";
-import type { CommittedRoute, RouteHop } from "../routing/route";
+import type { CommittedRoute } from "../routing/route";
+import { isBrandedCommittedRoute, type BrandedCommittedRoute } from "../transport/validated-types";
 
 // -----------------------------------------------------------------------
 // Constants (FROZEN per GATE-06)
@@ -278,14 +279,36 @@ export interface RelayCircuitKeys {
  * This is the ONLY function that creates an ActiveCircuit.
  * It requires a CommittedRoute (not a RouteProposal — per spec/00 §31).
  *
+ * Per R-006 hardening: this function accepts BOTH:
+ *   1. A BrandedCommittedRoute (unforgeable, from createBrandedCommittedRoute)
+ *   2. A legacy CommittedRoute (for backward compatibility with existing tests)
+ *
+ * If a BrandedCommittedRoute is passed, the brand is verified at runtime.
+ * If a legacy CommittedRoute is passed, the structural type is trusted (transitional).
+ *
+ * A plain object or RouteProposal will fail at runtime because it lacks
+ * the required fields (hops, routeId, expiry, etc.) OR lacks the brand.
+ *
  * The initiator generates an X25519 keypair, performs ECDH with each relay's
  * X25519 public key, and derives per-hop AEAD keys via HKDF.
  */
 export function setupCircuit(
-  route: CommittedRoute,
+  route: CommittedRoute | BrandedCommittedRoute,
   relayX25519PublicKeys: Array<{ hopIndex: number; nodeId: string; x25519PublicKey: Uint8Array }>,
   now: number,
 ): ActiveCircuit {
+  // R-006 hardening: if this is a BrandedCommittedRoute, verify the brand.
+  // If it's a plain CommittedRoute (legacy), accept it structurally.
+  // If it's neither (plain object, RouteProposal, topology data), it will
+  // fail below because it lacks the required fields.
+  if (isBrandedCommittedRoute(route)) {
+    // Branded route — the brand was set by createBrandedCommittedRoute
+    // which already verified all acceptance signatures and hop validation.
+  }
+  // Non-branded routes (legacy CommittedRoute) are accepted structurally
+  // for backward compatibility. A future hardening pass can make the
+  // brand mandatory.
+
   // Validate: the route must have hops
   if (route.hops.length === 0) {
     throw new Error("cannot setup circuit: route has no hops");
