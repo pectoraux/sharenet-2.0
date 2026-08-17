@@ -664,3 +664,43 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-002 is now FULLY CLOSED: there is exactly one semantic meaning of LINK_UP — a genuine AuthenticatedLink proof exists. The state machine cannot be walked to LINK_UP by supplying state names; each transition requires a genuine WeakSet-registered proof artifact. The cryptographic handshake (v4) + the state machine enforcement (v5) together close R-002 completely.
+
+---
+Task ID: R-002-P1-hardening-v6 (final evidence-provenance closure)
+Agent: main (Z.ai Code)
+Task: Close the final two evidence-provenance gaps: (1) state-machine challenge binding — advanceToProofOfPossession must verify the consumed challenge matches the challenge issued by advanceToHandshakeChallenge; (2) freshness-verifier provenance — VerifiedTranscript must record which local verifier consumed the challenge, and createAuthenticatedLink must require the transcript's verifier is the local node.
+
+Work Log:
+- Fixed state-machine challenge binding in `reference/transport/link-auth-state.ts`:
+  - Added `private issuedChallenge: Uint8Array | null` field to `LinkAuthStateMachine`.
+  - `advanceToHandshakeChallenge(challenge)`: now stores the challenge as `this.issuedChallenge`.
+  - `advanceToProofOfPossession(consumedChallenge)`: now verifies `constantTimeEqual(consumedChallenge.challenge, this.issuedChallenge)` — a genuine but unrelated ConsumedChallenge (for a different challenge) is rejected. Throws "does not match the challenge issued by this state machine".
+  - Added `constantTimeEqual()` helper to the module.
+
+- Added freshness-verifier provenance to `reference/transport/authenticated-link.ts`:
+  - `VerifiedTranscript` interface now includes `freshnessVerifierNodeId: string` and `consumedChallenge: ConsumedChallenge` — the transcript is DIRECTIONAL (A's VerifiedTranscript ≠ B's).
+  - `createVerifiedTranscript` now takes a `freshnessVerifierNodeId` parameter. Verifies it's a handshake participant (initiator or responder) before registering the artifact.
+  - `createAuthenticatedLink` now enforces `verifiedTranscript.freshnessVerifierNodeId === localNodeId` — a transcript verified by A cannot be used to create B's link. Throws "freshness verifier does not match".
+
+- Updated `tests/helpers/branded-route-helper.ts`: `runHandshake` passes `freshnessVerifierNodeId: initiatorKp.nodeId` (the initiator consumed the challenge).
+
+- Updated `tests/r002p1-authenticated-link.test.ts`:
+  - All `createVerifiedTranscript` calls now pass `freshnessVerifierNodeId`.
+  - Added `buildVerifiedTranscriptB` helper for responder-side transcripts (freshnessVerifierNodeId = kpB.nodeId).
+  - New `describe("R-002-P1 v6: Freshness-verifier provenance")` block (3 tests):
+    - transcript verified by A used to create B's link → REJECT
+    - transcript verified by A used to create A's link → ACCEPT
+    - freshnessVerifierNodeId not a handshake participant → REJECT
+
+- Updated `tests/r002-link-auth-attack-suite.test.ts`:
+  - State machine tests: added 2 adversarial tests:
+    - issued X + consumed Y (≠ X) → REJECT (challenge binding)
+    - issued X + consumed X → ACCEPT
+  - The "genuine full pipeline" test passes `freshnessVerifierNodeId: kpA.nodeId`.
+
+Stage Summary:
+- Tests: 275 → 280 pass, 0 fail (+5 net: 2 state-machine challenge-binding tests + 3 freshness-verifier provenance tests). 766 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-002 is now FULLY CLOSED: the state machine binds the consumed challenge to the issued challenge (no mismatch), and the VerifiedTranscript carries directional freshness-verifier provenance that createAuthenticatedLink enforces. There is exactly one semantic meaning of LINK_UP: a genuine AuthenticatedLink, verified by the local endpoint that consumed the challenge, bound to the exact issued challenge, with full cryptographic + freshness + replay + lifetime proof.

@@ -40,6 +40,14 @@ import { isVerifiedNodeAdvertisement } from "../advertisement/advertisement";
 import type { ConsumedChallenge, VerifiedTranscript, AuthenticatedLink } from "./authenticated-link";
 import { isConsumedChallenge, isVerifiedTranscript, isAuthenticatedLink } from "./authenticated-link";
 
+/** Constant-time byte comparison. */
+function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
+}
+
 // -----------------------------------------------------------------------
 // Link authentication state machine
 // -----------------------------------------------------------------------
@@ -94,6 +102,8 @@ export class LinkAuthStateMachine {
   private consumedChallenge: ConsumedChallenge | null = null;
   /** The genuine VerifiedNodeAdvertisement, set when advanceToAdVerified succeeds. */
   private verifiedAdvertisement: VerifiedNodeAdvertisement | null = null;
+  /** The challenge issued by advanceToHandshakeChallenge — bound to the consumed challenge. */
+  private issuedChallenge: Uint8Array | null = null;
 
   getState(): LinkAuthState {
     return this.state;
@@ -123,7 +133,12 @@ export class LinkAuthStateMachine {
    * Transition to HANDSHAKE_CHALLENGE.
    * Requires the raw challenge bytes (registered separately in the ChallengeCache).
    * This state records that a challenge was issued; the proof-of-possession
-   * transition consumes a ConsumedChallenge from the cache.
+   * transition MUST consume a ConsumedChallenge whose challenge bytes
+   * match this issued challenge (constant-time comparison).
+   *
+   * Per R-002-P1 hardening v6: the state machine binds the issued challenge
+   * to the consumed challenge — a genuine but unrelated ConsumedChallenge
+   * (for a different challenge) is rejected.
    */
   advanceToHandshakeChallenge(challenge: Uint8Array, now: number = Date.now()): boolean {
     // Basic structural check — the challenge is 32 bytes.
@@ -135,13 +150,20 @@ export class LinkAuthStateMachine {
           "consumed (as a ConsumedChallenge) at the PROOF_OF_POSSESSION step.",
       );
     }
-    return this.tryTransition("HANDSHAKE_CHALLENGE", "challenge issued", now);
+    if (!this.tryTransition("HANDSHAKE_CHALLENGE", "challenge issued", now)) return false;
+    // Store the issued challenge — advanceToProofOfPossession will bind to it.
+    this.issuedChallenge = challenge;
+    return true;
   }
 
   /**
    * Transition to PROOF_OF_POSSESSION.
    * Requires a genuine ConsumedChallenge (WeakSet-verified) — proves the
    * challenge was registered by the local verifier, unexpired, and single-use.
+   *
+   * Per R-002-P1 hardening v6: the consumed challenge MUST match the
+   * challenge previously issued by advanceToHandshakeChallenge. A genuine
+   * but unrelated ConsumedChallenge (for a different challenge) is rejected.
    */
   advanceToProofOfPossession(consumedChallenge: ConsumedChallenge, now: number = Date.now()): boolean {
     if (!isConsumedChallenge(consumedChallenge)) {
@@ -153,6 +175,28 @@ export class LinkAuthStateMachine {
           "unexpired, and single-use (consumed from the ChallengeCache). " +
           "A plain object or a copy cannot advance the state to " +
           "PROOF_OF_POSSESSION.",
+      );
+    }
+    // R-002-P1 hardening v6: bind the consumed challenge to the issued challenge.
+    // A genuine but unrelated ConsumedChallenge must be rejected.
+    if (this.issuedChallenge === null) {
+      throw new Error(
+        "ARCHITECTURE VIOLATION: advanceToProofOfPossession rejected — " +
+          "no challenge has been issued by this state machine. Per " +
+          "R-002-P1 hardening v6, the consumed challenge MUST match the " +
+          "challenge previously issued by advanceToHandshakeChallenge(). " +
+          "The proof-of-possession transition cannot be reached without " +
+          "first issuing a challenge.",
+      );
+    }
+    if (!constantTimeEqual(consumedChallenge.challenge, this.issuedChallenge)) {
+      throw new Error(
+        "ARCHITECTURE VIOLATION: advanceToProofOfPossession rejected — " +
+          "the consumed challenge does not match the challenge issued by " +
+          "this state machine. Per R-002-P1 hardening v6, a genuine but " +
+          "unrelated ConsumedChallenge (for a different challenge) is " +
+          "rejected. The proof-of-possession evidence must correspond to " +
+          "the exact challenge this state machine issued.",
       );
     }
     if (!this.tryTransition("PROOF_OF_POSSESSION", "proof of possession verified", now)) return false;

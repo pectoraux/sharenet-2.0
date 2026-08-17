@@ -201,6 +201,19 @@ export interface VerifiedTranscript {
   readonly initiatorNonce: Uint8Array;
   readonly responderNonce: Uint8Array;
   readonly verifiedAt: number;
+  /**
+   * Per R-002-P1 hardening v6: the NodeId of the local verifier who
+   * consumed the challenge and established freshness. This makes the
+   * transcript DIRECTIONAL — A's VerifiedTranscript ≠ B's VerifiedTranscript
+   * even though both describe the same wire handshake.
+   */
+  readonly freshnessVerifierNodeId: string;
+  /**
+   * Per R-002-P1 hardening v6: the consumed challenge that established
+   * freshness. Preserved for provenance — the transcript records which
+   * challenge was consumed and by whom.
+   */
+  readonly consumedChallenge: ConsumedChallenge;
 }
 
 /**
@@ -237,6 +250,13 @@ export function createVerifiedTranscript(params: {
   consumedChallenge: ConsumedChallenge;
   /** Trusted runtime clock (unix seconds) — NOT from untrusted protocol input. */
   now: number;
+  /**
+   * Per R-002-P1 hardening v6: the NodeId of the local verifier who
+   * consumed the challenge. Must be a participant in the handshake
+   * (either the initiator or the responder). This makes the transcript
+   * DIRECTIONAL — the verifier's NodeId is preserved in the artifact.
+   */
+  freshnessVerifierNodeId: string;
 }): VerifiedTranscript {
   // 0. Verify the ConsumedChallenge is genuine.
   if (!isConsumedChallenge(params.consumedChallenge)) {
@@ -427,6 +447,26 @@ export function createVerifiedTranscript(params: {
   //     A second call with the same ConsumedChallenge will fail at step 0b.
   transcriptConsumedChallengeRegistry.add(params.consumedChallenge);
 
+  // 11. R-002-P1 hardening v6: verify the freshnessVerifierNodeId is a
+  //     participant in the handshake (either initiator or responder).
+  //     The freshness proof is only meaningful if the verifier is one of
+  //     the two parties — a third party cannot establish freshness for
+  //     this handshake.
+  if (
+    params.freshnessVerifierNodeId !== initiatorNodeId &&
+    params.freshnessVerifierNodeId !== responderNodeId
+  ) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
+        `freshnessVerifierNodeId (${params.freshnessVerifierNodeId}) is ` +
+        `neither the initiator (${initiatorNodeId}) nor the responder ` +
+        `(${responderNodeId}) of the handshake. Per R-002-P1 hardening v6, ` +
+        "the freshness verifier MUST be a participant in the handshake — " +
+        "a third party cannot establish freshness for this bilateral " +
+        "protocol.",
+    );
+  }
+
   // All checks verified — register the genuine artifact.
   const transcript: VerifiedTranscript = {
     transcriptDigestHex: toHex(initiatorTranscriptHash),
@@ -437,6 +477,8 @@ export function createVerifiedTranscript(params: {
     initiatorNonce,
     responderNonce,
     verifiedAt: params.now,
+    freshnessVerifierNodeId: params.freshnessVerifierNodeId,
+    consumedChallenge: params.consumedChallenge,
   };
   verifiedTranscriptRegistry.add(transcript);
   return transcript;
@@ -534,6 +576,26 @@ export function createAuthenticatedLink(params: {
         `localNodeId (${params.localNodeId}) is neither the initiator ` +
         `(${initiatorNodeId}) nor the responder (${responderNodeId}) of ` +
         "the verified transcript.",
+    );
+  }
+
+  // 3b. R-002-P1 hardening v6: the transcript's freshness verifier MUST
+  //     be the local node creating this link. A transcript verified by A
+  //     cannot be used to create B's link — the freshness proof is
+  //     directional/local. This prevents the provenance gap where a
+  //     transcript's freshness evidence is silently transferred to a
+  //     different endpoint.
+  if (params.verifiedTranscript.freshnessVerifierNodeId !== params.localNodeId) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: createAuthenticatedLink rejected — " +
+        `the verified transcript's freshness verifier ` +
+        `(${params.verifiedTranscript.freshnessVerifierNodeId}) does not ` +
+        `match the local node creating this link (${params.localNodeId}). ` +
+        "Per R-002-P1 hardening v6, a transcript verified by A cannot be " +
+        "used to create B's link — the freshness proof is directional/" +
+        "local. Each endpoint must verify its own transcript (consuming " +
+        "its own challenge from its own ChallengeCache) before creating " +
+        "its own AuthenticatedLink.",
     );
   }
 

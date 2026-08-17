@@ -174,14 +174,15 @@ function runHandshake(
     cache, challengeForB, "RESPONDER", now,
   );
 
-  // Create the genuine VerifiedTranscript — v4 API: wire bytes + proofA +
-  // consumedChallenge + now (trusted runtime clock).
+  // Create the genuine VerifiedTranscript — v6 API: wire bytes + proofA +
+  // consumedChallenge + now + freshnessVerifierNodeId (the initiator).
   return createVerifiedTranscript({
     initiateBytes,
     acceptBytes,
     proofA,
     consumedChallenge,
     now,
+    freshnessVerifierNodeId: initiatorKp.nodeId,
   });
 }
 

@@ -250,6 +250,7 @@ describe("R-002A: Link authentication state machine enforcement (evidence-carryi
     const vt = createVerifiedTranscript({
       initiateBytes, acceptBytes, proofA,
       consumedChallenge: cc, now: REFERENCE_NOW,
+      freshnessVerifierNodeId: kpA.nodeId,
     });
     expect(isVerifiedTranscript(vt)).toBe(true);
 
@@ -318,6 +319,65 @@ describe("R-002A: Link authentication state machine enforcement (evidence-carryi
     expect(() => sm.advanceToProofOfPossession(fakeCc as any)).toThrow(
       /not a genuine ConsumedChallenge/i,
     );
+  });
+
+  // R-002-P1 hardening v6: state-machine challenge binding
+  test("advanceToProofOfPossession: issued X + consumed Y (≠ X) → REJECT", () => {
+    // Build a genuine handshake to get two genuine ConsumedChallenges (for different challenges)
+    const kpA = generateNodeKeypair();
+    const kpB = generateNodeKeypair();
+    const advA = signAdvertisement({
+      protocolVersion: 1, nodeId: kpA.nodeId, signingPublicKey: kpA.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.1", port: 7788 }],
+      sequence: 1, timestamp: REFERENCE_NOW, expiry: REFERENCE_NOW + 3600, nonce: randomBytes(16),
+    }, kpA.secretKey);
+    const vA = verifyAdvertisement(advA, REFERENCE_NOW);
+    if (!vA.ok) throw new Error("advA verification failed");
+
+    // Issue challenge X (via the state machine)
+    const challengeX = randomBytes(32);
+    const sm = new LinkAuthStateMachine();
+    expect(sm.advanceToAdVerified(vA.verified, REFERENCE_NOW)).toBe(true);
+    expect(sm.advanceToHandshakeChallenge(challengeX, REFERENCE_NOW)).toBe(true);
+
+    // Consume a DIFFERENT challenge Y (genuine ConsumedChallenge, but for Y ≠ X)
+    const challengeY = randomBytes(32);
+    const cache = new ChallengeCache();
+    cache.registerChallenge(challengeY, REFERENCE_NOW * 1000);
+    const ccY = consumeChallengeForTranscript(cache, challengeY, "RESPONDER", REFERENCE_NOW);
+    expect(isConsumedChallenge(ccY)).toBe(true);
+
+    // advanceToProofOfPossession must REJECT — ccY is genuine but for Y ≠ X
+    expect(() => sm.advanceToProofOfPossession(ccY, REFERENCE_NOW)).toThrow(
+      /does not match the challenge issued by this state machine/i,
+    );
+    expect(sm.getState()).toBe("HANDSHAKE_CHALLENGE"); // unchanged
+  });
+
+  test("advanceToProofOfPossession: issued X + consumed X → ACCEPT", () => {
+    const kpA = generateNodeKeypair();
+    const advA = signAdvertisement({
+      protocolVersion: 1, nodeId: kpA.nodeId, signingPublicKey: kpA.publicKey,
+      capabilities: ["MESH_RELAY"], endpoints: [{ type: "tcp", address: "10.0.0.1", port: 7788 }],
+      sequence: 1, timestamp: REFERENCE_NOW, expiry: REFERENCE_NOW + 3600, nonce: randomBytes(16),
+    }, kpA.secretKey);
+    const vA = verifyAdvertisement(advA, REFERENCE_NOW);
+    if (!vA.ok) throw new Error("advA verification failed");
+
+    const challengeX = randomBytes(32);
+    const sm = new LinkAuthStateMachine();
+    expect(sm.advanceToAdVerified(vA.verified, REFERENCE_NOW)).toBe(true);
+    expect(sm.advanceToHandshakeChallenge(challengeX, REFERENCE_NOW)).toBe(true);
+
+    // Consume the SAME challenge X
+    const cache = new ChallengeCache();
+    cache.registerChallenge(challengeX, REFERENCE_NOW * 1000);
+    const ccX = consumeChallengeForTranscript(cache, challengeX, "RESPONDER", REFERENCE_NOW);
+    expect(isConsumedChallenge(ccX)).toBe(true);
+
+    // advanceToProofOfPossession must ACCEPT — ccX matches the issued challenge X
+    expect(sm.advanceToProofOfPossession(ccX, REFERENCE_NOW)).toBe(true);
+    expect(sm.getState()).toBe("PROOF_OF_POSSESSION");
   });
 
   test("advanceToTranscriptVerified rejects non-genuine VerifiedTranscript", () => {

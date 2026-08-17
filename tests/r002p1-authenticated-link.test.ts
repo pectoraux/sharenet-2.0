@@ -144,7 +144,9 @@ function buildConsumedChallenge(h: ReturnType<typeof runGenuineHandshake>): Cons
   return consumeChallengeForTranscript(cache, h.challengeForB, "RESPONDER", NOW);
 }
 
-/** Build a genuine VerifiedTranscript from the handshake materials (v4 API). */
+/** Build a genuine VerifiedTranscript from the handshake materials (v6 API).
+ *  The freshness verifier is the INITIATOR (A) — A issued challengeForB and
+ *  consumed it from A's local ChallengeCache. */
 function buildVerifiedTranscript(h: ReturnType<typeof runGenuineHandshake>) {
   const cc = buildConsumedChallenge(h);
   return createVerifiedTranscript({
@@ -153,6 +155,24 @@ function buildVerifiedTranscript(h: ReturnType<typeof runGenuineHandshake>) {
     proofA: h.proofA,
     consumedChallenge: cc,
     now: NOW,
+    freshnessVerifierNodeId: h.kpA.nodeId,
+  });
+}
+
+/** Build a genuine VerifiedTranscript for the RESPONDER (B) side (v6 API).
+ *  The freshness verifier is the RESPONDER (B) — B issued challengeForA and
+ *  consumed it from B's local ChallengeCache. */
+function buildVerifiedTranscriptB(h: ReturnType<typeof runGenuineHandshake>) {
+  const cache = new ChallengeCache();
+  cache.registerChallenge(h.challengeForA, NOW * 1000); // ChallengeCache uses ms
+  const cc = consumeChallengeForTranscript(cache, h.challengeForA, "INITIATOR", NOW);
+  return createVerifiedTranscript({
+    initiateBytes: h.initiateBytes,
+    acceptBytes: h.acceptBytes,
+    proofA: h.proofA,
+    consumedChallenge: cc,
+    now: NOW,
+    freshnessVerifierNodeId: h.kpB.nodeId,
   });
 }
 
@@ -173,6 +193,7 @@ describe("R-002-P1 v4: VerifiedTranscript — wire binding + challenge freshness
     expect(() => createVerifiedTranscript({
       initiateBytes: tampered, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
+      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow();
   });
 
@@ -183,6 +204,7 @@ describe("R-002-P1 v4: VerifiedTranscript — wire binding + challenge freshness
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h2.proofA, consumedChallenge: cc, now: NOW,
+      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow(/initiator's possession proof did not verify/i);
   });
 
@@ -194,6 +216,7 @@ describe("R-002-P1 v4: VerifiedTranscript — wire binding + challenge freshness
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc2, now: NOW,
+      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow(/consumed challenge does not match/i);
   });
 });
@@ -247,12 +270,14 @@ describe("R-002-P1 v4: Challenge freshness / replay provenance", () => {
     const vt1 = createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
+      freshnessVerifierNodeId: h.kpA.nodeId,
     });
     expect(isVerifiedTranscript(vt1)).toBe(true);
     // Second transcript with the SAME ConsumedChallenge object → REJECT
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
+      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow(/already been used to produce a VerifiedTranscript/i);
   });
 
@@ -288,7 +313,57 @@ describe("R-002-P1 v4: Challenge freshness / replay provenance", () => {
     expect(() => createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: fakeCc as any, now: NOW,
+      freshnessVerifierNodeId: h.kpA.nodeId,
     })).toThrow(/not a genuine ConsumedChallenge/i);
+  });
+});
+
+describe("R-002-P1 v6: Freshness-verifier provenance", () => {
+  test("transcript verified by A used to create B's link → REJECT", () => {
+    // Build a transcript where A is the freshness verifier
+    const h = runGenuineHandshake();
+    const cc = buildConsumedChallenge(h); // A consumed it
+    const vt = createVerifiedTranscript({
+      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
+      proofA: h.proofA, consumedChallenge: cc, now: NOW,
+      freshnessVerifierNodeId: h.kpA.nodeId, // A verified it
+    });
+    expect(isVerifiedTranscript(vt)).toBe(true);
+    // Now try to create B's link from A's transcript → REJECT
+    const authNodeA = createAuthenticatedNodeRecord(h.verifiedAdvA);
+    expect(() => createAuthenticatedLink({
+      localNodeId: h.kpB.nodeId, // B trying to use A's transcript
+      remoteNode: authNodeA,
+      verifiedTranscript: vt, establishedAt: NOW, expiresAt: NOW + 3600,
+    })).toThrow(/freshness verifier.*does not match/i);
+  });
+
+  test("transcript verified by A used to create A's link → ACCEPT", () => {
+    const h = runGenuineHandshake();
+    const cc = buildConsumedChallenge(h);
+    const vt = createVerifiedTranscript({
+      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
+      proofA: h.proofA, consumedChallenge: cc, now: NOW,
+      freshnessVerifierNodeId: h.kpA.nodeId,
+    });
+    const authNodeB = createAuthenticatedNodeRecord(h.verifiedAdvB);
+    const link = createAuthenticatedLink({
+      localNodeId: h.kpA.nodeId, // A creating A's link from A's transcript
+      remoteNode: authNodeB,
+      verifiedTranscript: vt, establishedAt: NOW, expiresAt: NOW + 3600,
+    });
+    expect(isAuthenticatedLink(link)).toBe(true);
+  });
+
+  test("freshnessVerifierNodeId not a handshake participant → REJECT", () => {
+    const h = runGenuineHandshake();
+    const cc = buildConsumedChallenge(h);
+    const stranger = generateNodeKeypair();
+    expect(() => createVerifiedTranscript({
+      initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
+      proofA: h.proofA, consumedChallenge: cc, now: NOW,
+      freshnessVerifierNodeId: stranger.nodeId, // not a participant
+    })).toThrow(/neither the initiator.*nor the responder/i);
   });
 });
 
@@ -308,7 +383,7 @@ describe("R-002-P1 v4: AuthenticatedLink — freshness provenance + symmetry", (
   test("genuine responder-side AuthenticatedLink → succeeds", () => {
     const h = runGenuineHandshake();
     const authNodeA = createAuthenticatedNodeRecord(h.verifiedAdvA);
-    const vt = buildVerifiedTranscript(h);
+    const vt = buildVerifiedTranscriptB(h); // B verifies its own transcript
     const link = createAuthenticatedLink({
       localNodeId: h.kpB.nodeId, remoteNode: authNodeA,
       verifiedTranscript: vt, establishedAt: NOW, expiresAt: NOW + 3600,
@@ -381,6 +456,7 @@ describe("R-002-P1 v4: Genuine full pipeline (both directions)", () => {
     const vt = createVerifiedTranscript({
       initiateBytes: h.initiateBytes, acceptBytes: h.acceptBytes,
       proofA: h.proofA, consumedChallenge: cc, now: NOW,
+      freshnessVerifierNodeId: h.kpB.nodeId,
     });
     const responderLink = createAuthenticatedLink({
       localNodeId: h.kpB.nodeId, remoteNode: authNodeA,
