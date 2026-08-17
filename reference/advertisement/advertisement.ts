@@ -1,14 +1,17 @@
 /**
  * NodeAdvertisement — signed, expiring, monotonic-sequence advertisement.
  *
- * Per spec/03-node-advertisements.md and ADR-0004:
+ * Per spec/03-node-advertisements.md, ADR-0004, and ADR-0017 (protocol freeze):
  *
  *   Wire format = Canonical CBOR (RFC 8949 §4.2.2) over an INTEGER-keyed map.
  *
  *   Signature  = Ed25519.sign(
- *                  BLAKE2b("sharenet-advertisement-v1" || canonical_cbor(advertisement_without_signature)),
+ *                  utf8("SHARENET/ADVERTISEMENT/1") || canonical_cbor(advertisement_without_signature),
  *                  secretKey
  *                )
+ *
+ * Per ADR-0017: the old domain tag "sharenet-advertisement-v1" is RETIRED.
+ * The canonical domain tag is "SHARENET/ADVERTISEMENT/1".
  *
  * Verification (spec/03 §5) MUST check:
  *   1. signature                          — cryptographic validity
@@ -34,8 +37,8 @@ import {
   bytesToHex,
 } from "../identity/keys";
 
-/** Domain-separation string for advertisement signatures. FROZEN per spec/14 §4. */
-export const ADVERTISEMENT_SIGNATURE_DOMAIN = "sharenet-advertisement-v1";
+/** Domain-separation tag for advertisement signatures. FROZEN per spec/14 §4 + ADR-0017. */
+export const ADVERTISEMENT_SIGNATURE_DOMAIN = "SHARENET/ADVERTISEMENT/1";
 
 /** Clock skew tolerance for timestamp validation (seconds). spec/03 §5.3. */
 export const CLOCK_SKEW_SECONDS = 300;

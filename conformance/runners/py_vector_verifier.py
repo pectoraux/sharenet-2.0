@@ -40,7 +40,7 @@ NODE_ID_BYTES = 32
 NODE_ID_TEXT_LENGTH = 52
 BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567"
 
-ADVERTISEMENT_SIGNATURE_DOMAIN = b"sharenet-advertisement-v1"
+ADVERTISEMENT_SIGNATURE_DOMAIN = b"SHARENET/ADVERTISEMENT/1"
 CLOCK_SKEW_SECONDS = 300
 MAX_TTL_SECONDS = 86400
 
@@ -451,7 +451,7 @@ def verify_handshake_vector(data: dict) -> dict:
 def _compute_link_id_bytes(local_node_id: str, remote_node_id: str,
                            local_nonce: bytes, remote_nonce: bytes) -> bytes:
     h = blake3.blake3()
-    h.update(b"sharenet-link-id-v1")
+    h.update(b"SHARENET/LINK/ID/1")
     h.update(local_node_id.encode())
     h.update(remote_node_id.encode())
     h.update(local_nonce)

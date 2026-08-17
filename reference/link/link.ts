@@ -41,11 +41,11 @@
  * link direction explicit in the ID itself.
  */
 
-import { blake2b } from "@noble/hashes/blake2.js";
+import { blake3 } from "@noble/hashes/blake3.js";
 import { randomBytes } from "@noble/hashes/utils.js";
 
-/** Domain-separation string for LinkId derivation. FROZEN per ADR-0014. */
-export const LINK_ID_DOMAIN = "sharenet-link-id-v1";
+/** Domain-separation tag for LinkId derivation. FROZEN per ADR-0014 + ADR-0017. */
+export const LINK_ID_DOMAIN = "SHARENET/LINK/ID/1";
 
 /** LinkId string prefix. */
 export const LINK_ID_PREFIX = "link:";
@@ -93,7 +93,7 @@ export function deriveLinkId(
   input.set(remote, off); off += remote.length;
   input.set(localNonce, off); off += localNonce.length;
   input.set(remoteNonce, off);
-  const hash = blake2b(input, { dkLen: LINK_ID_HASH_BYTES });
+  const hash = blake3(input, { dkLen: LINK_ID_HASH_BYTES });
   return LINK_ID_PREFIX + bytesToHex(hash);
 }
 

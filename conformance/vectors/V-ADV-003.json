@@ -1,17 +1,17 @@
 {
   "id": "V-ADV-003",
   "status": "ratified",
-  "spec": "spec/03-node-advertisements.md §5.4",
-  "description": "Expired advertisement: timestamp is within clock skew (200s before referenceNow) but expiry is 100s in the past. MUST fail with error EXPIRED, not TIMESTAMP_OUT_OF_RANGE.",
+  "spec": "spec/03-node-advertisements.md §5.4 (ADR-0017 domain tag)",
+  "description": "Expired advertisement. Domain: SHARENET/ADVERTISEMENT/1.",
   "referenceNow": 1786876545,
   "input": {
-    "advertisementHex": "aa010102783479763337667969366c6d71716d37676b33736b676465737a63326e67646a68327275656e6d6b666e326463326b7a74616b6869610358204cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba2904826a4d4553485f52454c415969444953434f564552590581a30163746370026831302e302e302e3103191e6c0802091a6a8191b90a1a6a81921d0b50b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e70c584091aeb1d12319b9c3ede15d5eaa6a193ef5a61661f3fa507c7543b4e543f591c151f3ecfb7f5a4e57bd48a0249daf17b66fc687b28e4c52da816d24884c646d0d",
+    "advertisementHex": "aa010102783479763337667969366c6d71716d37676b33736b676465737a63326e67646a68327275656e6d6b666e326463326b7a74616b6869610358204cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba2904826a4d4553485f52454c415969444953434f564552590581a30163746370026831302e302e302e3103191e6c0802091a6a8191b90a1a6a81921d0b50b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e70c5840f92f092d8f65b9254aad13f7b6df0a9ac2e5ac08c7a1f1f4427ef3897f6ea977e7092940719976d43c9e41a8fc9f9944f645448cad00ccf2ee29ab3484188502",
     "expectedNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
     "publicKeyHex": "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29"
   },
   "expected": {
     "verificationResult": "fail",
     "errorCode": "EXPIRED",
-    "reason": "expiry is in the past relative to referenceNow"
+    "reason": "expiry in the past"
   }
 }

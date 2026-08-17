@@ -258,7 +258,7 @@ export function computeLinkIdBytes(
   remoteNonce: Uint8Array,
 ): Uint8Array {
   const h = blake3.create({ dkLen: 32 });
-  h.update(new TextEncoder().encode("sharenet-link-id-v1"));
+  h.update(new TextEncoder().encode("SHARENET/LINK/ID/1"));
   h.update(new TextEncoder().encode(localNodeId));
   h.update(new TextEncoder().encode(remoteNodeId));
   h.update(localNonce);
