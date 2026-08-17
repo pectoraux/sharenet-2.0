@@ -31,6 +31,7 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { canonicalEncode, toHex } from "../encoding/cbor";
 import { proposalDigest, hopDigest, serviceDigest } from "./digests";
 import type { ServiceAgreement } from "./service-negotiation";
+import { registerRouteCommitment } from "../transport/validated-types";
 
 // Re-export ServiceAgreement type for convenience
 export type { ServiceAgreement } from "./service-negotiation";
@@ -414,15 +415,22 @@ export function createRouteCommitment(
   const payload = routeCommitmentSigningPayload(proposal, acceptances);
   const signature = signMessage(committerSecretKey, payload);
 
+  const commitment = {
+    routeId: proposal.routeId,
+    proposal,
+    acceptances,
+    committerSignature: signature,
+    committedAt: now,
+  };
+
+  // R-006H3: Register the genuine RouteCommitment in the private WeakSet.
+  // This allows isRouteCommitment() to verify it was produced through
+  // this function (which verified all signatures + bindings).
+  registerRouteCommitment(commitment);
+
   return {
     ok: true,
-    commitment: {
-      routeId: proposal.routeId,
-      proposal,
-      acceptances,
-      committerSignature: signature,
-      committedAt: now,
-    },
+    commitment,
     verificationResults,
   };
 }

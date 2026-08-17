@@ -260,6 +260,25 @@ export interface VerifiedNodeAdvertisement {
   bodyBytes: Uint8Array; // the canonical bytes that were signed
 }
 
+// -----------------------------------------------------------------------
+// Private WeakSet registry for VerifiedNodeAdvertisement (R-006H3)
+// -----------------------------------------------------------------------
+
+const verifiedNodeRegistry = new WeakSet<object>();
+
+/**
+ * Runtime check: is this object a genuine VerifiedNodeAdvertisement
+ * produced by verifyAdvertisement()?
+ *
+ * Per R-006H3: a TypeScript interface is just a shape — any object
+ * matching the fields can masquerade as a VerifiedNodeAdvertisement.
+ * This WeakSet tracks object identity: only objects created by
+ * verifyAdvertisement() (when it returns ok: true) are registered.
+ */
+export function isVerifiedNodeAdvertisement(obj: unknown): obj is VerifiedNodeAdvertisement {
+  return typeof obj === "object" && obj !== null && verifiedNodeRegistry.has(obj);
+}
+
 /**
  * Verify a NodeAdvertisement cryptographically.
  *
@@ -348,8 +367,14 @@ export function verifyAdvertisement(
 
   return {
     ok: true,
-    verified: { advertisement: adv, verifiedAt: now, bodyBytes },
+    verified: registerVerifiedNodeAdvertisement({ advertisement: adv, verifiedAt: now, bodyBytes }),
   };
+}
+
+/** Register a VerifiedNodeAdvertisement in the private WeakSet. */
+function registerVerifiedNodeAdvertisement(v: VerifiedNodeAdvertisement): VerifiedNodeAdvertisement {
+  verifiedNodeRegistry.add(v);
+  return v;
 }
 
 // ---------------------------------------------------------------------

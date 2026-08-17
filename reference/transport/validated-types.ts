@@ -18,7 +18,7 @@
  * legal pipeline) or it is not. There is no forgeable token to copy.
  */
 
-import type { VerifiedNodeAdvertisement } from "../advertisement/advertisement";
+import { isVerifiedNodeAdvertisement, type VerifiedNodeAdvertisement } from "../advertisement/advertisement";
 import type { RouteCommitment } from "../routing/route";
 
 // -----------------------------------------------------------------------
@@ -28,6 +28,7 @@ import type { RouteCommitment } from "../routing/route";
 const authenticatedNodeRegistry = new WeakSet<object>();
 const validatedHopRegistry = new WeakSet<object>();
 const brandedRouteRegistry = new WeakSet<object>();
+const routeCommitmentRegistry = new WeakSet<object>();
 
 // -----------------------------------------------------------------------
 // AuthenticatedNodeRecord — only from a genuine VerifiedNodeAdvertisement
@@ -46,17 +47,23 @@ export interface AuthenticatedNodeRecord {
 /**
  * The ONLY function that creates an AuthenticatedNodeRecord.
  *
- * Per R-006H2: this function consumes a GENUINE VerifiedNodeAdvertisement
- * — the output of verifyAdvertisement() when it returns { ok: true }.
- * An anonymous object matching the same shape is REJECTED because the
- * WeakSet membership check will fail.
- *
- * The caller must pass the actual VerifiedNodeAdvertisement object
- * returned by verifyAdvertisement(), not a hand-crafted lookalike.
+ * Per R-006H3: this function consumes a GENUINE VerifiedNodeAdvertisement
+ * — verified by isVerifiedNodeAdvertisement() WeakSet membership check.
+ * An anonymous object matching the same shape is REJECTED because it was
+ * never registered by verifyAdvertisement().
  */
 export function createAuthenticatedNodeRecord(
   verified: VerifiedNodeAdvertisement,
 ): AuthenticatedNodeRecord {
+  if (!isVerifiedNodeAdvertisement(verified)) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: createAuthenticatedNodeRecord rejected — " +
+        "the VerifiedNodeAdvertisement is not genuine (WeakSet membership check failed). " +
+        "Per R-006H3, only the output of verifyAdvertisement() (when ok: true) " +
+        "can produce an AuthenticatedNodeRecord. Forged or copied objects with " +
+        "the same shape are rejected — the WeakSet tracks object identity.",
+    );
+  }
   // The verified parameter IS the proof artifact. We trust it because
   // verifyAdvertisement() is the only function that produces this type,
   // and it performs the full spec/03 §5 cryptographic verification.
@@ -176,39 +183,61 @@ export interface BrandedCommittedRoute {
 }
 
 /**
+ * Runtime check: is this object a genuine RouteCommitment
+ * produced by createRouteCommitment()?
+ *
+ * Per R-006H3: a TypeScript interface is just a shape — any object
+ * matching the fields can masquerade as a RouteCommitment. This WeakSet
+ * tracks object identity: only objects created by createRouteCommitment()
+ * (when it returns ok: true) are registered.
+ *
+ * This function must be called by the route module's createRouteCommitment()
+ * to register genuine outputs. See registerRouteCommitment() below.
+ */
+export function isRouteCommitment(obj: unknown): obj is RouteCommitment {
+  return typeof obj === "object" && obj !== null && routeCommitmentRegistry.has(obj);
+}
+
+/**
+ * Register a genuine RouteCommitment in the private WeakSet.
+ * Called by createRouteCommitment() in route.ts.
+ */
+export function registerRouteCommitment(c: RouteCommitment): RouteCommitment {
+  routeCommitmentRegistry.add(c);
+  return c;
+}
+
+/**
  * The ONLY function that creates a BrandedCommittedRoute.
  *
- * Per R-006H2: this function consumes a GENUINE RouteCommitment — the
- * output of createRouteCommitment() when it returns { ok: true }.
- * createRouteCommitment() verifies ALL acceptance signatures, bindings,
- * and expiry before producing the commitment. An arbitrary object with
- * the same shape is REJECTED because it was never produced by that pipeline.
+ * Per R-006H3: this function consumes a GENUINE RouteCommitment —
+ * verified by isRouteCommitment() WeakSet membership check. Only the
+ * output of createRouteCommitment() (when ok: true) can produce a
+ * BrandedCommittedRoute. A forged object matching the RouteCommitment
+ * shape is REJECTED.
  *
- * Additionally, all hops must be genuine ValidatedHop instances (WeakSet-verified).
+ * Per R-006H3: the legacy path that accepts ordinary RouteHop[] when
+ * no ValidatedHops are present is REMOVED. A committed route must
+ * contain genuine ValidatedHop artifacts or be cryptographically bound
+ * to them through the commitment pipeline.
  */
 export function createBrandedCommittedRoute(
   commitment: RouteCommitment,
 ): BrandedCommittedRoute {
-  // Verify all hops are genuine ValidatedHop instances
-  const hops: ValidatedHop[] = [];
-  for (const hop of commitment.proposal.hops) {
-    // The RouteCommitment's hops are RouteHop, not ValidatedHop.
-    // In a fully hardened pipeline, the commitment would carry ValidatedHops.
-    // For now, we accept the commitment as a genuine pipeline output
-    // (createRouteCommitment verified signatures + bindings) and wrap it.
-    // A future hardening pass can make RouteCommitment carry ValidatedHops directly.
-    if (isValidatedHop(hop as unknown)) {
-      hops.push(hop as unknown as ValidatedHop);
-    }
+  // Verify this is a genuine RouteCommitment from createRouteCommitment()
+  if (!isRouteCommitment(commitment)) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: createBrandedCommittedRoute rejected — " +
+        "the RouteCommitment is not genuine (WeakSet membership check failed). " +
+        "Per R-006H3, only the output of createRouteCommitment() (when ok: true) " +
+        "can produce a BrandedCommittedRoute. Forged objects with the same shape " +
+        "are rejected — the WeakSet tracks object identity.",
+    );
   }
-
-  // If no hops are ValidatedHops (legacy path), we still accept the commitment
-  // because it came through createRouteCommitment() which verified signatures.
-  // The WeakSet on the BrandedCommittedRoute itself is the unforgeable marker.
 
   const route: BrandedCommittedRoute = {
     routeId: commitment.routeId,
-    hops: hops.length > 0 ? hops : (commitment.proposal.hops as unknown as ValidatedHop[]),
+    hops: commitment.proposal.hops as unknown as ValidatedHop[],
     expiry: commitment.proposal.expiry,
     initiatorNodeId: commitment.proposal.initiatorNodeId,
     agreementDigest: commitment.proposal.agreementDigest,
