@@ -61,7 +61,12 @@ export interface RouteHop {
 // -----------------------------------------------------------------------
 
 export interface RouteProposal {
-  routeId: string;
+  /**
+   * Per R-003/R-004 final reconciliation: routeId is REMOVED from the
+   * canonical proposal. The only route identity is the commitment_root
+   * (derived from proposal + acceptances + nonce). A caller-chosen
+   * pre-ID must NOT influence the final route_id.
+   */
   hops: RouteHop[];
   requirementDigest: string;
   expiry: number;
@@ -71,12 +76,11 @@ export interface RouteProposal {
 
 export function routeProposalSigningPayload(proposal: RouteProposal): Uint8Array {
   const m = new Map<number, unknown>([
-    [1, proposal.routeId],
-    [2, proposal.hops.map((h) => h.nodeId)],
-    [3, proposal.requirementDigest],
-    [4, proposal.expiry],
-    [5, proposal.initiatorNodeId],
-    [6, proposal.agreementDigest],
+    [1, proposal.hops.map((h) => h.nodeId)],
+    [2, proposal.requirementDigest],
+    [3, proposal.expiry],
+    [4, proposal.initiatorNodeId],
+    [5, proposal.agreementDigest],
   ]);
   const body = canonicalEncode(m);
   const domain = new TextEncoder().encode(ROUTE_PROPOSAL_DOMAIN);
@@ -293,16 +297,17 @@ const NODE_TYPE_INTERNAL = 0x02;
  * Uses integer-keyed map per ADR-0004.
  */
 function canonicalEncodeProposal(proposal: RouteProposal): Uint8Array {
+  // Per R-003/R-004 final reconciliation: routeId is NOT included.
+  // The Merkle leaf binds only the semantically-significant fields.
   const m = new Map<number, unknown>([
-    [1, proposal.routeId],
-    [2, proposal.hops.map((h) => h.nodeId)],
-    [3, proposal.hops.map((h) => h.capability)],
-    [4, proposal.hops.map((h) => h.endpoint)],
-    [5, proposal.hops.map((h) => h.linkUp)],
-    [6, proposal.requirementDigest],
-    [7, proposal.expiry],
-    [8, proposal.initiatorNodeId],
-    [9, proposal.agreementDigest],
+    [1, proposal.hops.map((h) => h.nodeId)],
+    [2, proposal.hops.map((h) => h.capability)],
+    [3, proposal.hops.map((h) => h.endpoint)],
+    [4, proposal.hops.map((h) => h.linkUp)],
+    [5, proposal.requirementDigest],
+    [6, proposal.expiry],
+    [7, proposal.initiatorNodeId],
+    [8, proposal.agreementDigest],
   ]);
   return canonicalEncode(m);
 }
@@ -675,6 +680,100 @@ export function createRouteCommitment(
   };
 }
 
+// -----------------------------------------------------------------------
+// Independent verification (no WeakSet dependency)
+// -----------------------------------------------------------------------
+
+/**
+ * Independently verify a RouteCommitment from the serialized commitment
+ * and the source's public key alone.
+ *
+ * Per R-003/R-004 final reconciliation: this function does NOT depend on
+ * WeakSet membership. It re-derives the commitment_root from the proposal +
+ * acceptances, verifies the source signature over (commitment_root ||
+ * commitment_nonce), and verifies that the route_id matches
+ * "route:" + hex(commitment_root).
+ *
+ * It also verifies every acceptance signature + binding (same as
+ * createRouteCommitment) to ensure the acceptances are genuine.
+ *
+ * This is the language-independent verification path — any implementation
+ * (Rust, Go, C) can use this logic without WeakSet support.
+ *
+ * @returns { ok: true } if all checks pass, { ok: false, reason } otherwise.
+ */
+export function verifyRouteCommitment(
+  commitment: RouteCommitment,
+  sourcePublicKey: Uint8Array,
+  hopPublicKeys: Map<string, Uint8Array>,
+  serviceAgreements: Map<number, ServiceAgreement>,
+  now: number,
+): { ok: true } | { ok: false; reason: string } {
+  // 1. Recompute the commitment_root from proposal + acceptances.
+  const expectedRoot = computeCommitmentRoot(commitment.proposal, commitment.acceptances);
+  if (!constantTimeEqual(expectedRoot, commitment.commitmentRoot)) {
+    return { ok: false, reason: "commitment_root mismatch: recomputed root does not match the carried commitment_root" };
+  }
+
+  // 2. Verify the route_id matches "route:" + hex(commitment_root).
+  const expectedRouteId = deriveRouteId(commitment.commitmentRoot);
+  if (commitment.routeId !== expectedRouteId) {
+    return { ok: false, reason: `route_id mismatch: expected ${expectedRouteId}, got ${commitment.routeId}` };
+  }
+
+  // 3. Verify the source signature over (commitment_root || commitment_nonce).
+  const payload = routeCommitmentSigningPayload(commitment.commitmentRoot, commitment.commitmentNonce);
+  if (!verifySignature(sourcePublicKey, payload, commitment.committerSignature)) {
+    return { ok: false, reason: "source signature invalid over commitment_root + commitment_nonce" };
+  }
+
+  // 4. Verify every acceptance signature + binding (same as createRouteCommitment).
+  for (let i = 0; i < commitment.proposal.hops.length; i++) {
+    const hop = commitment.proposal.hops[i]!;
+    const acc = commitment.acceptances[i];
+    if (!acc) {
+      return { ok: false, reason: `missing acceptance for hop ${i}` };
+    }
+    if (acc.hopIndex !== i) {
+      return { ok: false, reason: `acceptance ${i} has wrong hopIndex ${acc.hopIndex}` };
+    }
+    if (acc.acceptorNodeId !== hop.nodeId) {
+      return { ok: false, reason: `acceptance ${i} acceptor ${acc.acceptorNodeId} != hop ${hop.nodeId}` };
+    }
+    if (acc.expiry <= now) {
+      return { ok: false, reason: `acceptance ${i} expired` };
+    }
+    const pubKey = hopPublicKeys.get(hop.nodeId);
+    if (!pubKey) {
+      return { ok: false, reason: `no public key for hop ${i} (${hop.nodeId})` };
+    }
+    if (!verifyRouteAcceptance(acc, pubKey)) {
+      return { ok: false, reason: `acceptance ${i} signature invalid` };
+    }
+    const sa = serviceAgreements.get(i);
+    if (!sa) {
+      return { ok: false, reason: `no service agreement for hop ${i}` };
+    }
+    const binding = verifyAcceptanceBinding(acc, commitment.proposal, i, hop, sa);
+    if (!binding.ok) {
+      return { ok: false, reason: binding.reason };
+    }
+    if (!hop.linkUp) {
+      return { ok: false, reason: `hop ${i} (${hop.nodeId}) is not LINK_UP` };
+    }
+  }
+
+  return { ok: true };
+}
+
+/** Constant-time byte comparison. */
+function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
+}
+
 /**
  * Compute the signing payload for a RouteCommitment.
  *
@@ -746,7 +845,7 @@ export function TOPOLOGY_TO_ROUTE_FORBIDDEN(topologyData: unknown): never {
 export function PROPOSAL_TO_CIRCUIT_FORBIDDEN(proposal: RouteProposal): never {
   throw new Error(
     `ARCHITECTURE VIOLATION: attempted to create a circuit from RouteProposal ` +
-      `(routeId=${proposal.routeId}) without a RouteCommitment. ` +
+      `(hops=${proposal.hops.length}) without a RouteCommitment. ` +
       `Per spec/00 §31, a circuit can ONLY be created from a CommittedRoute.`,
   );
 }

@@ -39,7 +39,6 @@ function makeCommittedRoute(nodeIds: string[], initiator: ReturnType<typeof gene
     linkUp: true,
   }));
   const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
     hops,
     requirementDigest: bytesToHex(randomBytes(32)),
     expiry: REFERENCE_NOW + 3600,

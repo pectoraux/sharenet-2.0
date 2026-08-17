@@ -450,7 +450,6 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
 
       // Negative: a RouteProposal is also not a BrandedCommittedRoute
       const proposal: RouteProposal = {
-        routeId: toHex(randomBytes(32)),
         hops: [{ nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
         requirementDigest: toHex(randomBytes(32)),
         expiry: Math.floor(Date.now() / 1000) + 3600,
@@ -695,7 +694,6 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
     await runOne(17, "RouteProposal → setupCircuit fails — brand check (R-006H)", "ARCHITECTURE", "spec/00 §31 + spec/08 + R-006H", async () => {
       const kp = generateNodeKeypair();
       const proposal: RouteProposal = {
-        routeId: toHex(randomBytes(32)),
         hops: [{ nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
         requirementDigest: toHex(randomBytes(32)),
         expiry: Math.floor(Date.now() / 1000) + 3600,

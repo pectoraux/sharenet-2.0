@@ -161,7 +161,6 @@ describe("R-006H3: Unforgeable trust chain at every construction boundary", () =
     const fakeCommitment = {
       routeId: "fake",
       proposal: {
-        routeId: "fake",
         hops: [ordinaryHop],
         requirementDigest: "",
         expiry: NOW + 3600,

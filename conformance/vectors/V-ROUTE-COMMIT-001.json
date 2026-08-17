@@ -1,6 +1,6 @@
 {
   "id": "V-ROUTE-COMMIT-001",
-  "status": "draft",
+  "status": "frozen",
   "spec": "spec/07-routing.md §5.3.1 (FROZEN)",
   "adr": "adr/0017-protocol-freeze-reconciliation.md",
   "description": "Canonical Merkle commitment_root golden vectors. These vectors verify the exact BLAKE3-256 Merkle tree construction produces byte-stable output for the same logical inputs, enabling cross-implementation route identity verification.",
@@ -25,8 +25,14 @@
       "name": "single-hop-route",
       "description": "2 leaves (proposal + 1 acceptance) → 1 parent = root",
       "proposal": {
-        "routeId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "hops": [{ "nodeId": "node1", "capability": "MESH_RELAY", "endpoint": "10.0.0.1:7788", "linkUp": true }],
+        "hops": [
+          {
+            "nodeId": "node1",
+            "capability": "MESH_RELAY",
+            "endpoint": "10.0.0.1:7788",
+            "linkUp": true
+          }
+        ],
         "requirementDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "expiry": 1786876545,
         "initiatorNodeId": "initiator1",
@@ -41,20 +47,29 @@
           "acceptorNodeId": "node1",
           "acceptanceNonceHex": "0102030405060708090a0b0c0d0e0f10",
           "expiry": 1786876545,
-          "signatureHex": "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+          "signatureHex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
         }
       ],
-      "expectedCommitmentRootHex": "bc89ae9a85a75962a08943f47c0e455a98b00834efbd78a2778f5abbcb5f08c3",
-      "expectedRouteId": "route:bc89ae9a85a75962a08943f47c0e455a98b00834efbd78a2778f5abbcb5f08c3"
+      "expectedCommitmentRootHex": "5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9",
+      "expectedRouteId": "route:5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9"
     },
     {
       "name": "two-hop-route",
       "description": "3 leaves (proposal + 2 acceptances) → odd → duplicate → 2 parents → 1 root",
       "proposal": {
-        "routeId": "1111111111111111111111111111111111111111111111111111111111111111",
         "hops": [
-          { "nodeId": "relay1", "capability": "MESH_RELAY", "endpoint": "10.0.0.1:7788", "linkUp": true },
-          { "nodeId": "gateway1", "capability": "INTERNET_GATEWAY", "endpoint": "10.0.0.2:7789", "linkUp": true }
+          {
+            "nodeId": "relay1",
+            "capability": "MESH_RELAY",
+            "endpoint": "10.0.0.1:7788",
+            "linkUp": true
+          },
+          {
+            "nodeId": "gateway1",
+            "capability": "INTERNET_GATEWAY",
+            "endpoint": "10.0.0.2:7789",
+            "linkUp": true
+          }
         ],
         "requirementDigest": "2222222222222222222222222222222222222222222222222222222222222222",
         "expiry": 1786876545,
@@ -70,7 +85,7 @@
           "acceptorNodeId": "relay1",
           "acceptanceNonceHex": "0a0b0c0d0e0f10111213141516171819",
           "expiry": 1786876545,
-          "signatureHex": "0101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
+          "signatureHex": "01010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101"
         },
         {
           "proposalDigestHex": "4444444444444444444444444444444444444444444444444444444444444444",
@@ -83,8 +98,8 @@
           "signatureHex": "02020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202"
         }
       ],
-      "expectedCommitmentRootHex": "86d96b685e531625db0770b953985e3e28bb90b38fc6ebaafefbe6b7597f7c4d",
-      "expectedRouteId": "route:86d96b685e531625db0770b953985e3e28bb90b38fc6ebaafefbe6b7597f7c4d"
+      "expectedCommitmentRootHex": "ad583d66f371808c96e3ee5bd7ddd85a7a56c40f6ac733359f17788f7f828c86",
+      "expectedRouteId": "route:ad583d66f371808c96e3ee5bd7ddd85a7a56c40f6ac733359f17788f7f828c86"
     }
   ],
   "verification": "tests/r003-r004-commitment-root.test.ts computes the commitment_root from the vector inputs and asserts the expected hex."

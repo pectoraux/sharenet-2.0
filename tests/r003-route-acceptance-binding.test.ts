@@ -41,7 +41,6 @@ function setup() {
   ];
 
   const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
     hops,
     requirementDigest: bytesToHex(randomBytes(32)),
     expiry: REFERENCE_NOW + 3600,
@@ -155,10 +154,10 @@ describe("R-003D: Route acceptance binding tests", () => {
     expect(r.ok).toBe(false);
   });
 
-  // 12. Acceptance for another proposal with same routeId fails
-  test("12. Acceptance for different proposal with same routeId fails binding", () => {
+  // 12. Acceptance for another proposal with same caller-chosen identifier fails
+  test("12. Acceptance for different proposal fails binding", () => {
     const ctx = setup();
-    // Same routeId but different hops
+    // Different hops → different proposal_digest
     const differentProposal: RouteProposal = {
       ...ctx.proposal,
       hops: [
@@ -204,7 +203,7 @@ describe("R-003D: Route acceptance binding tests", () => {
   test("15. Different proposals produce different commitments", () => {
     const ctx1 = setup();
     const ctx2 = setup();
-    // Different proposals (different routeId, different hops)
+    // Different proposals (different hops → different commitment_roots)
     const r1 = createRouteCommitment(ctx1.proposal, ctx1.acceptances, ctx1.hopPublicKeys, ctx1.serviceAgreements, ctx1.initiator.secretKey, REFERENCE_NOW);
     const r2 = createRouteCommitment(ctx2.proposal, ctx2.acceptances, ctx2.hopPublicKeys, ctx2.serviceAgreements, ctx2.initiator.secretKey, REFERENCE_NOW);
     expect(r1.ok).toBe(true);

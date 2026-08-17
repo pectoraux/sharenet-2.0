@@ -37,6 +37,13 @@ import {
   ROLE_INITIATOR,
   ROLE_RESPONDER,
 } from "@reference/transport/auth-handshake";
+import {
+  computeCommitmentRoot,
+  deriveRouteId,
+  type RouteProposal,
+  type RouteAcceptance,
+  type RouteHop,
+} from "@reference/routing/route";
 
 interface VectorResult {
   id: string;
@@ -237,6 +244,57 @@ function verifyHandshakeVector(data: any): VectorResult {
   }
 }
 
+function verifyRouteCommitVector(data: any): VectorResult {
+  const vectors = data.vectors || [];
+  let allOk = true;
+  const failures: string[] = [];
+  for (const v of vectors) {
+    try {
+      const proposal: RouteProposal = {
+        hops: v.proposal.hops.map((h: any) => ({
+          nodeId: h.nodeId,
+          capability: h.capability,
+          endpoint: h.endpoint,
+          linkUp: h.linkUp,
+        })),
+        requirementDigest: v.proposal.requirementDigest,
+        expiry: v.proposal.expiry,
+        initiatorNodeId: v.proposal.initiatorNodeId,
+        agreementDigest: v.proposal.agreementDigest,
+      };
+      const acceptances: RouteAcceptance[] = v.acceptances.map((a: any) => ({
+        proposalDigestHex: a.proposalDigestHex,
+        hopIndex: a.hopIndex,
+        hopDigestHex: a.hopDigestHex,
+        serviceDigestHex: a.serviceDigestHex,
+        acceptorNodeId: a.acceptorNodeId,
+        acceptanceNonce: hexToBytes(a.acceptanceNonceHex),
+        expiry: a.expiry,
+        signature: hexToBytes(a.signatureHex),
+      }));
+      const root = computeCommitmentRoot(proposal, acceptances);
+      const rootHex = toHex(root);
+      const routeId = deriveRouteId(root);
+      if (rootHex !== v.expectedCommitmentRootHex) {
+        allOk = false;
+        failures.push(`${v.name}: root ${rootHex} != ${v.expectedCommitmentRootHex}`);
+      } else if (routeId !== v.expectedRouteId) {
+        allOk = false;
+        failures.push(`${v.name}: routeId ${routeId} != ${v.expectedRouteId}`);
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} route-commit vectors match`,
+    actual: allOk ? `${vectors.length} route-commit vectors match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
 // Main
 const files = walkJsonFiles(vectorsDir);
 const results: VectorResult[] = [];
@@ -261,6 +319,8 @@ for (const file of files) {
     result = verifyAdvVector(data);
   } else if (data.id?.startsWith("V-LINK-HANDSHAKE-") || data.id?.startsWith("V-LINK-AUTH-")) {
     result = verifyHandshakeVector(data);
+  } else if (data.id?.startsWith("V-ROUTE-COMMIT-")) {
+    result = verifyRouteCommitVector(data);
   } else if (data.id === "MANIFEST" || data.file === "MANIFEST.json") {
     // Manifest is metadata, not a protocol vector — skip it
     result = { id: data.id ?? file, passed: true, expected: "manifest metadata", actual: "manifest (not a protocol vector)" };
@@ -295,3 +355,4 @@ console.log(`Passed: ${passed}/${results.length}, Failed: ${failed}`);
 console.log("");
 
 process.exit(failed > 0 ? 1 : 0);
+

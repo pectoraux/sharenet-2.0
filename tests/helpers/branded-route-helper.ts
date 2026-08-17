@@ -279,7 +279,6 @@ export function makeGenuineBrandedRoute(
   }));
 
   const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
     hops,
     requirementDigest: bytesToHex(randomBytes(32)),
     expiry: now + 3600,

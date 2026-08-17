@@ -857,3 +857,55 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-003/R-004 now have canonical golden vectors for the commitment-root Merkle algorithm. An independent implementation (Rust, Go, C) can verify byte-stability against these vectors.
+
+---
+Task ID: R-003/R-004-final-reconciliation
+Agent: main (Z.ai Code)
+Task: Final R-003/R-004 reconciliation — remove RouteProposal.routeId from the canonical proposal, freeze golden vectors + wire into TS runner, add independent verifyRouteCommitment() path.
+
+Work Log:
+- Removed `routeId` from `RouteProposal` interface in `reference/routing/route.ts`:
+  - The field is gone from the interface, signing payload, and Merkle leaf encoding (`canonicalEncodeProposal`).
+  - The only route identity is now `commitment_root` (Merkle tree of proposal + acceptances), with `route_id = "route:" + hex(commitment_root)`.
+  - Fixed `PROPOSAL_TO_CIRCUIT_FORBIDDEN` which referenced `proposal.routeId` in its error message.
+  - Removed `routeId` from all `RouteProposal` constructions in all test files + architecture-tests.
+
+- Updated `proposalDigest()` in `reference/routing/digests.ts` — already excluded `routeId` (no change needed).
+
+- Re-generated golden vectors after `routeId` removal:
+  - `V-ROUTE-COMMIT-001.json`: status changed from "draft" to "frozen".
+  - Removed `routeId` from the proposal objects in the JSON.
+  - Fixed a signature-hex-length bug (was 130 chars = 65 bytes, should be 128 chars = 64 bytes).
+  - Updated `expectedCommitmentRootHex` for both vectors with the new (routeId-free) Merkle output.
+
+- Wired `V-ROUTE-COMMIT-001` into the TypeScript conformance runner (`ts-vector-runner.ts`):
+  - Added `verifyRouteCommitVector()` handler that constructs RouteProposal + RouteAcceptance from the JSON inputs and asserts the expected commitment_root + route_id.
+  - Added dispatch entry: `data.id?.startsWith("V-ROUTE-COMMIT-")` → `verifyRouteCommitVector(data)`.
+  - TS runner now passes 20/20 vectors (was 19/20 before — V-ROUTE-COMMIT-001 was unknown/unknown).
+
+- Added independent `verifyRouteCommitment()` in `reference/routing/route.ts`:
+  - Does NOT depend on WeakSet membership.
+  - Re-derives `commitment_root` from proposal + acceptances → compares to carried root (constant-time).
+  - Verifies `route_id == "route:" + hex(commitment_root)`.
+  - Verifies source signature over `commitment_root || commitment_nonce`.
+  - Verifies every acceptance signature + binding (same as `createRouteCommitment`).
+  - This is the language-independent verification path — any implementation (Rust, Go, C) can use this logic.
+
+- Created `tests/r003-r004-verify-commitment.test.ts` (9 adversarial tests):
+  - genuine commitment → verify succeeds (no WeakSet dependency)
+  - independently decoded commitment (JSON round-trip) → verify succeeds
+  - proposal mutation (hops changed) → reject (commitment_root mismatch)
+  - commitment root mutation → reject (recomputed root != carried root)
+  - nonce mutation → reject (signature invalid)
+  - acceptance mutation (signature changed) → reject
+  - route_id mutation → reject (route_id != "route:" + hex(root))
+  - source signature mutation → reject
+  - wrong source public key → reject
+
+Stage Summary:
+- Tests: 302 → 311 pass, 0 fail (+9 verifyRouteCommitment tests). 823 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 20/20 vectors pass (was 19/20 — V-ROUTE-COMMIT-001 now wired in).
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-003/R-004 final reconciliation: RouteProposal no longer has a caller-chosen routeId; the only route identity is commitment_root. Golden vectors are frozen and consumed by the canonical conformance system. Independent verifyRouteCommitment() provides a WeakSet-free verification path. All three audit requirements are addressed.

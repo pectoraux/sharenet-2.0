@@ -253,7 +253,6 @@ describe("GATE-05: Service negotiation and route commitment", () => {
 
     // Build the route proposal: A → Relay → Gateway
     const proposal: RouteProposal = {
-      routeId: bytesToHex(randomBytes(32)),
       hops: [
         makeHop(kps.relay.nodeId, "MESH_RELAY"),
         makeHop(kps.gateway.nodeId, "INTERNET_GATEWAY"),
@@ -284,7 +283,7 @@ describe("GATE-05: Service negotiation and route commitment", () => {
     if (commitmentResult.ok) {
       // Create committed route
       const route = createCommittedRoute(commitmentResult.commitment);
-      // R-003/R-004: route_id is now DERIVED from commitment_root, not proposal.routeId
+      // R-003/R-004: route_id is DERIVED from commitment_root (no caller-chosen routeId)
       // Per spec/07 §5.4: route_id = "route:" + lowercase_hex(commitment_root)
       expect(route.routeId).toBe("route:" + bytesToHex(commitmentResult.commitment.commitmentRoot));
       expect(route.commitmentRoot).toEqual(commitmentResult.commitment.commitmentRoot);
@@ -298,7 +297,6 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   test("route commitment fails with missing acceptance", () => {
     const kps = makeKeypairs();
     const proposal: RouteProposal = {
-      routeId: bytesToHex(randomBytes(32)),
       hops: [
         makeHop(kps.relay.nodeId, "MESH_RELAY"),
         makeHop(kps.gateway.nodeId, "INTERNET_GATEWAY"),
@@ -328,7 +326,6 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   test("route commitment fails with wrong acceptor", () => {
     const kps = makeKeypairs();
     const proposal: RouteProposal = {
-      routeId: bytesToHex(randomBytes(32)),
       hops: [
         makeHop(kps.relay.nodeId, "MESH_RELAY"),
         makeHop(kps.gateway.nodeId, "INTERNET_GATEWAY"),
@@ -361,7 +358,6 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   test("route commitment fails for ADV_VERIFIED hop (not LINK_UP)", () => {
     const kps = makeKeypairs();
     const proposal: RouteProposal = {
-      routeId: bytesToHex(randomBytes(32)),
       hops: [
         makeHop(kps.relay.nodeId, "MESH_RELAY", true),
         makeHop(kps.gateway.nodeId, "INTERNET_GATEWAY", false), // ADV_VERIFIED only!
@@ -392,7 +388,6 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   test("route commitment fails for expired acceptance", () => {
     const kps = makeKeypairs();
     const proposal: RouteProposal = {
-      routeId: bytesToHex(randomBytes(32)),
       hops: [
         makeHop(kps.relay.nodeId, "MESH_RELAY"),
         makeHop(kps.gateway.nodeId, "INTERNET_GATEWAY"),
@@ -429,7 +424,6 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   // --- 17. Proposal → Circuit FORBIDDEN ---
   test("PROPOSAL_TO_CIRCUIT_FORBIDDEN throws", () => {
     const proposal: RouteProposal = {
-      routeId: "test",
       hops: [],
       requirementDigest: "",
       expiry: 0,
@@ -442,7 +436,7 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   // --- 18. Route acceptance verification ---
   test("route acceptance verifies correctly", () => {
     const kp = generateNodeKeypair();
-    const acceptance = signRouteAcceptance({routeId:"route123",hops:[{nodeId:kp.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true}],requirementDigest:"",expiry:REFERENCE_NOW+3600,initiatorNodeId:"",agreementDigest:""} as any, 0, {nodeId:kp.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true} as any, {nodeId:kp.nodeId,capability:"MESH_RELAY",requirementDigest:"",allocatedBandwidthBps:0,expiry:REFERENCE_NOW+3600,policyVersion:1} as any, kp.nodeId, kp.secretKey, REFERENCE_NOW + 3600);
+    const acceptance = signRouteAcceptance({hops:[{nodeId:kp.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true}],requirementDigest:"",expiry:REFERENCE_NOW+3600,initiatorNodeId:"",agreementDigest:""} as any, 0, {nodeId:kp.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true} as any, {nodeId:kp.nodeId,capability:"MESH_RELAY",requirementDigest:"",allocatedBandwidthBps:0,expiry:REFERENCE_NOW+3600,policyVersion:1} as any, kp.nodeId, kp.secretKey, REFERENCE_NOW + 3600);
     const ok = verifyRouteAcceptance(acceptance, kp.publicKey);
     expect(ok).toBe(true);
   });
@@ -450,7 +444,7 @@ describe("GATE-05: Service negotiation and route commitment", () => {
   test("route acceptance with wrong key fails", () => {
     const kpA = generateNodeKeypair();
     const kpB = generateNodeKeypair();
-    const acceptance = signRouteAcceptance({routeId:"route123",hops:[{nodeId:kpA.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true}],requirementDigest:"",expiry:REFERENCE_NOW+3600,initiatorNodeId:"",agreementDigest:""} as any, 0, {nodeId:kpA.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true} as any, {nodeId:kpA.nodeId,capability:"MESH_RELAY",requirementDigest:"",allocatedBandwidthBps:0,expiry:REFERENCE_NOW+3600,policyVersion:1} as any, kpA.nodeId, kpA.secretKey, REFERENCE_NOW + 3600);
+    const acceptance = signRouteAcceptance({hops:[{nodeId:kpA.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true}],requirementDigest:"",expiry:REFERENCE_NOW+3600,initiatorNodeId:"",agreementDigest:""} as any, 0, {nodeId:kpA.nodeId,capability:"MESH_RELAY",endpoint:"10.0.0.1:7788",linkUp:true} as any, {nodeId:kpA.nodeId,capability:"MESH_RELAY",requirementDigest:"",allocatedBandwidthBps:0,expiry:REFERENCE_NOW+3600,policyVersion:1} as any, kpA.nodeId, kpA.secretKey, REFERENCE_NOW + 3600);
     const ok = verifyRouteAcceptance(acceptance, kpB.publicKey);
     expect(ok).toBe(false);
   });

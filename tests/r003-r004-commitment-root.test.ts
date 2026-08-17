@@ -13,17 +13,17 @@
  *
  * The key property: route_id is now DERIVED from the commitment_root, not
  * from a caller-chosen proposal identifier. Two routes with the same
- * proposal.routeId but different acceptances (or different commitment_nonce)
+ * proposal terms but different acceptances (or different commitment_nonce)
  * get DIFFERENT route_ids.
  *
  * Adversarial tests:
- *   - two routes with same proposal.routeId but different acceptances → different route_ids
+ *   - two routes with same proposal terms but different acceptances → different route_ids
  *   - two commitments with same proposal + acceptances but different commitment_nonce → different route_ids
  *   - route_id == toHex(commitment_root) (the canonical identity)
  *   - commitment_root changes if any acceptance signature changes
  *   - commitment_root changes if the proposal changes
  *   - commitment_root changes if the commitment_nonce changes
- *   - the committer signature is over the commitment_root (not over proposal.routeId)
+ *   - the committer signature is over the commitment_root (not over any caller-chosen id)
  */
 
 import { describe, test, expect } from "bun:test";
@@ -54,7 +54,6 @@ function makeProposal(kps: { nodeId: string; publicKey: Uint8Array; secretKey: U
     linkUp: true,
   }));
   const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
     hops,
     requirementDigest: bytesToHex(randomBytes(32)),
     expiry: NOW + 3600,
@@ -81,7 +80,7 @@ function makeAcceptances(proposal: RouteProposal, hops: RouteHop[], kps: { nodeI
 }
 
 describe("R-003/R-004: Canonical commitment-root reconciliation", () => {
-  test("route_id is DERIVED from commitment_root (not proposal.routeId)", () => {
+  test("route_id is DERIVED from commitment_root (no caller-chosen routeId)", () => {
     const kps = [generateNodeKeypair(), generateNodeKeypair()];
     const initiator = generateNodeKeypair();
     const { proposal, hops } = makeProposal(kps, initiator);
@@ -96,8 +95,6 @@ describe("R-003/R-004: Canonical commitment-root reconciliation", () => {
     // Per spec/07 §5.4 (FROZEN): route_id = "route:" + lowercase_hex(commitment_root)
     expect(commitment.routeId).toBe(deriveRouteId(commitment.commitmentRoot));
     expect(commitment.routeId).toBe("route:" + bytesToHex(commitment.commitmentRoot));
-    // route_id != proposal.routeId (the old caller-chosen identifier)
-    expect(commitment.routeId).not.toBe(proposal.routeId);
 
     // CommittedRoute also carries the commitment_root
     const route = createCommittedRoute(commitment);
@@ -105,13 +102,11 @@ describe("R-003/R-004: Canonical commitment-root reconciliation", () => {
     expect(route.commitmentRoot).toEqual(commitment.commitmentRoot);
   });
 
-  test("two routes with same proposal.routeId but different acceptances → DIFFERENT route_ids", () => {
+  test("two routes with different hops → DIFFERENT route_ids (different commitment_roots)", () => {
     const kps1 = [generateNodeKeypair(), generateNodeKeypair()];
     const kps2 = [generateNodeKeypair(), generateNodeKeypair()]; // different relay/gateway
     const initiator = generateNodeKeypair();
 
-    // Both proposals use the SAME routeId (caller-chosen)
-    const routeId = bytesToHex(randomBytes(32));
     const hops1: RouteHop[] = kps1.map((kp, i) => ({
       nodeId: kp.nodeId, capability: i === 1 ? "INTERNET_GATEWAY" : "MESH_RELAY",
       endpoint: `10.0.0.${i + 1}:7788`, linkUp: true,
@@ -121,11 +116,11 @@ describe("R-003/R-004: Canonical commitment-root reconciliation", () => {
       endpoint: `10.0.0.${i + 1}:7789`, linkUp: true,
     }));
     const proposal1: RouteProposal = {
-      routeId, hops: hops1, requirementDigest: bytesToHex(randomBytes(32)),
+      hops: hops1, requirementDigest: bytesToHex(randomBytes(32)),
       expiry: NOW + 3600, initiatorNodeId: initiator.nodeId, agreementDigest: bytesToHex(randomBytes(32)),
     };
     const proposal2: RouteProposal = {
-      routeId, hops: hops2, requirementDigest: bytesToHex(randomBytes(32)),
+      hops: hops2, requirementDigest: bytesToHex(randomBytes(32)),
       expiry: NOW + 3600, initiatorNodeId: initiator.nodeId, agreementDigest: bytesToHex(randomBytes(32)),
     };
 
@@ -153,7 +148,7 @@ describe("R-003/R-004: Canonical commitment-root reconciliation", () => {
     expect(r2.ok).toBe(true);
     if (!r1.ok || !r2.ok) return;
 
-    // Same proposal.routeId, but different route_ids (different commitment_roots)
+    // Same proposal terms, but different route_ids (different commitment_roots)
     expect(r1.commitment.routeId).not.toBe(r2.commitment.routeId);
     expect(r1.commitment.commitmentRoot).not.toEqual(r2.commitment.commitmentRoot);
   });
@@ -196,10 +191,9 @@ describe("R-003/R-004: Canonical commitment-root reconciliation", () => {
     const initiator = generateNodeKeypair();
     const { proposal: p1, hops: h1 } = makeProposal(kps, initiator);
 
-    // Different proposal with different hops (same routeId but different nodeIds)
+    // Different proposal with different hops (different nodeIds → different commitment_roots)
     const kps2 = [generateNodeKeypair(), generateNodeKeypair()];
     const { proposal: p2, hops: h2 } = makeProposal(kps2, initiator);
-    p2.routeId = p1.routeId; // same caller-chosen routeId
 
     const sa1 = new Map<number, ServiceAgreement>();
     const hpk1 = new Map<string, Uint8Array>();
@@ -225,7 +219,7 @@ describe("R-003/R-004: Canonical commitment-root reconciliation", () => {
     expect(deriveRouteId(root1)).not.toBe(deriveRouteId(root2));
   });
 
-  test("the committer signature is over the commitment_root (tampering with routeId doesn't affect signature validity)", () => {
+  test("the committer signature is over the commitment_root (route_id derived from commitment_root)", () => {
     const kps = [generateNodeKeypair(), generateNodeKeypair()];
     const initiator = generateNodeKeypair();
     const { proposal, hops } = makeProposal(kps, initiator);
@@ -383,7 +377,6 @@ describe("R-003/R-004: Merkle commitment_root algorithm properties", () => {
 describe("R-003/R-004: Canonical golden vectors (V-ROUTE-COMMIT-001)", () => {
   test("single-hop-route golden vector — exact commitment_root bytes match", () => {
     const proposal: RouteProposal = {
-      routeId: "a".repeat(64),
       hops: [{ nodeId: "node1", capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
       requirementDigest: "b".repeat(64),
       expiry: 1786876545,
@@ -404,13 +397,12 @@ describe("R-003/R-004: Canonical golden vectors (V-ROUTE-COMMIT-001)", () => {
     const rootHex = bytesToHex(root);
     const routeId = deriveRouteId(root);
     // Golden vector (FROZEN per spec/07 §5.3.1):
-    expect(rootHex).toBe("bc89ae9a85a75962a08943f47c0e455a98b00834efbd78a2778f5abbcb5f08c3");
-    expect(routeId).toBe("route:bc89ae9a85a75962a08943f47c0e455a98b00834efbd78a2778f5abbcb5f08c3");
+    expect(rootHex).toBe("5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9");
+    expect(routeId).toBe("route:5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9");
   });
 
   test("two-hop-route golden vector — exact commitment_root bytes match (odd-node duplication)", () => {
     const proposal: RouteProposal = {
-      routeId: "1".repeat(64),
       hops: [
         { nodeId: "relay1", capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true },
         { nodeId: "gateway1", capability: "INTERNET_GATEWAY", endpoint: "10.0.0.2:7789", linkUp: true },
@@ -446,7 +438,7 @@ describe("R-003/R-004: Canonical golden vectors (V-ROUTE-COMMIT-001)", () => {
     const rootHex = bytesToHex(root);
     const routeId = deriveRouteId(root);
     // Golden vector (FROZEN per spec/07 §5.3.1):
-    expect(rootHex).toBe("86d96b685e531625db0770b953985e3e28bb90b38fc6ebaafefbe6b7597f7c4d");
-    expect(routeId).toBe("route:86d96b685e531625db0770b953985e3e28bb90b38fc6ebaafefbe6b7597f7c4d");
+    expect(rootHex).toBe("ad583d66f371808c96e3ee5bd7ddd85a7a56c40f6ac733359f17788f7f828c86");
+    expect(routeId).toBe("route:ad583d66f371808c96e3ee5bd7ddd85a7a56c40f6ac733359f17788f7f828c86");
   });
 });

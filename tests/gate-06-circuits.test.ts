@@ -184,7 +184,6 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   // --- 12. PROPOSAL_TO_CIRCUIT_FORBIDDEN throws ---
   test("PROPOSAL_TO_CIRCUIT_FORBIDDEN throws", () => {
     const proposal: RouteProposal = {
-      routeId: "test",
       hops: [],
       requirementDigest: "",
       expiry: 0,

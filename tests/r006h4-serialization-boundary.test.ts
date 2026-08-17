@@ -80,7 +80,6 @@ describe("R-006H4: Serialization boundary — deserialized proof objects are rej
   test("deserialized RouteCommitment → rejected by createBrandedCommittedRoute", () => {
     const kp = generateNodeKeypair();
     const proposal: RouteProposal = {
-      routeId: bytesToHex(randomBytes(32)),
       hops: [{ nodeId: kp.nodeId, capability: "MESH_RELAY", endpoint: "10.0.0.1:7788", linkUp: true }],
       requirementDigest: bytesToHex(randomBytes(32)),
       expiry: NOW + 3600,

@@ -23,7 +23,6 @@ export function makeRouteTestSetup(nodeIds: string[], kps: NodeKeypair[], initia
   }));
 
   const proposal: RouteProposal = {
-    routeId: bytesToHex(randomBytes(32)),
     hops,
     requirementDigest: bytesToHex(randomBytes(32)),
     expiry: REFERENCE_NOW + 3600,
