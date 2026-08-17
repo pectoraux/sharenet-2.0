@@ -781,3 +781,52 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-003/R-004 are now CLOSED: route_id is cryptographically derived from commitment_root = BLAKE3(proposal_digest || acceptance_root || commitment_nonce). Two different route contents can never share the same route_id. The commitment_root is carried through the entire trust chain (RouteCommitment → CommittedRoute → BrandedCommittedRoute → setupCircuit) as the canonical cryptographic anchor.
+
+---
+Task ID: R-003/R-004-hardening-v2 (canonical Merkle + immutability)
+Agent: main (Z.ai Code)
+Task: Reconcile implementation exactly to normative spec/07 §5.3.1-5.4: canonical Merkle commitment construction, normative route_id representation, immutable proof artifacts.
+
+Work Log:
+- Frozen the exact Merkle algorithm in spec/07-routing.md §5.3.1 (Canonical Merkle Commitment Construction):
+  - Leaf encoding: proposal_leaf = BLAKE3(domain || u8(0x00) || canonicalEncode(RouteProposal))
+  - acceptance_leaf_i = BLAKE3(domain || u8(0x01) || u32be(i) || canonicalEncode(RouteAcceptance_i))
+  - Parent: parent = BLAKE3(domain || u8(0x02) || left || right)
+  - Leaf ordering: [proposal_leaf, acceptance_leaf_0, ..., acceptance_leaf_N-1]
+  - Odd-node handling: duplicate last node (standard "duplicate last")
+  - Single leaf: that leaf IS the root
+  - commitment_nonce NOT part of the Merkle tree (only in the signature, §5.3.2)
+- Frozen spec/07 §5.3.2 (Source Signature): payload = domain || commitment_root (32) || commitment_nonce (16)
+- Frozen spec/07 §5.4 (CommittedRoute): route_id = "route:" + lowercase_hex(commitment_root)
+
+- Replaced the old `BLAKE3(proposalDigest || BLAKE3(sigs) || nonce)` construction with the canonical Merkle tree in `reference/routing/route.ts`:
+  - Added `computeProposalLeaf()`, `computeAcceptanceLeaf()`, `computeParent()`
+  - `computeCommitmentRoot(proposal, acceptances)` — now takes 2 args (no nonce), builds the Merkle tree
+  - `deriveRouteId(commitmentRoot)` — now returns `"route:" + toHex(commitmentRoot)` (normative representation)
+  - The commitment_nonce is generated in `createRouteCommitment` and included only in the signature
+
+- Made RouteCommitment immutable:
+  - `deepFreeze()` helper — recursively freezes objects + arrays (skips TypedArrays in Bun)
+  - `frozenCopy()` helper — defensive copies of byte arrays
+  - `createRouteCommitment` freezes the commitment, proposal, acceptances, and all byte arrays
+  - `createCommittedRoute` freezes the committed route
+  - `createBrandedCommittedRoute` freezes the branded route
+  - The frozen outer object prevents property replacement; defensive copies prevent buffer mutation
+
+- Updated `circuit.ts` + `distributed-setup.ts`: routeIdPrefix now strips the `"route:"` prefix before extracting hex
+
+- Updated `gate-05-route-commitment.test.ts`: routeId assertion now checks `"route:" + hex`
+
+- Updated `r003-r004-commitment-root.test.ts`:
+  - All `computeCommitmentRoot` calls updated to 2-arg API (no nonce)
+  - All route_id assertions updated to `"route:" + hex` format
+  - Replaced "different nonce → different route_ids" test with "same proposal + acceptances → same root regardless of nonce" (correct behavior: nonce only affects signature, not root)
+  - Added 5 immutability adversarial tests: mutation of routeId, proposal, acceptances, commitmentRoot, CommittedRoute — all fail silently
+  - Added 4 Merkle algorithm property tests: single-acceptance, three-acceptance (even), five-acceptance (odd-node duplication), reordering changes root
+
+Stage Summary:
+- Tests: 291 → 300 pass, 0 fail (+9 new: 5 immutability + 4 Merkle algorithm). 798 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-003/R-004 hardening v2: the commitment_root is now a canonical Merkle tree (not a flat hash), route_id is "route:" + hex(commitment_root), and RouteCommitment/CommittedRoute/BrandedCommittedRoute are all immutable (frozen + defensive copies).

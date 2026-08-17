@@ -275,61 +275,202 @@ export function verifyAcceptanceBinding(
 }
 
 // -----------------------------------------------------------------------
-// Commitment Root (R-003/R-004 canonical commitment model)
+// Commitment Root — Canonical Merkle Construction (FROZEN per spec/07 §5.3.1)
 // -----------------------------------------------------------------------
 
+/** Domain tag for the Merkle commitment construction (FROZEN). */
+export const MERKLE_COMMITMENT_DOMAIN = "SHARENET/ROUTE/COMMITMENT/MERKLE/1";
+
+/** Leaf-type byte: proposal (0x00). */
+const LEAF_TYPE_PROPOSAL = 0x00;
+/** Leaf-type byte: acceptance (0x01). */
+const LEAF_TYPE_ACCEPTANCE = 0x01;
+/** Node-type byte: internal/parent (0x02). */
+const NODE_TYPE_INTERNAL = 0x02;
+
 /**
- * Compute the canonical commitment_root over a proposal + ordered acceptances
- * + commitment_nonce.
+ * Canonical CBOR encoding of a RouteProposal for the Merkle leaf.
+ * Uses integer-keyed map per ADR-0004.
+ */
+function canonicalEncodeProposal(proposal: RouteProposal): Uint8Array {
+  const m = new Map<number, unknown>([
+    [1, proposal.routeId],
+    [2, proposal.hops.map((h) => h.nodeId)],
+    [3, proposal.hops.map((h) => h.capability)],
+    [4, proposal.hops.map((h) => h.endpoint)],
+    [5, proposal.hops.map((h) => h.linkUp)],
+    [6, proposal.requirementDigest],
+    [7, proposal.expiry],
+    [8, proposal.initiatorNodeId],
+    [9, proposal.agreementDigest],
+  ]);
+  return canonicalEncode(m);
+}
+
+/**
+ * Canonical CBOR encoding of a RouteAcceptance for the Merkle leaf.
+ * Uses integer-keyed map per ADR-0004.
+ */
+function canonicalEncodeAcceptance(acc: RouteAcceptance): Uint8Array {
+  const m = new Map<number, unknown>([
+    [1, acc.proposalDigestHex],
+    [2, acc.hopIndex],
+    [3, acc.hopDigestHex],
+    [4, acc.serviceDigestHex],
+    [5, acc.acceptorNodeId],
+    [6, acc.acceptanceNonce],
+    [7, acc.expiry],
+    [8, acc.signature],
+  ]);
+  return canonicalEncode(m);
+}
+
+/**
+ * Compute a Merkle leaf for the proposal.
  *
- * Per spec/07 §5.3:
- *   commitment_root = BLAKE3-256(
- *     proposal_digest       (32 bytes — BLAKE3 of canonical RouteProposal)
- *     || acceptance_root   (32 bytes — BLAKE3 of ordered acceptance signatures)
- *     || commitment_nonce  (16 bytes — fresh per commitment)
- *   )
+ * proposal_leaf = BLAKE3-256(
+ *   utf8(MERKLE_COMMITMENT_DOMAIN) || u8(0x00) || canonicalEncode(RouteProposal)
+ * )
+ */
+function computeProposalLeaf(proposal: RouteProposal): Uint8Array {
+  const domain = new TextEncoder().encode(MERKLE_COMMITMENT_DOMAIN);
+  const body = canonicalEncodeProposal(proposal);
+  const input = new Uint8Array(domain.length + 1 + body.length);
+  input.set(domain, 0);
+  input[domain.length] = LEAF_TYPE_PROPOSAL;
+  input.set(body, domain.length + 1);
+  return blake3(input, { dkLen: 32 });
+}
+
+/**
+ * Compute a Merkle leaf for an acceptance.
  *
- * The commitment_root IS the route's canonical identity. route_id is derived
- * from it: route_id = toHex(commitment_root). This prevents two different
- * route contents from sharing the same route_id merely because they share a
- * caller-chosen proposal identifier.
+ * acceptance_leaf_i = BLAKE3-256(
+ *   utf8(MERKLE_COMMITMENT_DOMAIN) || u8(0x01) || u32be(i) || canonicalEncode(RouteAcceptance_i)
+ * )
+ */
+function computeAcceptanceLeaf(acc: RouteAcceptance, hopIndex: number): Uint8Array {
+  const domain = new TextEncoder().encode(MERKLE_COMMITMENT_DOMAIN);
+  const body = canonicalEncodeAcceptance(acc);
+  const indexBuf = new Uint8Array(4);
+  new DataView(indexBuf.buffer).setUint32(0, hopIndex, false); // big-endian
+  const input = new Uint8Array(domain.length + 1 + 4 + body.length);
+  input.set(domain, 0);
+  input[domain.length] = LEAF_TYPE_ACCEPTANCE;
+  input.set(indexBuf, domain.length + 1);
+  input.set(body, domain.length + 1 + 4);
+  return blake3(input, { dkLen: 32 });
+}
+
+/**
+ * Compute a Merkle parent from two children.
+ *
+ * parent = BLAKE3-256(
+ *   utf8(MERKLE_COMMITMENT_DOMAIN) || u8(0x02) || left (32 bytes) || right (32 bytes)
+ * )
+ */
+function computeParent(left: Uint8Array, right: Uint8Array): Uint8Array {
+  const domain = new TextEncoder().encode(MERKLE_COMMITMENT_DOMAIN);
+  const input = new Uint8Array(domain.length + 1 + 32 + 32);
+  input.set(domain, 0);
+  input[domain.length] = NODE_TYPE_INTERNAL;
+  input.set(left, domain.length + 1);
+  input.set(right, domain.length + 1 + 32);
+  return blake3(input, { dkLen: 32 });
+}
+
+/**
+ * Compute the canonical commitment_root via a Merkle tree.
+ *
+ * Per spec/07 §5.3.1 (FROZEN):
+ *
+ *   Leaves: [proposal_leaf, acceptance_leaf_0, acceptance_leaf_1, ...]
+ *   Odd-node handling: duplicate the last node (standard "duplicate last").
+ *   Single leaf: that leaf IS the root (no duplication).
+ *
+ * The commitment_nonce is NOT part of the Merkle tree — it is included
+ * only in the source signature payload (see routeCommitmentSigningPayload).
+ *
+ * The commitment_root is the canonical cryptographic identity of the
+ * accepted route.
  */
 export function computeCommitmentRoot(
   proposal: RouteProposal,
   acceptances: RouteAcceptance[],
-  commitmentNonce: Uint8Array,
 ): Uint8Array {
-  // 1. proposal_digest (already computed by proposalDigest())
-  const proposalDigestBytes = proposalDigest(proposal);
-
-  // 2. acceptance_root = BLAKE3(ordered(acceptance signatures))
-  //    Each acceptance's signature is the canonical representation of the
-  //    acceptor's signed agreement. The ordered concatenation of these
-  //    signatures binds every participant's acceptance into the root.
-  const h = blake3.create({ dkLen: 32 });
-  for (const acc of acceptances) {
-    h.update(acc.signature);
+  // 1. Build the leaf level.
+  const leaves: Uint8Array[] = [computeProposalLeaf(proposal)];
+  for (let i = 0; i < acceptances.length; i++) {
+    leaves.push(computeAcceptanceLeaf(acceptances[i]!, i));
   }
-  const acceptanceRoot = h.digest();
 
-  // 3. commitment_root = BLAKE3(proposal_digest || acceptance_root || commitment_nonce)
-  const rootHash = blake3(
-    new Uint8Array([
-      ...proposalDigestBytes,
-      ...acceptanceRoot,
-      ...commitmentNonce,
-    ]),
-    { dkLen: 32 },
-  );
-  return rootHash;
+  // 2. Build the tree bottom-up.
+  let level = leaves;
+  while (level.length > 1) {
+    const nextLevel: Uint8Array[] = [];
+    for (let i = 0; i < level.length; i += 2) {
+      const left = level[i]!;
+      const right = i + 1 < level.length ? level[i + 1]! : left; // duplicate last if odd
+      nextLevel.push(computeParent(left, right));
+    }
+    level = nextLevel;
+  }
+
+  // 3. The single remaining node is the root.
+  return level[0]!;
 }
 
 /**
  * Derive the canonical route_id from a commitment_root.
- * Per spec/07 §5.4: route_id = toHex(commitment_root).
+ *
+ * Per spec/07 §5.4 (FROZEN): route_id = "route:" + lowercase_hex(commitment_root).
+ * The "route:" prefix distinguishes route identifiers from other hex-encoded
+ * identifiers in the ShareNet ecosystem.
  */
 export function deriveRouteId(commitmentRoot: Uint8Array): string {
-  return toHex(commitmentRoot);
+  return "route:" + toHex(commitmentRoot);
+}
+
+// -----------------------------------------------------------------------
+// Immutability helpers
+// -----------------------------------------------------------------------
+
+/**
+ * Create a defensive copy of a Uint8Array.
+ * The copy is NOT frozen here — deepFreeze handles freezing.
+ * The copy ensures the caller cannot hold a reference to the internal buffer.
+ */
+function frozenCopy(bytes: Uint8Array): Uint8Array {
+  const copy = new Uint8Array(bytes.length);
+  copy.set(bytes);
+  return copy;
+}
+
+/**
+ * Deep-freeze an object and all its nested properties.
+ * Used for RouteCommitment, CommittedRoute, and BrandedCommittedRoute.
+ *
+ * Note: TypedArrays (Uint8Array) are NOT frozen directly because
+ * Object.freeze on a TypedArray throws in some runtimes (Bun). Instead,
+ * byte arrays are defensive copies — the caller cannot hold a reference
+ * to the internal buffer. The frozen outer object prevents replacing
+ * the property reference.
+ */
+function deepFreeze<T>(obj: T): T {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Object.isFrozen(obj)) return obj; // already frozen — skip
+  // Skip TypedArrays (can't freeze in Bun; defensive copies suffice)
+  if (obj instanceof Uint8Array) return obj;
+  // Freeze arrays
+  if (Array.isArray(obj)) {
+    for (const item of obj) deepFreeze(item);
+    return Object.freeze(obj) as T;
+  }
+  // Freeze plain objects
+  for (const key of Object.keys(obj as Record<string, unknown>)) {
+    deepFreeze((obj as Record<string, unknown>)[key]);
+  }
+  return Object.freeze(obj) as T;
 }
 
 // -----------------------------------------------------------------------
@@ -348,13 +489,15 @@ export interface RouteCommitment {
   acceptances: RouteAcceptance[];
   /**
    * The canonical commitment_root (32 bytes).
-   * Per spec/07 §5.3: BLAKE3-256(proposal_digest || acceptance_root || commitment_nonce).
+   * Per spec/07 §5.3.1 (FROZEN): Merkle root over
+   * [proposal_leaf, acceptance_leaf_0, acceptance_leaf_1, ...].
+   * Does NOT depend on commitmentNonce — the nonce is in the signature only.
    */
   commitmentRoot: Uint8Array;
   /**
-   * Fresh per-commitment nonce (16 bytes). Included in the commitment_root
-   * derivation to ensure each commitment is unique even with identical
-   * proposal + acceptances.
+   * Fresh per-commitment nonce (16 bytes). NOT part of the Merkle tree;
+   * included only in the source signature payload to ensure each
+   * commitment signature is unique.
    */
   commitmentNonce: Uint8Array;
   committerSignature: Uint8Array;
@@ -487,31 +630,42 @@ export function createRouteCommitment(
   }
 
   // 3. All verifications passed — compute the canonical commitment_root.
-  // Per R-003/R-004: the commitment_root IS the route's canonical identity.
-  // It binds the proposal + all ordered acceptances + a fresh commitment_nonce.
-  const commitmentNonce = randomBytes(16);
-  const commitmentRoot = computeCommitmentRoot(proposal, acceptances, commitmentNonce);
+  // Per spec/07 §5.3.1 (FROZEN): the commitment_root is a Merkle root over
+  // [proposal_leaf, acceptance_leaf_0, ...]. It does NOT depend on the
+  // commitment_nonce (the nonce is in the signature only).
+  const commitmentRoot = computeCommitmentRoot(proposal, acceptances);
   const routeId = deriveRouteId(commitmentRoot);
 
-  // 4. Sign the commitment_root (NOT the proposal's routeId or acceptance signatures).
-  // Per spec/07 §5.3: the source signs over the commitment_root, which transitively
-  // binds the proposal + all acceptances + the commitment_nonce.
+  // 4. Generate the commitment_nonce + sign over commitment_root + nonce.
+  // Per spec/07 §5.3.2: the source signs over the commitment_root and
+  // commitment_nonce to ensure each commitment signature is unique.
+  const commitmentNonce = randomBytes(16);
   const payload = routeCommitmentSigningPayload(commitmentRoot, commitmentNonce);
   const signature = signMessage(committerSecretKey, payload);
 
-  const commitment: RouteCommitment = {
+  // 5. Build the immutable commitment artifact.
+  // Per R-003/R-004 hardening: the commitment is FROZEN — all byte arrays
+  // are defensive copies and the entire object tree is deep-frozen.
+  // This prevents post-registration mutation that would invalidate the
+  // WeakSet trust guarantee.
+  const commitment: RouteCommitment = deepFreeze({
     routeId,
-    proposal,
-    acceptances,
-    commitmentRoot,
-    commitmentNonce,
-    committerSignature: signature,
+    proposal: deepFreeze({ ...proposal, hops: Object.freeze(proposal.hops.map(h => deepFreeze({ ...h }))) }),
+    acceptances: Object.freeze(acceptances.map(a => deepFreeze({
+      ...a,
+      acceptanceNonce: frozenCopy(a.acceptanceNonce),
+      signature: frozenCopy(a.signature),
+    }))) as unknown as RouteAcceptance[],
+    commitmentRoot: frozenCopy(commitmentRoot),
+    commitmentNonce: frozenCopy(commitmentNonce),
+    committerSignature: frozenCopy(signature),
     committedAt: now,
-  };
+  });
 
   // R-006H3: Register the genuine RouteCommitment in the private WeakSet.
   // This allows isRouteCommitment() to verify it was produced through
   // this function (which verified all signatures + bindings).
+  // The object is FROZEN — post-registration mutation is impossible.
   registerRouteCommitment(commitment);
 
   return {
@@ -565,15 +719,15 @@ export interface CommittedRoute {
 }
 
 export function createCommittedRoute(commitment: RouteCommitment): CommittedRoute {
-  return {
+  return deepFreeze({
     routeId: commitment.routeId,
     hops: commitment.proposal.hops,
     expiry: commitment.proposal.expiry,
     initiatorNodeId: commitment.proposal.initiatorNodeId,
     agreementDigest: commitment.proposal.agreementDigest,
     committedAt: commitment.committedAt,
-    commitmentRoot: commitment.commitmentRoot,
-  };
+    commitmentRoot: frozenCopy(commitment.commitmentRoot),
+  });
 }
 
 // -----------------------------------------------------------------------

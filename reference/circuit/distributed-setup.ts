@@ -495,7 +495,12 @@ export function establishDistributedCircuit(
   // 3. Compute circuit ID + route commitment digest
   const circuitId = deriveCircuitId(route.routeId, initiatorX25519PublicKey);
   const circuitIdHex = toHex(circuitId);
-  const routeIdPrefix = parseInt(route.routeId.slice(0, 8), 16);
+  // Per R-003/R-004: routeId is "route:" + hex(commitment_root).
+  // Strip the prefix to get the raw hex for the nonce prefix.
+  const routeIdHex = route.routeId.startsWith("route:")
+    ? route.routeId.slice(6)
+    : route.routeId;
+  const routeIdPrefix = parseInt(routeIdHex.slice(0, 8), 16);
   const commitDigestHex = toHex(routeCommitmentDigest(route));
 
   // 4. Process each ack

@@ -285,7 +285,8 @@ describe("GATE-05: Service negotiation and route commitment", () => {
       // Create committed route
       const route = createCommittedRoute(commitmentResult.commitment);
       // R-003/R-004: route_id is now DERIVED from commitment_root, not proposal.routeId
-      expect(route.routeId).toBe(bytesToHex(commitmentResult.commitment.commitmentRoot));
+      // Per spec/07 §5.4: route_id = "route:" + lowercase_hex(commitment_root)
+      expect(route.routeId).toBe("route:" + bytesToHex(commitmentResult.commitment.commitmentRoot));
       expect(route.commitmentRoot).toEqual(commitmentResult.commitment.commitmentRoot);
       expect(route.hops.length).toBe(2);
       expect(route.hops[0]!.nodeId).toBe(kps.relay.nodeId);

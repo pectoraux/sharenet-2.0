@@ -24,6 +24,32 @@ import type { AuthenticatedLink } from "./authenticated-link";
 import { isAuthenticatedLink } from "./authenticated-link";
 
 // -----------------------------------------------------------------------
+// Immutability helpers (R-003/R-004 hardening: proof artifacts are immutable)
+// -----------------------------------------------------------------------
+
+/** Create a defensive copy of a Uint8Array (not frozen — deepFreeze handles that). */
+function frozenCopy(bytes: Uint8Array): Uint8Array {
+  const copy = new Uint8Array(bytes.length);
+  copy.set(bytes);
+  return copy;
+}
+
+/** Deep-freeze an object and all its nested properties (skips TypedArrays). */
+function deepFreeze<T>(obj: T): T {
+  if (obj === null || typeof obj !== "object") return obj;
+  if (Object.isFrozen(obj)) return obj;
+  if (obj instanceof Uint8Array) return obj; // skip TypedArrays
+  if (Array.isArray(obj)) {
+    for (const item of obj) deepFreeze(item);
+    return Object.freeze(obj) as T;
+  }
+  for (const key of Object.keys(obj as Record<string, unknown>)) {
+    deepFreeze((obj as Record<string, unknown>)[key]);
+  }
+  return Object.freeze(obj) as T;
+}
+
+// -----------------------------------------------------------------------
 // Private WeakSet registries (genuinely unforgeable)
 // -----------------------------------------------------------------------
 
@@ -318,15 +344,15 @@ export function createBrandedCommittedRoute(
     }
   }
 
-  const route: BrandedCommittedRoute = {
+  const route: BrandedCommittedRoute = deepFreeze({
     routeId: commitment.routeId,
     hops: validatedHops, // genuine ValidatedHop[] — NO CAST
     expiry: commitment.proposal.expiry,
     initiatorNodeId: commitment.proposal.initiatorNodeId,
     agreementDigest: commitment.proposal.agreementDigest,
     committedAt: commitment.committedAt,
-    commitmentRoot: commitment.commitmentRoot,
-  };
+    commitmentRoot: frozenCopy(commitment.commitmentRoot),
+  });
   brandedRouteRegistry.add(route);
   return route;
 }

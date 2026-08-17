@@ -167,6 +167,95 @@ RouteCommitment = {
 
 Signature domain: `"SHARENET/ROUTE/COMMITMENT/1"`.
 
+#### 5.3.1 Canonical Merkle Commitment Construction (FROZEN)
+
+The `commitment_root` is computed via a canonical Merkle tree. The
+exact algorithm is frozen here; all implementations MUST produce
+identical bytes for the same inputs.
+
+**Domain separation:**
+`"SHARENET/ROUTE/COMMITMENT/MERKLE/1"`
+
+**Leaf encoding:**
+
+Each leaf is a BLAKE3-256 hash of a domain-prefixed canonical encoding:
+
+```
+proposal_leaf  = BLAKE3-256(
+    utf8("SHARENET/ROUTE/COMMITMENT/MERKLE/1")
+    || u8(0x00)                          ; leaf-type: proposal (0x00)
+    || canonicalEncode(RouteProposal)    ; canonical CBOR of the proposal
+)
+
+acceptance_leaf_i = BLAKE3-256(
+    utf8("SHARENET/ROUTE/COMMITMENT/MERKLE/1")
+    || u8(0x01)                          ; leaf-type: acceptance (0x01)
+    || u32be(i)                          ; hop index (4 bytes, big-endian)
+    || canonicalEncode(RouteAcceptance_i) ; canonical CBOR of acceptance i
+)
+```
+
+**Leaf ordering:**
+
+The leaves are ordered as:
+```
+[proposal_leaf, acceptance_leaf_0, acceptance_leaf_1, ..., acceptance_leaf_N-1]
+```
+
+The proposal leaf is always first; acceptance leaves follow in hop-index
+order (0, 1, 2, ...). This ordering is fixed and MUST NOT vary.
+
+**Parent hashing:**
+
+Each internal node is:
+```
+parent = BLAKE3-256(
+    utf8("SHARENET/ROUTE/COMMITMENT/MERKLE/1")
+    || u8(0x02)                          ; node-type: internal (0x02)
+    || left_child                         ; 32 bytes
+    || right_child                        ; 32 bytes
+)
+```
+
+**Odd-node handling:**
+
+When a level has an odd number of nodes, the last node is duplicated
+(promoted to the next level by pairing with itself). This is the
+standard "duplicate last" Merkle approach.
+
+**Tree shape:**
+
+The tree is built bottom-up: hash all leaves at level 0, then pair and
+hash to produce level 1, and so on until a single root remains. If there
+is only one leaf, that leaf IS the root (no duplication at the
+single-leaf level).
+
+**Commitment nonce inclusion:**
+
+The `commitment_nonce` (16 bytes) is NOT part of the Merkle tree. It
+is included in the `source_signature` signing payload (see §5.3.2) to
+ensure each commitment is unique even with identical proposal +
+acceptances. The `commitment_root` itself does not depend on the nonce.
+
+**commitment_root:**
+
+The `commitment_root` is the final single hash at the root of the
+Merkle tree (32 bytes). It is the canonical cryptographic identity of
+the accepted route.
+
+#### 5.3.2 Source Signature over the Commitment (FROZEN)
+
+The source signs over the `commitment_root` and `commitment_nonce`:
+
+```
+signature_payload = utf8("SHARENET/ROUTE/COMMITMENT/1")
+    || commitment_root      ; 32 bytes
+    || commitment_nonce     ; 16 bytes
+```
+
+The signature transitively binds the proposal + all ordered acceptances
+(via the commitment_root) plus the fresh nonce.
+
 ### 5.4 CommittedRoute
 
 The state object a node holds once a `RouteCommitment` is finalized.
@@ -176,14 +265,16 @@ It is the **only** input that the Circuit layer MAY consume (see
 ```
 CommittedRoute = {
   commitment:         RouteCommitment,
-  route_id:           text,    ; hex of commitment_root
+  route_id:           text,    ; "route:" + lowercase_hex(commitment_root)
   established_at:      uint,
   state:              "ACTIVE" | "EXPIRED" | "REVOKED",
 }
 ```
 
-`route_id` is `route:hex(commitment_root)` and is the canonical handle
-for the route.
+`route_id` is `"route:" + lowercase_hex(commitment_root)` and is the
+canonical handle for the route. The `route:` prefix distinguishes route
+identifiers from other hex-encoded identifiers in the ShareNet
+ecosystem (e.g. NodeId, CircuitId).
 
 ## 6. Invariants
 

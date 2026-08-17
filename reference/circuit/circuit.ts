@@ -365,11 +365,18 @@ export function setupCircuit(
   const initiatorPublicKey = x25519.getPublicKey(initiatorSecretKey);
 
   // Compute CircuitId
+  // Per R-003/R-004: routeId is "route:" + hex(commitment_root).
+  // The CircuitId derivation uses the full routeId string (including prefix).
   const circuitId = deriveCircuitId(route.routeId, initiatorPublicKey);
   const circuitIdHex = toHex(circuitId);
 
-  // Route ID prefix (first 4 bytes of routeId hex as u32)
-  const routeIdPrefix = parseInt(route.routeId.slice(0, 8), 16);
+  // Route ID prefix (first 4 bytes of commitment_root hex as u32).
+  // Per R-003/R-004: routeId is "route:" + hex(commitment_root), so we
+  // extract the hex part after the "route:" prefix.
+  const routeIdHex = route.routeId.startsWith("route:")
+    ? route.routeId.slice(6) // strip "route:" prefix
+    : route.routeId; // backward compat (shouldn't happen with genuine branded routes)
+  const routeIdPrefix = parseInt(routeIdHex.slice(0, 8), 16);
 
   // Derive per-hop keys
   const hopKeys: HopKeyMaterial[] = [];
