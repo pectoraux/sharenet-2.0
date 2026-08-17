@@ -744,3 +744,40 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-002 is now FULLY CLOSED: the verifier identity is intrinsic to the ConsumedChallenge artifact (not caller-supplied), bound to the signerRole (RESPONDER→initiator, INITIATOR→responder), and enforced at every construction boundary. There is exactly one semantic meaning of LINK_UP: a genuine AuthenticatedLink, verified by the local endpoint, with full cryptographic + freshness + replay + lifetime + provenance proof.
+
+---
+Task ID: R-003/R-004-canonical-commitment-root
+Agent: main (Z.ai Code)
+Task: Reconcile the implementation with the canonical RouteCommitment/commitment-root model from spec/07 §5.3-5.4. Make route_id derive from commitment_root, not from a caller-chosen proposal identifier.
+
+Work Log:
+- Added `computeCommitmentRoot(proposal, acceptances, commitmentNonce)` to `reference/routing/route.ts`:
+  - `proposal_digest = proposalDigest(proposal)` (BLAKE3 of canonical RouteProposal)
+  - `acceptance_root = BLAKE3(ordered(acceptance signatures))` — binds every participant's signed acceptance
+  - `commitment_root = BLAKE3(proposal_digest || acceptance_root || commitment_nonce)` (32 bytes)
+- Added `deriveRouteId(commitmentRoot)` — `route_id = toHex(commitment_root)`.
+- Updated `RouteCommitment` interface: added `commitmentRoot: Uint8Array` + `commitmentNonce: Uint8Array`. `routeId` is now DERIVED from `commitmentRoot`, not from `proposal.routeId`.
+- Updated `routeCommitmentSigningPayload()`: now signs over `commitment_root + commitment_nonce` (not over `proposal.routeId + acceptance signatures + expiry`). The signature transitively binds the proposal + all acceptances + the nonce.
+- Updated `createRouteCommitment()`: generates a fresh `commitmentNonce`, computes `commitmentRoot`, derives `routeId`, signs over the root.
+- Updated `CommittedRoute` interface: added `commitmentRoot: Uint8Array` — carried through to the circuit layer.
+- Updated `createCommittedRoute()`: carries `commitmentRoot` from the commitment.
+- Updated `BrandedCommittedRoute` in `validated-types.ts`: added `commitmentRoot: Uint8Array` — the cryptographic anchor is now carried through the entire trust chain to `setupCircuit`.
+- Updated `createBrandedCommittedRoute()`: carries `commitmentRoot` from the genuine commitment.
+
+- Updated `tests/gate-05-route-commitment.test.ts`: the positive test now checks `route.routeId == bytesToHex(commitment.commitmentRoot)` (not `== proposal.routeId`), and verifies `route.commitmentRoot` is carried.
+
+- Created `tests/r003-r004-commitment-root.test.ts` (7 adversarial tests):
+  - route_id is DERIVED from commitment_root (not proposal.routeId)
+  - two routes with same proposal.routeId but different acceptances → DIFFERENT route_ids
+  - two commitments with same proposal + acceptances but different commitment_nonce → different route_ids
+  - commitment_root changes if any acceptance signature changes
+  - commitment_root changes if the proposal changes (different hops)
+  - the committer signature is over the commitment_root (routeId tamper doesn't affect it)
+  - commitment_root is deterministic for same inputs
+
+Stage Summary:
+- Tests: 284 → 291 pass, 0 fail (+7 new commitment-root tests). 789 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-003/R-004 are now CLOSED: route_id is cryptographically derived from commitment_root = BLAKE3(proposal_digest || acceptance_root || commitment_nonce). Two different route contents can never share the same route_id. The commitment_root is carried through the entire trust chain (RouteCommitment → CommittedRoute → BrandedCommittedRoute → setupCircuit) as the canonical cryptographic anchor.

@@ -275,13 +275,88 @@ export function verifyAcceptanceBinding(
 }
 
 // -----------------------------------------------------------------------
-// RouteCommitment (R-003E/R-004: verifies signatures)
+// Commitment Root (R-003/R-004 canonical commitment model)
+// -----------------------------------------------------------------------
+
+/**
+ * Compute the canonical commitment_root over a proposal + ordered acceptances
+ * + commitment_nonce.
+ *
+ * Per spec/07 §5.3:
+ *   commitment_root = BLAKE3-256(
+ *     proposal_digest       (32 bytes — BLAKE3 of canonical RouteProposal)
+ *     || acceptance_root   (32 bytes — BLAKE3 of ordered acceptance signatures)
+ *     || commitment_nonce  (16 bytes — fresh per commitment)
+ *   )
+ *
+ * The commitment_root IS the route's canonical identity. route_id is derived
+ * from it: route_id = toHex(commitment_root). This prevents two different
+ * route contents from sharing the same route_id merely because they share a
+ * caller-chosen proposal identifier.
+ */
+export function computeCommitmentRoot(
+  proposal: RouteProposal,
+  acceptances: RouteAcceptance[],
+  commitmentNonce: Uint8Array,
+): Uint8Array {
+  // 1. proposal_digest (already computed by proposalDigest())
+  const proposalDigestBytes = proposalDigest(proposal);
+
+  // 2. acceptance_root = BLAKE3(ordered(acceptance signatures))
+  //    Each acceptance's signature is the canonical representation of the
+  //    acceptor's signed agreement. The ordered concatenation of these
+  //    signatures binds every participant's acceptance into the root.
+  const h = blake3.create({ dkLen: 32 });
+  for (const acc of acceptances) {
+    h.update(acc.signature);
+  }
+  const acceptanceRoot = h.digest();
+
+  // 3. commitment_root = BLAKE3(proposal_digest || acceptance_root || commitment_nonce)
+  const rootHash = blake3(
+    new Uint8Array([
+      ...proposalDigestBytes,
+      ...acceptanceRoot,
+      ...commitmentNonce,
+    ]),
+    { dkLen: 32 },
+  );
+  return rootHash;
+}
+
+/**
+ * Derive the canonical route_id from a commitment_root.
+ * Per spec/07 §5.4: route_id = toHex(commitment_root).
+ */
+export function deriveRouteId(commitmentRoot: Uint8Array): string {
+  return toHex(commitmentRoot);
+}
+
+// -----------------------------------------------------------------------
+// RouteCommitment (R-003E/R-004: verifies signatures + canonical commitment_root)
 // -----------------------------------------------------------------------
 
 export interface RouteCommitment {
+  /**
+   * The canonical route identity — DERIVED from commitmentRoot.
+   * Per R-003/R-004: route_id = toHex(commitment_root).
+   * This is NOT the proposal's routeId; it is the cryptographic commitment
+   * to the exact accepted route.
+   */
   routeId: string;
   proposal: RouteProposal;
   acceptances: RouteAcceptance[];
+  /**
+   * The canonical commitment_root (32 bytes).
+   * Per spec/07 §5.3: BLAKE3-256(proposal_digest || acceptance_root || commitment_nonce).
+   */
+  commitmentRoot: Uint8Array;
+  /**
+   * Fresh per-commitment nonce (16 bytes). Included in the commitment_root
+   * derivation to ensure each commitment is unique even with identical
+   * proposal + acceptances.
+   */
+  commitmentNonce: Uint8Array;
   committerSignature: Uint8Array;
   committedAt: number;
 }
@@ -411,14 +486,25 @@ export function createRouteCommitment(
     verificationResults.push(result);
   }
 
-  // 3. All verifications passed — sign the commitment
-  const payload = routeCommitmentSigningPayload(proposal, acceptances);
+  // 3. All verifications passed — compute the canonical commitment_root.
+  // Per R-003/R-004: the commitment_root IS the route's canonical identity.
+  // It binds the proposal + all ordered acceptances + a fresh commitment_nonce.
+  const commitmentNonce = randomBytes(16);
+  const commitmentRoot = computeCommitmentRoot(proposal, acceptances, commitmentNonce);
+  const routeId = deriveRouteId(commitmentRoot);
+
+  // 4. Sign the commitment_root (NOT the proposal's routeId or acceptance signatures).
+  // Per spec/07 §5.3: the source signs over the commitment_root, which transitively
+  // binds the proposal + all acceptances + the commitment_nonce.
+  const payload = routeCommitmentSigningPayload(commitmentRoot, commitmentNonce);
   const signature = signMessage(committerSecretKey, payload);
 
-  const commitment = {
-    routeId: proposal.routeId,
+  const commitment: RouteCommitment = {
+    routeId,
     proposal,
     acceptances,
+    commitmentRoot,
+    commitmentNonce,
     committerSignature: signature,
     committedAt: now,
   };
@@ -435,20 +521,26 @@ export function createRouteCommitment(
   };
 }
 
+/**
+ * Compute the signing payload for a RouteCommitment.
+ *
+ * Per R-003/R-004: the committer signs over the commitment_root +
+ * commitment_nonce. This transitively binds:
+ *   - the proposal (via proposal_digest in commitment_root)
+ *   - all ordered acceptances (via acceptance_root in commitment_root)
+ *   - the commitment_nonce (fresh per commitment)
+ *
+ * payload = domain || commitment_root (32 bytes) || commitment_nonce (16 bytes)
+ */
 function routeCommitmentSigningPayload(
-  proposal: RouteProposal,
-  acceptances: RouteAcceptance[],
+  commitmentRoot: Uint8Array,
+  commitmentNonce: Uint8Array,
 ): Uint8Array {
-  const m = new Map<number, unknown>([
-    [1, proposal.routeId],
-    [2, acceptances.map((a) => toHex(a.signature))],
-    [3, proposal.expiry],
-  ]);
-  const body = canonicalEncode(m);
   const domain = new TextEncoder().encode(ROUTE_COMMITMENT_DOMAIN);
-  const out = new Uint8Array(domain.length + body.length);
+  const out = new Uint8Array(domain.length + 32 + 16);
   out.set(domain, 0);
-  out.set(body, domain.length);
+  out.set(commitmentRoot, domain.length);
+  out.set(commitmentNonce, domain.length + 32);
   return out;
 }
 
@@ -457,12 +549,19 @@ function routeCommitmentSigningPayload(
 // -----------------------------------------------------------------------
 
 export interface CommittedRoute {
+  /** The canonical route identity — DERIVED from commitment_root. */
   routeId: string;
   hops: RouteHop[];
   expiry: number;
   initiatorNodeId: string;
   agreementDigest: string;
   committedAt: number;
+  /**
+   * The canonical commitment_root (32 bytes).
+   * Per R-003/R-004: this is the cryptographic anchor binding the exact
+   * accepted route. Carried through to the circuit layer.
+   */
+  commitmentRoot: Uint8Array;
 }
 
 export function createCommittedRoute(commitment: RouteCommitment): CommittedRoute {
@@ -473,6 +572,7 @@ export function createCommittedRoute(commitment: RouteCommitment): CommittedRout
     initiatorNodeId: commitment.proposal.initiatorNodeId,
     agreementDigest: commitment.proposal.agreementDigest,
     committedAt: commitment.committedAt,
+    commitmentRoot: commitment.commitmentRoot,
   };
 }
 

@@ -194,6 +194,12 @@ export interface BrandedCommittedRoute {
   readonly initiatorNodeId: string;
   readonly agreementDigest: string;
   readonly committedAt: number;
+  /**
+   * The canonical commitment_root (32 bytes).
+   * Per R-003/R-004: this is the cryptographic anchor binding the exact
+   * accepted route. route_id is DERIVED from this: route_id = toHex(commitment_root).
+   */
+  readonly commitmentRoot: Uint8Array;
 }
 
 /**
@@ -319,6 +325,7 @@ export function createBrandedCommittedRoute(
     initiatorNodeId: commitment.proposal.initiatorNodeId,
     agreementDigest: commitment.proposal.agreementDigest,
     committedAt: commitment.committedAt,
+    commitmentRoot: commitment.commitmentRoot,
   };
   brandedRouteRegistry.add(route);
   return route;
