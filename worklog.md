@@ -578,3 +578,45 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The AuthenticatedLink now proves: authenticated Node identity + genuine wire transcript (all inputs derived from decoded bytes) + mutual fresh possession + exact directional LinkId (recomputed) + valid bounded lifetime + freshness-bound to transcript verification time. ValidatedHop enforces use-time freshness (link.expiresAt > now).
+
+---
+Task ID: R-002-P1-hardening-v4
+Agent: main (Z.ai Code)
+Task: Close the final R-002 gap — intrinsic challenge freshness/replay provenance. Make VerifiedTranscript consume a proof-bearing ConsumedChallenge artifact (not a boolean) that proves the challenge was registered by the local verifier, unexpired, and single-use. Also ensure `now` comes from the trusted runtime clock.
+
+Work Log:
+- Modified `ChallengeCache` in `auth-handshake.ts`: added optional `now` parameter to `registerChallenge(challenge, now?)` and `consumeChallenge(challenge, now?)` — backward-compatible (defaults to `Date.now()`). This enables deterministic testing while preserving the trusted-runtime-clock contract.
+
+- Added `ConsumedChallenge` proof artifact to `authenticated-link.ts`:
+  - `ConsumedChallenge` interface: `{ challenge, consumedAt, signerRole }` — WeakSet-registered, unforgeable.
+  - `consumeChallengeForTranscript(cache, challenge, signerRole, now)` — the ONLY function that creates a `ConsumedChallenge`. Calls `cache.consumeChallenge(challenge, now * 1000)` (converting seconds→ms for the ChallengeCache). If the challenge is not registered, expired, or already used, throws — no artifact produced.
+  - `isConsumedChallenge(obj)` — WeakSet runtime check.
+  - `signerRole`: "RESPONDER" means the challenge is `challengeForB` (from Initiate, B signed it); "INITIATOR" means `challengeForA` (from Accept, A signed it).
+
+- Added `transcriptConsumedChallengeRegistry` — a SECOND WeakSet that tracks `ConsumedChallenge` objects already used to produce a `VerifiedTranscript`. This provides two-level single-use protection:
+  1. `ChallengeCache.consumeChallenge` marks the challenge BYTES as used (can't produce a second `ConsumedChallenge` for the same challenge from the same cache).
+  2. `createVerifiedTranscript` marks the `ConsumedChallenge` OBJECT as transcript-used (can't reuse the same artifact for a second transcript).
+
+- Modified `createVerifiedTranscript`:
+  - NEW API: `{ initiateBytes, acceptBytes, proofA, consumedChallenge: ConsumedChallenge, now: number }` — `verifiedAt` replaced by `now` (trusted runtime clock).
+  - Step 0: verifies `consumedChallenge` is genuine (WeakSet).
+  - Step 0b: verifies `consumedChallenge` has NOT already been used by a transcript (second WeakSet — replay proof).
+  - Step 0c (after decoding wire): verifies the consumed challenge MATCHES the wire message — `signerRole=RESPONDER` → must match `challengeForB` from Initiate; `signerRole=INITIATOR` → must match `challengeForA` from Accept.
+  - Step 10 (after all proofs verified): marks the `consumedChallenge` as transcript-used (adds to second WeakSet).
+  - `VerifiedTranscript.verifiedAt` = `now` (from the trusted runtime clock).
+
+- Updated `tests/helpers/branded-route-helper.ts`: `runHandshake` now creates a `ChallengeCache`, registers `challengeForB`, and calls `consumeChallengeForTranscript` to produce a `ConsumedChallenge` before passing it to `createVerifiedTranscript`.
+
+- Rewrote `tests/r002p1-authenticated-link.test.ts` (18 tests) with the v4 API:
+  - Wire binding: tampered Initiate → reject, wrong proofA → reject, consumed challenge mismatch → reject.
+  - Challenge freshness/replay: same tuple twice → second ConsumedChallenge from same cache fails (challenge_replayed); reused ConsumedChallenge object → second transcript fails (already used); expired challenge → reject; unregistered challenge → reject; non-genuine ConsumedChallenge → reject; valid fresh → accept.
+  - AuthenticatedLink: both directions, stale transcript, lifetime bounds.
+  - ValidatedHop: use-time freshness, stale link rejects.
+  - Genuine full pipeline: both directions succeed.
+
+Stage Summary:
+- Tests: 274 → 269 pass, 0 fail (the r002p1 test file was rewritten from 23 to 18 tests — consolidated redundant v3 tests; the new tests are more focused on the v4 freshness/replay semantics). 730 expect() calls.
+- Architecture tests: 24/24 pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-002-P1 is now fully closed: AuthenticatedLink proves authenticated Node identity + genuine wire transcript + mutual fresh possession + exact directional LinkId + valid bounded lifetime + freshness-bound to transcript + INTRINSIC CHALLENGE FRESHNESS/REPLAY PROOF (ConsumedChallenge). A previously valid handshake tuple CANNOT produce a second VerifiedTranscript — two levels of single-use protection.

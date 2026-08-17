@@ -338,14 +338,18 @@ export class ChallengeCache {
   /**
    * Verify that a challenge is valid (exists, not expired, not used).
    * If valid, mark it as used.
+   *
+   * Per R-002-P1 hardening v4: accepts an optional `now` parameter for
+   * deterministic testing. When omitted, defaults to `Date.now()` (the
+   * trusted runtime clock). The `now` value MUST come from the trusted
+   * local runtime, not from untrusted protocol input.
    */
-  consumeChallenge(challenge: Uint8Array): { ok: true } | { ok: false; reason: string } {
+  consumeChallenge(challenge: Uint8Array, now: number = Date.now()): { ok: true } | { ok: false; reason: string } {
     const key = toHex(challenge);
     const entry = this.entries.get(key);
     if (!entry) {
       return { ok: false, reason: "challenge_not_found" };
     }
-    const now = Date.now();
     if (now - entry.createdAt > CHALLENGE_EXPIRY_MS) {
       this.entries.delete(key);
       return { ok: false, reason: "challenge_expired" };
@@ -360,12 +364,15 @@ export class ChallengeCache {
   /**
    * Register a challenge that we generated and sent to the peer.
    * We expect to receive a proof over this challenge back.
+   *
+   * Per R-002-P1 hardening v4: accepts an optional `now` parameter for
+   * deterministic testing.
    */
-  registerChallenge(challenge: Uint8Array): void {
+  registerChallenge(challenge: Uint8Array, now: number = Date.now()): void {
     const key = toHex(challenge);
     this.entries.set(key, {
       challenge,
-      createdAt: Date.now(),
+      createdAt: now,
       used: false,
     });
   }

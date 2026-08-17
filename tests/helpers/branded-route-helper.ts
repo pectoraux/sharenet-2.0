@@ -64,6 +64,7 @@ import {
   signPossessionProof,
   encodeInitiate,
   encodeAccept,
+  ChallengeCache,
   POSSESSION_DOMAIN_INITIATOR,
   POSSESSION_DOMAIN_RESPONDER,
   ROLE_INITIATOR,
@@ -74,8 +75,10 @@ import {
 import {
   createVerifiedTranscript,
   createAuthenticatedLink,
+  consumeChallengeForTranscript,
   type AuthenticatedLink,
   type VerifiedTranscript,
+  type ConsumedChallenge,
 } from "@reference/transport/authenticated-link";
 
 export const BRANDED_ROUTE_HELPER_NOW = 1786876545;
@@ -161,13 +164,24 @@ function runHandshake(
     transcriptAfterAccept, linkIdBytes, challengeForA, ROLE_INITIATOR,
   );
 
-  // Create the genuine VerifiedTranscript — v3 API: derive everything from
-  // the decoded wire bytes (initiateBytes + acceptBytes + proofA only).
+  // R-002-P1 hardening v4: consume the challenge from a ChallengeCache to
+  // produce a ConsumedChallenge proof artifact (intrinsic freshness/replay proof).
+  // The initiator (A) generated challengeForB, so A consumes it from A's cache
+  // (signerRole=RESPONDER because B signed it).
+  const cache = new ChallengeCache();
+  cache.registerChallenge(challengeForB, now * 1000); // ChallengeCache uses ms
+  const consumedChallenge = consumeChallengeForTranscript(
+    cache, challengeForB, "RESPONDER", now,
+  );
+
+  // Create the genuine VerifiedTranscript — v4 API: wire bytes + proofA +
+  // consumedChallenge + now (trusted runtime clock).
   return createVerifiedTranscript({
     initiateBytes,
     acceptBytes,
     proofA,
-    verifiedAt: now,
+    consumedChallenge,
+    now,
   });
 }
 

@@ -45,6 +45,7 @@ import {
   computeTranscriptHash,
   computeLinkIdBytes,
   decodeMessage,
+  ChallengeCache,
   POSSESSION_DOMAIN_INITIATOR,
   POSSESSION_DOMAIN_RESPONDER,
   ROLE_INITIATOR,
@@ -81,6 +82,88 @@ export const MAX_TRANSCRIPT_AGE_SECONDS = 300; // 5 minutes
 
 const verifiedTranscriptRegistry = new WeakSet<object>();
 const authenticatedLinkRegistry = new WeakSet<object>();
+const consumedChallengeRegistry = new WeakSet<object>();
+/**
+ * Tracks ConsumedChallenge objects that have ALREADY been used to produce
+ * a VerifiedTranscript. This provides the SECOND level of single-use
+ * protection: even if an attacker reuses the same ConsumedChallenge object,
+ * createVerifiedTranscript will reject it because it's already been
+ * consumed by a transcript.
+ */
+const transcriptConsumedChallengeRegistry = new WeakSet<object>();
+
+// -----------------------------------------------------------------------
+// ConsumedChallenge — freshness/replay proof artifact
+// -----------------------------------------------------------------------
+
+/**
+ * A ConsumedChallenge is the proof that a challenge was:
+ *   - registered in a local ChallengeCache (issued by the local verifier)
+ *   - unexpired at consumption time
+ *   - single-use (marked as consumed — a second consumption fails)
+ *
+ * Per R-002-P1 hardening v4: this artifact is the intrinsic freshness
+ * evidence for VerifiedTranscript construction. It prevents a previously
+ * valid (Initiate, Accept, Confirm) tuple from producing a second
+ * VerifiedTranscript — the challenge is consumed once and cannot be
+ * reused.
+ *
+ * The `signerRole` field indicates which peer signed the challenge:
+ *   - "RESPONDER": the challenge is challengeForB (from Initiate, B signed it)
+ *   - "INITIATOR": the challenge is challengeForA (from Accept, A signed it)
+ */
+export interface ConsumedChallenge {
+  readonly challenge: Uint8Array;
+  readonly consumedAt: number;
+  readonly signerRole: "INITIATOR" | "RESPONDER";
+}
+
+/**
+ * The ONLY function that creates a ConsumedChallenge.
+ *
+ * Calls `cache.consumeChallenge(challenge, now)` — which checks:
+ *   1. The challenge exists in the cache (was registered by the local verifier)
+ *   2. The challenge is not expired
+ *   3. The challenge is single-use (not previously consumed)
+ *
+ * If any check fails, throws — no artifact is produced.
+ *
+ * The `now` parameter MUST come from the trusted local runtime clock,
+ * not from untrusted protocol input.
+ */
+export function consumeChallengeForTranscript(
+  cache: ChallengeCache,
+  challenge: Uint8Array,
+  signerRole: "INITIATOR" | "RESPONDER",
+  now: number,
+): ConsumedChallenge {
+  // ChallengeCache uses milliseconds internally; `now` is in seconds.
+  const result = cache.consumeChallenge(challenge, now * 1000);
+  if (!result.ok) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: consumeChallengeForTranscript rejected — " +
+        `challenge consumption failed: ${result.reason}. Per R-002-P1 ` +
+        "hardening v4, the challenge must be registered by the local " +
+        "verifier, unexpired, and single-use to produce a VerifiedTranscript. " +
+        "A replayed or expired challenge cannot produce a fresh transcript.",
+    );
+  }
+  const cc: ConsumedChallenge = {
+    challenge,
+    consumedAt: now,
+    signerRole,
+  };
+  consumedChallengeRegistry.add(cc);
+  return cc;
+}
+
+/**
+ * Runtime check: is this object a genuine ConsumedChallenge
+ * produced by consumeChallengeForTranscript()?
+ */
+export function isConsumedChallenge(obj: unknown): obj is ConsumedChallenge {
+  return typeof obj === "object" && obj !== null && consumedChallengeRegistry.has(obj);
+}
 
 // -----------------------------------------------------------------------
 // VerifiedTranscript — derived from decoded wire bytes
@@ -123,30 +206,66 @@ export interface VerifiedTranscript {
 /**
  * The ONLY function that creates a VerifiedTranscript.
  *
- * Takes the raw wire bytes of the Initiate, Accept, and Confirm messages
- * (or just Initiate + Accept + proofA). Derives ALL trusted inputs by
- * decoding the wire messages — no duplicate caller-supplied fields.
+ * Per R-002-P1 hardening v4: takes a genuine `ConsumedChallenge` artifact
+ * (intrinsic freshness/replay proof) + `now` (from the trusted runtime
+ * clock). The `ConsumedChallenge` proves the challenge was registered by
+ * the local verifier, unexpired, and single-use. A second call with the
+ * same handshake tuple will fail because:
+ *   - The challenge is already consumed in the ChallengeCache (level 1)
+ *   - The ConsumedChallenge object is already marked as transcript-used
+ *     (level 2)
  *
  * Verification steps:
+ *   0. Verify the ConsumedChallenge is genuine + not already used by a transcript
+ *   0b. Verify the consumed challenge matches the wire message
  *   1. Decode Initiate → advAHex, nonceA, challengeForB
  *   2. Decode Accept → advBHex, nonceB, challengeForA, proofB
- *   3. Decode advAHex → NodeAdvertisement A → verify (signature + NodeId + freshness)
- *   4. Decode advBHex → NodeAdvertisement B → verify (signature + NodeId + freshness)
- *   5. VerifyNodeIdBinding for both (defense-in-depth — verifyAdvertisement already does this)
- *   6. Recompute linkIdBytes = computeLinkIdBytes(nodeIdA, nodeIdB, nonceA, nonceB)
+ *   3. Decode + verify A's advertisement (from Initiate wire bytes)
+ *   4. Decode + verify B's advertisement (from Accept wire bytes)
+ *   5. VerifyNodeIdBinding for both (defense-in-depth)
+ *   6. Recompute linkIdBytes from decoded nonces + NodeIds
  *   7. Verify proofB over hash(Initiate), linkIdBytes, challengeForB, RESPONDER
  *   8. Verify proofA over hash(Initiate, Accept), linkIdBytes, challengeForA, INITIATOR
- *
- * If ANY step fails, throws — no artifact is produced.
+ *   9. Mark the ConsumedChallenge as transcript-used (replay protection)
  */
 export function createVerifiedTranscript(params: {
   initiateBytes: Uint8Array;
   acceptBytes: Uint8Array;
   /** A's possession proof from the Confirm message (the one non-wire input). */
   proofA: Uint8Array;
-  /** Verification time (unix seconds) — used for advertisement freshness. */
-  verifiedAt: number;
+  /** Freshness/replay proof — the challenge consumed from the local cache. */
+  consumedChallenge: ConsumedChallenge;
+  /** Trusted runtime clock (unix seconds) — NOT from untrusted protocol input. */
+  now: number;
 }): VerifiedTranscript {
+  // 0. Verify the ConsumedChallenge is genuine.
+  if (!isConsumedChallenge(params.consumedChallenge)) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
+        "consumedChallenge is not a genuine ConsumedChallenge (WeakSet " +
+        "membership check failed). Per R-002-P1 hardening v4, the " +
+        "transcript requires intrinsic freshness evidence: a challenge " +
+        "that was registered by the local verifier, unexpired, and " +
+        "single-use (consumed from the ChallengeCache). A handshake " +
+        "without freshness proof cannot produce a VerifiedTranscript.",
+    );
+  }
+
+  // 0b. Verify the ConsumedChallenge has not already been used by a transcript.
+  //     This is the SECOND level of single-use protection — even if the
+  //     attacker reuses the same ConsumedChallenge object, this check
+  //     prevents a second VerifiedTranscript.
+  if (transcriptConsumedChallengeRegistry.has(params.consumedChallenge)) {
+    throw new Error(
+      "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
+        "the ConsumedChallenge has already been used to produce a " +
+        "VerifiedTranscript (replay). Per R-002-P1 hardening v4, a " +
+        "previously valid handshake tuple MUST NOT produce a second " +
+        "transcript. The challenge is single-use at both the cache " +
+        "level and the transcript level.",
+    );
+  }
+
   // 1. Decode the Initiate message.
   let initiate: InitiateMessage;
   try {
@@ -157,9 +276,7 @@ export function createVerifiedTranscript(params: {
   } catch (e) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        `failed to decode Initiate message: ${(e as Error).message}. ` +
-        "The transcript must be derived from genuine wire bytes, not " +
-        "caller-supplied duplicate fields.",
+        `failed to decode Initiate message: ${(e as Error).message}.`,
     );
   }
 
@@ -173,10 +290,32 @@ export function createVerifiedTranscript(params: {
   } catch (e) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        `failed to decode Accept message: ${(e as Error).message}. ` +
-        "The transcript must be derived from genuine wire bytes, not " +
-        "caller-supplied duplicate fields.",
+        `failed to decode Accept message: ${(e as Error).message}.`,
     );
+  }
+
+  // 0c. Verify the consumed challenge MATCHES the wire message.
+  //     signerRole=RESPONDER → challenge is challengeForB (from Initiate, B signed)
+  //     signerRole=INITIATOR → challenge is challengeForA (from Accept, A signed)
+  const cc = params.consumedChallenge;
+  if (cc.signerRole === "RESPONDER") {
+    if (!constantTimeEqual(cc.challenge, initiate.challengeForB)) {
+      throw new Error(
+        "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
+          "the consumed challenge does not match challengeForB in the " +
+          "Initiate wire message. The freshness proof must correspond to " +
+          "the exact challenge the peer signed.",
+      );
+    }
+  } else {
+    if (!constantTimeEqual(cc.challenge, accept.challengeForA)) {
+      throw new Error(
+        "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
+          "the consumed challenge does not match challengeForA in the " +
+          "Accept wire message. The freshness proof must correspond to " +
+          "the exact challenge the peer signed.",
+      );
+    }
   }
 
   // 3. Decode + verify A's advertisement (from the Initiate message).
@@ -186,17 +325,14 @@ export function createVerifiedTranscript(params: {
   } catch (e) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        `failed to decode initiator advertisement from Initiate: ${(e as Error).message}.`,
+        `failed to decode initiator advertisement: ${(e as Error).message}.`,
     );
   }
-  const vA = verifyAdvertisement(advA, params.verifiedAt);
+  const vA = verifyAdvertisement(advA, params.now);
   if (!vA.ok) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        `initiator advertisement verification failed: ${vA.detail}. ` +
-        "The advertisement carried in the Initiate wire message MUST " +
-        "pass full spec/03 §5 verification (signature + NodeId binding + " +
-        "freshness).",
+        `initiator advertisement verification failed: ${vA.detail}.`,
     );
   }
 
@@ -207,23 +343,18 @@ export function createVerifiedTranscript(params: {
   } catch (e) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        `failed to decode responder advertisement from Accept: ${(e as Error).message}.`,
+        `failed to decode responder advertisement: ${(e as Error).message}.`,
     );
   }
-  const vB = verifyAdvertisement(advB, params.verifiedAt);
+  const vB = verifyAdvertisement(advB, params.now);
   if (!vB.ok) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        `responder advertisement verification failed: ${vB.detail}. ` +
-        "The advertisement carried in the Accept wire message MUST " +
-        "pass full spec/03 §5 verification (signature + NodeId binding + " +
-        "freshness).",
+        `responder advertisement verification failed: ${vB.detail}.`,
     );
   }
 
   // 5. Defense-in-depth: verifyNodeIdBinding for both parties.
-  //    verifyAdvertisement already does this, but we re-check here to be
-  //    explicit about the identity invariant.
   if (!verifyNodeIdBinding(advA.nodeId, advA.signingPublicKey)) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
@@ -256,8 +387,8 @@ export function createVerifiedTranscript(params: {
   const initiatorTranscriptHash = computeTranscriptHash([params.initiateBytes, params.acceptBytes]);
 
   // 8. Verify the responder's (B's) possession proof (decoded from Accept).
-  const challengeForB = initiate.challengeForB; // from the wire
-  const proofB = accept.proofB; // from the wire
+  const challengeForB = initiate.challengeForB;
+  const proofB = accept.proofB;
   const proofBOk = verifyPossessionProof(
     advB.signingPublicKey,
     proofB,
@@ -270,15 +401,12 @@ export function createVerifiedTranscript(params: {
   if (!proofBOk) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        "responder's possession proof (decoded from the Accept wire " +
-        "message) did not verify. B must sign the challenge from the " +
-        "Initiate message, bound to hash(Initiate) and the directional " +
-        "LinkId, with role RESPONDER.",
+        "responder's possession proof (decoded from Accept) did not verify.",
     );
   }
 
-  // 9. Verify the initiator's (A's) possession proof (the one non-wire input).
-  const challengeForA = accept.challengeForA; // from the wire
+  // 9. Verify the initiator's (A's) possession proof.
+  const challengeForA = accept.challengeForA;
   const proofAOk = verifyPossessionProof(
     advA.signingPublicKey,
     params.proofA,
@@ -291,11 +419,13 @@ export function createVerifiedTranscript(params: {
   if (!proofAOk) {
     throw new Error(
       "ARCHITECTURE VIOLATION: createVerifiedTranscript rejected — " +
-        "initiator's possession proof did not verify. A must sign the " +
-        "challenge from the Accept message, bound to hash(Initiate, Accept) " +
-        "and the directional LinkId, with role INITIATOR.",
+        "initiator's possession proof did not verify.",
     );
   }
+
+  // 10. Mark the ConsumedChallenge as transcript-used (replay protection).
+  //     A second call with the same ConsumedChallenge will fail at step 0b.
+  transcriptConsumedChallengeRegistry.add(params.consumedChallenge);
 
   // All checks verified — register the genuine artifact.
   const transcript: VerifiedTranscript = {
@@ -306,7 +436,7 @@ export function createVerifiedTranscript(params: {
     responderNodeId,
     initiatorNonce,
     responderNonce,
-    verifiedAt: params.verifiedAt,
+    verifiedAt: params.now,
   };
   verifiedTranscriptRegistry.add(transcript);
   return transcript;
