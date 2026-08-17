@@ -498,6 +498,9 @@ def main():
     json_files = sorted(vectors_dir.rglob("*.json"))
     results = []
     for f in json_files:
+        if f.name == "MANIFEST.json":
+            # Manifest is metadata, not a protocol vector — skip it
+            continue
         data = json.loads(f.read_text())
         result = verify_vector(data)
         results.append(result)

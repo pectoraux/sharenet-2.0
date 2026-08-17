@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "description": "ShareNet 2.0 conformance vector manifest. Every protocol-layer implementation MUST consume these vectors as mandatory inputs. No implementation owns private protocol truth.",
+  "vectors": [
+    { "id": "V-NODEID-001", "protocol": "identity", "schema_version": "1", "expected_result": "valid NodeId derivation", "file": "V-NODEID-001.json" },
+    { "id": "V-NODEID-002", "protocol": "identity", "schema_version": "1", "expected_result": "binding rejection", "file": "V-NODEID-002.json" },
+    { "id": "V-NODEID-003", "protocol": "identity", "schema_version": "1", "expected_result": "format validation", "file": "V-NODEID-003.json" },
+    { "id": "V-CBOR-001", "protocol": "encoding", "schema_version": "1", "expected_result": "canonical CBOR encoding", "file": "V-CBOR-001.json" },
+    { "id": "V-ADV-001", "protocol": "advertisement", "schema_version": "1", "expected_result": "valid advertisement", "file": "V-ADV-001.json" },
+    { "id": "V-ADV-002", "protocol": "advertisement", "schema_version": "1", "expected_result": "invalid signature", "file": "V-ADV-002.json" },
+    { "id": "V-ADV-003", "protocol": "advertisement", "schema_version": "1", "expected_result": "expired", "file": "V-ADV-003.json" },
+    { "id": "V-ADV-004", "protocol": "advertisement", "schema_version": "1", "expected_result": "malformed", "file": "V-ADV-004.json" },
+    { "id": "V-ADV-005", "protocol": "advertisement", "schema_version": "1", "expected_result": "sequence rollback", "file": "V-ADV-005.json" },
+    { "id": "V-LINK-HANDSHAKE-001", "protocol": "link", "schema_version": "1", "expected_result": "valid LINK_UP", "file": "V-LINK-HANDSHAKE-001.json" },
+    { "id": "V-LINK-HANDSHAKE-002", "protocol": "link", "schema_version": "1", "expected_result": "tampered proof", "file": "V-LINK-HANDSHAKE-002.json" },
+    { "id": "V-LINK-HANDSHAKE-003", "protocol": "link", "schema_version": "1", "expected_result": "replayed transcript", "file": "V-LINK-HANDSHAKE-003.json" },
+    { "id": "V-LINK-HANDSHAKE-004", "protocol": "link", "schema_version": "1", "expected_result": "wrong role", "file": "V-LINK-HANDSHAKE-004.json" },
+    { "id": "V-LINK-HANDSHAKE-005", "protocol": "link", "schema_version": "1", "expected_result": "wrong LinkId", "file": "V-LINK-HANDSHAKE-005.json" },
+    { "id": "V-LINK-AUTH-001", "protocol": "link", "schema_version": "1", "expected_result": "valid authenticated link", "file": "V-LINK-AUTH-001.json" },
+    { "id": "V-LINK-AUTH-002", "protocol": "link", "schema_version": "1", "expected_result": "invalid challenge", "file": "V-LINK-AUTH-002.json" },
+    { "id": "V-LINK-AUTH-003", "protocol": "link", "schema_version": "1", "expected_result": "wrong transcript", "file": "V-LINK-AUTH-003.json" },
+    { "id": "V-LINK-AUTH-004", "protocol": "link", "schema_version": "1", "expected_result": "wrong identity", "file": "V-LINK-AUTH-004.json" },
+    { "id": "V-LINK-AUTH-005", "protocol": "link", "schema_version": "1", "expected_result": "replay attempt", "file": "V-LINK-AUTH-005.json" }
+  ]
+}

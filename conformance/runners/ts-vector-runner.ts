@@ -53,7 +53,7 @@ function walkJsonFiles(dir: string): string[] {
     const full = join(dir, entry);
     if (statSync(full).isDirectory()) {
       out.push(...walkJsonFiles(full));
-    } else if (entry.endsWith(".json")) {
+    } else if (entry.endsWith(".json") && entry !== "MANIFEST.json") {
       out.push(full);
     }
   }
@@ -261,6 +261,9 @@ for (const file of files) {
     result = verifyAdvVector(data);
   } else if (data.id?.startsWith("V-LINK-HANDSHAKE-") || data.id?.startsWith("V-LINK-AUTH-")) {
     result = verifyHandshakeVector(data);
+  } else if (data.id === "MANIFEST" || data.file === "MANIFEST.json") {
+    // Manifest is metadata, not a protocol vector — skip it
+    result = { id: data.id ?? file, passed: true, expected: "manifest metadata", actual: "manifest (not a protocol vector)" };
   } else {
     result = { id: data.id ?? file, passed: false, expected: "known vector type", actual: "unknown vector type" };
   }
