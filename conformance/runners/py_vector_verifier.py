@@ -377,7 +377,7 @@ def verify_vector(data: dict) -> dict:
             return {"id": vid, "passed": False, "expected": expected_code or "ok",
                     "actual": f"threw: {e}"}
 
-    elif vid.startswith("V-LINK-HANDSHAKE-"):
+    elif vid.startswith("V-LINK-HANDSHAKE-") or vid.startswith("V-LINK-AUTH-"):
         return verify_handshake_vector(data)
 
     return {"id": vid, "passed": False, "expected": "known type", "actual": "unknown type"}

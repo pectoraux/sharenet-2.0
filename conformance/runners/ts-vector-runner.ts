@@ -259,7 +259,7 @@ for (const file of files) {
     result = verifyCborVector(data);
   } else if (data.id?.startsWith("V-ADV-")) {
     result = verifyAdvVector(data);
-  } else if (data.id?.startsWith("V-LINK-HANDSHAKE-")) {
+  } else if (data.id?.startsWith("V-LINK-HANDSHAKE-") || data.id?.startsWith("V-LINK-AUTH-")) {
     result = verifyHandshakeVector(data);
   } else {
     result = { id: data.id ?? file, passed: false, expected: "known vector type", actual: "unknown vector type" };

@@ -30,7 +30,7 @@
  *
  * LinkId derivation (FROZEN per ADR-0014 — see below):
  *
- *   LinkId = "link:" + hex(BLAKE2b-256("sharenet-link-id-v1"
+ *   LinkId = "link:" + hex(BLAKE3-256("SHARENET/LINK/ID/1"
  *                                     ‖ localNodeId
  *                                     ‖ remoteNodeId
  *                                     ‖ localNonce
@@ -50,7 +50,7 @@ export const LINK_ID_DOMAIN = "SHARENET/LINK/ID/1";
 /** LinkId string prefix. */
 export const LINK_ID_PREFIX = "link:";
 
-/** Length of the LinkId hash (BLAKE2b-256). */
+/** Length of the LinkId hash (BLAKE3-256). */
 export const LINK_ID_HASH_BYTES = 32;
 
 /** Length of the handshake nonce (16 bytes). */

@@ -84,26 +84,26 @@ domain strings:
 
 | Domain String                              | Use                                                  | Spec                              |
 |--------------------------------------------|------------------------------------------------------|-----------------------------------|
-| `sharenet-node-id-v1`                      | NodeId derivation.                                    | `spec/02-identity.md` §2.1.       |
-| `sharenet-advertisement-v1`                | NodeAdvertisement signature.                          | `spec/03-node-advertisements.md` §4. |
-| `sharenet-link-challenge-v1`               | Link handshake challenge signature.                  | `spec/04-links.md` §3.2.          |
-| `sharenet-remote-node-hint-v1`             | RemoteNodeHint signature.                             | `spec/06-topology.md` §2.1.       |
-| `sharenet-route-proposal-v1`               | RouteProposal signature.                             | `spec/07-routing.md` §5.1.        |
-| `sharenet-route-acceptance-v1`             | RouteAcceptance signature.                            | `spec/07-routing.md` §5.2.        |
-| `sharenet-route-commitment-v1`             | RouteCommitment source signature.                     | `spec/07-routing.md` §5.3.        |
-| `sharenet-circuit-id-v1`                   | CircuitId derivation.                                 | `spec/08-circuits.md` §3.        |
-| `sharenet-circuit-hop-key-v1`              | Per-hop AEAD key derivation.                          | `spec/08-circuits.md` §4.1.      |
-| `sharenet-circuit-nonce-prefix-v1`         | Per-circuit nonce prefix.                            | `spec/08-circuits.md` §4.3.      |
-| `sharenet-circuit-setup-ack-v1`            | Per-hop setup ack signature.                          | `spec/08-circuits.md` §4.4.      |
-| `sharenet-circuit-possession-v1`           | Possession proof signature.                          | `spec/08-circuits.md` §4.4.      |
-| `sharenet-circuit-frame-v1`                | AEAD associated data prefix.                          | `spec/08-circuits.md` §4.6.      |
-| `sharenet-gateway-agreement-gateway-v1`    | Gateway signature on service agreement.              | `spec/09-internet-gateway.md` §3.1. |
-| `sharenet-gateway-agreement-source-v1`     | Source signature on service agreement.               | `spec/09-internet-gateway.md` §3.1. |
-| `sharenet-gateway-payment-request-v1`     | Gateway payment request signature.                    | `spec/13-external-crypto.md` §3.1. |
-| `sharenet-content-id-v1`                   | ContentId derivation.                                 | `spec/10-content.md` §2.         |
-| `sharenet-manifest-v1`                     | Manifest signature.                                   | `spec/10-content.md` §4.         |
-| `sharenet-contribution-proof-v1`           | ContributionProof signature.                         | `spec/11-contribution.md` §3.    |
-| `sharenet-settlement-v1`                   | Settlement signature.                                 | `spec/12-civic-points.md` §4.    |
+| `SHARENET/NODEID/1`                      | NodeId derivation.                                    | `spec/02-identity.md` §2.1.       |
+| `SHARENET/ADVERTISEMENT/1`                | NodeAdvertisement signature.                          | `spec/03-node-advertisements.md` §4. |
+| `SHARENET/LINK/TRANSCRIPT/1`               | Link handshake challenge signature.                  | `spec/04-links.md` §3.2.          |
+| `SHARENET/HINT/1`             | RemoteNodeHint signature.                             | `spec/06-topology.md` §2.1.       |
+| `SHARENET/ROUTE/PROPOSAL/1`               | RouteProposal signature.                             | `spec/07-routing.md` §5.1.        |
+| `SHARENET/ROUTE/ACCEPTANCE/1`             | RouteAcceptance signature.                            | `spec/07-routing.md` §5.2.        |
+| `SHARENET/ROUTE/COMMITMENT/1`             | RouteCommitment source signature.                     | `spec/07-routing.md` §5.3.        |
+| `SHARENET/CIRCUIT/ID/1`                   | CircuitId derivation.                                 | `spec/08-circuits.md` §3.        |
+| `SHARENET/CIRCUIT/KEY/1`              | Per-hop AEAD key derivation.                          | `spec/08-circuits.md` §4.1.      |
+| `SHARENET/CIRCUIT/NONCE/1`         | Per-circuit nonce prefix.                            | `spec/08-circuits.md` §4.3.      |
+| `SHARENET/CIRCUIT/ACK/1`            | Per-hop setup ack signature.                          | `spec/08-circuits.md` §4.4.      |
+| `SHARENET/CIRCUIT/POSSESSION/1`           | Possession proof signature.                          | `spec/08-circuits.md` §4.4.      |
+| `SHARENET/CIRCUIT/FRAME/1`                | AEAD associated data prefix.                          | `spec/08-circuits.md` §4.6.      |
+| `SHARENET/GATEWAY/AGREEMENT/GATEWAY/1`    | Gateway signature on service agreement.              | `spec/09-internet-gateway.md` §3.1. |
+| `SHARENET/GATEWAY/AGREEMENT/SOURCE/1`     | Source signature on service agreement.               | `spec/09-internet-gateway.md` §3.1. |
+| `SHARENET/GATEWAY/PAYMENT/1`     | Gateway payment request signature.                    | `spec/13-external-crypto.md` §3.1. |
+| `SHARENET/CONTENT/ID/1`                   | ContentId derivation.                                 | `spec/10-content.md` §2.         |
+| `SHARENET/CONTENT/MANIFEST/1`                     | Manifest signature.                                   | `spec/10-content.md` §4.         |
+| `SHARENET/CONTRIBUTION/PROOF/1`           | ContributionProof signature.                         | `spec/11-contribution.md` §3.    |
+| `SHARENET/SETTLEMENT/1`                   | Settlement signature.                                 | `spec/12-civic-points.md` §4.    |
 
 A pull request that reuses a domain string across two distinct uses
 MUST fail code review and MUST fail the conformance test

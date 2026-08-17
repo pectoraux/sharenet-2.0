@@ -92,7 +92,7 @@ Peer authentication MUST verify:
 
 1. The remote advertisement under `spec/03-node-advertisements.md` §5.
 2. A fresh challenge: A sends 16 random bytes; B signs
-   `BLAKE2b("sharenet-link-challenge-v1" || A_node_id || B_node_id
+   `BLAKE3("SHARENET/LINK/TRANSCRIPT/1" || A_node_id || B_node_id
    || challenge)` with its Ed25519 private key. A verifies under
    `B.signing_public_key`.
 3. A and B's advertised NodeIds both bind to the keys used.

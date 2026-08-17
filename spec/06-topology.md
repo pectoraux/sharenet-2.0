@@ -52,13 +52,13 @@ RemoteNodeHint = {
 ### 2.1 Signature Domain
 
 ```
-signing_input = "sharenet-remote-node-hint-v1"
+signing_input = "SHARENET/HINT/1"
               || canonical_cbor(hint_without_signature_value)
 digest        = BLAKE2b-256(signing_input)
 signature     = Ed25519Sign(reporter_private_key, digest)
 ```
 
-The domain-separation string `"sharenet-remote-node-hint-v1"` is
+The domain-separation string `"SHARENET/HINT/1"` is
 exactly 28 bytes of UTF-8, no NUL terminator, and MUST NOT be reused
 for any other signature type.
 

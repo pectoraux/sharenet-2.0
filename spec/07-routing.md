@@ -123,7 +123,7 @@ RouteProposal = {
 }
 ```
 
-Signature domain: `"sharenet-route-proposal-v1"`.
+Signature domain: `"SHARENET/ROUTE/PROPOSAL/1"`.
 
 ### 5.2 RouteAcceptance
 
@@ -146,7 +146,7 @@ RouteAcceptance = {
 }
 ```
 
-Signature domain: `"sharenet-route-acceptance-v1"`.
+Signature domain: `"SHARENET/ROUTE/ACCEPTANCE/1"`.
 
 ### 5.3 RouteCommitment
 
@@ -165,7 +165,7 @@ RouteCommitment = {
 }
 ```
 
-Signature domain: `"sharenet-route-commitment-v1"`.
+Signature domain: `"SHARENET/ROUTE/COMMITMENT/1"`.
 
 ### 5.4 CommittedRoute
 
