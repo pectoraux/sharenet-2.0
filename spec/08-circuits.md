@@ -53,21 +53,32 @@ ActiveCircuit
 
 ## 3. Circuit Identity
 
-The `CircuitId` is derived from the route commitment:
+The `CircuitId` is derived from the route commitment root and the
+initiator's ephemeral X25519 public key:
 
 ```
-CircuitId = "circuit:" || hex(BLAKE2b-256("sharenet-circuit-id-v1"
-                                          || route_id_bytes))
+CircuitId = BLAKE3-256(
+    utf8("SHARENET/CIRCUIT/ID/1")
+    || commitment_root       ; 32 bytes — the raw Merkle root
+    || initiator_x25519_pub  ; 32 bytes — the source's ephemeral key
+)
 ```
 
-Where `route_id_bytes` is the 32-byte raw `commitment_root` of the
-underlying `RouteCommitment` (see `spec/07-routing.md` §5.4).
+Per R-001 (ADR-0017): all hashing uses BLAKE3-256. The domain tag
+`SHARENET/CIRCUIT/ID/1` is FROZEN.
+
+The `commitment_root` is the 32-byte raw Merkle root of the
+`RouteCommitment` (see `spec/07-routing.md` §5.3.1). It is NOT the
+`route_id` string (which is `"route:" + hex(commitment_root)`).
 
 Because the `commitment_root` is a Merkle root over per-hop
 `RouteAcceptance`s, the `CircuitId` cryptographically binds the circuit
 to the exact route and to every participant's acceptance. Tampering
-with any hop's acceptance changes the `commitment_root`, changes the
-`route_id`, and therefore changes the `CircuitId`.
+with any hop's acceptance changes the `commitment_root`, and therefore
+changes the `CircuitId`.
+
+The `initiator_x25519_pub` binds the circuit to a specific ephemeral
+key, preventing circuit ID reuse across initiator keypairs.
 
 ## 4. Cryptographic Construction
 
@@ -77,21 +88,25 @@ Each hop in the route performs X25519 ECDH with the source:
 
 1. The source generates a fresh X25519 ephemeral keypair
    `(eph_priv, eph_pub)` per circuit.
-2. Each hop holds a static X25519 circuit keypair whose public half is
-   advertised as `circuit_public_key` (see `spec/03-node-advertisements.md`
-   §2).
-3. Per-hop shared secret: `dh_i = X25519(eph_priv, hop_i.circuit_pub)`.
+2. Each hop generates a fresh X25519 ephemeral keypair per circuit
+   (providing forward secrecy per circuit — stronger than the
+   original spec's static-key model).
+3. Per-hop shared secret: `dh_i = X25519(eph_priv_source, eph_pub_hop_i)`.
 4. Per-hop AEAD key:
    `key_i = HKDF-SHA256(salt = commitment_root, ikm = dh_i,
-                       info = "sharenet-circuit-hop-key-v1" || i)`,
-   where `i` is the 1-based hop index.
-5. The source encrypts the next hop's `eph_pub` envelope under
-   `key_i` (onion-style).
+                       info = "SHARENET/CIRCUIT/KEY/1" || u8(hop_index))`,
+   where `hop_index` is the 0-based hop index (1 byte).
+5. The HKDF output is 64 bytes, split into:
+   - `forwardingKey` (bytes 0–31): AEAD key for forward traffic
+   - `returnKey` (bytes 32–63): AEAD key for return traffic
+
+Per R-001 (ADR-0017): the domain tag `SHARENET/CIRCUIT/KEY/1` is FROZEN.
+The salt is the 32-byte `commitment_root` (NOT empty), binding the
+derived keys to the specific accepted route.
 
 ### 4.2 AEAD
 
-The AEAD is ChaCha20-Poly1305 (or, if a platform lacks it, AES-GCM with
-hardware acceleration — but ChaCha20-Poly1305 is the reference).
+The AEAD is ChaCha20-Poly1305 (256-bit key, 96-bit nonce, 128-bit tag).
 
 Each hop's AEAD key is used to (a) wrap the next-hop envelope in the
 setup phase and (b) encrypt/decrypt relayed frames in the data phase.
@@ -102,31 +117,37 @@ Each frame carries a 96-bit AEAD nonce composed of:
 
 ```
 nonce = circuit_nonce_prefix (64 bits, fixed per circuit)
-     || frame_sequence (32 bits, big-endian, starts at 0)
+     || frame_sequence (32 bits, big-endian, starts at 1)
 ```
 
-- `circuit_nonce_prefix` is derived as the first 8 bytes of
+- `circuit_nonce_prefix` is the first 8 bytes of:
   `HKDF-SHA256(salt = commitment_root, ikm = "nonce-prefix",
-               info = "sharenet-circuit-nonce-prefix-v1")`.
-- `frame_sequence` is a 32-bit per-circuit counter. The circuit MUST
-  terminate with an error if `frame_sequence` would overflow.
+              info = "SHARENET/CIRCUIT/NONCE/1")`
+  (32-byte output, first 8 bytes used as prefix).
+- `frame_sequence` is a 32-bit per-circuit counter starting at 1.
+  The circuit MUST terminate with an error if `frame_sequence` would
+  overflow.
 - Nonce reuse is catastrophic; the conformance suite MUST include a
   test that fails any implementation that reuses a `(circuit_id,
   frame_sequence)` pair.
 
+Per R-001 (ADR-0017): the domain tag `SHARENET/CIRCUIT/NONCE/1` is FROZEN.
+
 ### 4.4 Domain Separation
 
 Every signature and every HKDF `info` string in the circuit layer is
-prefixed by a unique domain-separation string. The full set:
+prefixed by a unique domain-separation string. The full set (FROZEN per
+R-001 / ADR-0017):
 
 | Domain                                | Use                                            |
 |---------------------------------------|------------------------------------------------|
-| `sharenet-circuit-id-v1`              | CircuitId derivation.                          |
-| `sharenet-circuit-hop-key-v1`         | Per-hop AEAD key derivation.                   |
-| `sharenet-circuit-nonce-prefix-v1`    | Per-circuit nonce prefix.                       |
-| `sharenet-circuit-setup-ack-v1`       | Per-hop setup acknowledgement signature.       |
-| `sharenet-circuit-possession-v1`      | Possession proof signature.                    |
-| `sharenet-circuit-frame-v1`           | AEAD associated data for data frames.          |
+| `SHARENET/CIRCUIT/ID/1`               | CircuitId derivation.                          |
+| `SHARENET/CIRCUIT/KEY/1`              | Per-hop AEAD key derivation.                   |
+| `SHARENET/CIRCUIT/NONCE/1`           | Per-circuit nonce prefix.                       |
+| `SHARENET/CIRCUIT/SETUP/1`            | Circuit setup request signing.                 |
+| `SHARENET/CIRCUIT/ACK/1`              | Circuit setup ack signing.                     |
+| `SHARENET/CIRCUIT/POSSESSION/1`       | Possession proof signature.                    |
+| `SHARENET/CIRCUIT/FRAME/1`           | AEAD associated data for data frames.          |
 
 No two uses share a domain string (see `spec/14-security.md` §4).
 
@@ -171,15 +192,27 @@ Bounds (3) and (4) are what make a captured ack unusable shortly after
 issuance, even when its absolute `ackExpiry` is generous (e.g. 1 hour).
 This bounds the setup-phase replay window to `ACK_MAX_AGE_SECONDS`.
 
-### 4.6 Route / Circuit Binding
+### 4.6 CircuitFrame (Data-Plane Wire Object)
 
-Every data frame carries, as AEAD associated data:
+A `CircuitFrame` is the data-plane wire object carrying encrypted
+application traffic over a circuit. Each frame carries:
 
 ```
-AD = "sharenet-circuit-frame-v1"
-   || commitment_root (32 bytes)
-   || frame_sequence (4 bytes big-endian)
-   || direction (1 byte: 0x01 = forward, 0x02 = backward)
+CircuitFrame = {
+    circuit_nonce_prefix:  bstr .size 8,   ; per-circuit prefix (§4.3)
+    frame_sequence:        uint .size 4,    ; big-endian, starts at 1
+    direction:             uint .size 1,   ; 0x01 = forward, 0x02 = backward
+    ciphertext:            bstr,           ; ChaCha20-Poly1305 encrypted payload
+}
+```
+
+The AEAD associated data (AD) for each frame is:
+
+```
+AD = utf8("SHARENET/CIRCUIT/FRAME/1")
+   || commitment_root       ; 32 bytes
+   || frame_sequence        ; 4 bytes big-endian
+   || direction             ; 1 byte
 ```
 
 This binds the frame to a specific `CommittedRoute`. A frame
@@ -196,27 +229,36 @@ from a fresh `(eph_priv, eph_pub)` and a new `circuit_nonce_prefix`.
 ## 5. Circuit Setup Protocol
 
 ```
-Source ──CircuitSetup──> Hop_1 ──CircuitSetup──> Hop_2 ──> ... ──> Destination
-   ▲                          │                       │                  │
-   │                          ▼                       ▼                  ▼
-   │                       ack_1                    ack_2              ack_dest
-   │                          │                       │                  │
-   └──── possession proof request ──────────────────────────────────────┘
-                                       ▼
-                          possession proof (signed ack chain)
-                                       ▼
-                                 ActiveCircuit
+Source ──CircuitSetupRequest──> Hop_1
+   ▲                          │
+   │                          ▼
+   │                       CircuitSetupAck (relay X25519 pubkey + possession proof)
+   │                          │
+   │  ←───────────────────────┘
+   │
+   (repeat for each hop)
+   │
+   ▼
+ActiveCircuit
 ```
 
-A `CircuitSetup` message is the source's `RouteCommitment` plus the
-onion-encrypted per-hop envelope. Each hop decrypts its envelope,
-verifies its own `RouteAcceptance` is in the commitment, returns a
-signed `CircuitSetupAck`, and forwards the remaining onion to the next
-hop.
+A `CircuitSetupRequest` is sent by the source to each hop individually.
+It carries the `BrandedCommittedRoute`, the hop index, the source's
+ephemeral X25519 public key, and a fresh setup nonce.
 
-A `possession proof` is a signed statement by each hop that it holds
-the AEAD key derived from its X25519 shared secret. The source verifies
-all proofs before declaring the circuit `ACTIVE`.
+Each hop:
+1. Verifies the route is a genuine `BrandedCommittedRoute` (WeakSet check)
+2. Verifies it occupies the specified `hopIndex` in the route
+3. Generates a fresh X25519 ephemeral keypair
+4. Computes the shared secret with the initiator's X25519 public key
+5. Derives forwarding + return keys via HKDF (salt = `commitment_root`)
+6. Signs a possession proof binding: routeId + routeCommitmentDigest +
+   hopIndex + relay_pubkey + initiator_pubkey + nonce + timestamps
+7. Returns a `CircuitSetupAck` with the relay's X25519 public key +
+   possession proof + freshness timestamps
+
+The source verifies all acks + possession proofs before declaring the
+circuit `ACTIVE`.
 
 ## 6. State
 
@@ -235,7 +277,8 @@ protection of any future circuit re-using the same route commitment
 ## 7. Invariants
 
 1. A circuit exists only from a `CommittedRoute`.
-2. The `CircuitId` is cryptographically bound to the route commitment.
+2. The `CircuitId` is cryptographically bound to the `commitment_root`
+   and the initiator's ephemeral X25519 key.
 3. Nonce reuse within a circuit is impossible by construction.
 4. Domain separation is exhaustive; no two signature or KDF uses share
    a domain string.

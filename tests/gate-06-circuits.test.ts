@@ -66,7 +66,8 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
     const { route } = makeBrandedRoute(1);
     const relayKeys = makeRelayX25519Keys(route);
     const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
-    const circuitId2 = deriveCircuitId(route.routeId, circuit.initiatorX25519PublicKey);
+    // Per spec/08 §3 (new API): circuit_id derives from commitment_root, NOT routeId string.
+    const circuitId2 = deriveCircuitId(route.commitmentRoot, circuit.initiatorX25519PublicKey);
     expect(circuit.circuitIdHex).toBe(bytesToHex(circuitId2));
   });
 
@@ -77,7 +78,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
     const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
 
     const plaintext = new TextEncoder().encode("Hello, real Internet!");
-    const seq = 1n;
+    const seq = 1; // frame sequence is a 32-bit number per spec/08 §4.3 (new API)
 
     // Encrypt (onion layers)
     const { encryptedPayload } = onionEncrypt(circuit, seq, plaintext);
@@ -121,10 +122,13 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   });
 
   // --- 7. Nonce layout: unique per circuit + sequence ---
-  test("nonce layout: route_id_prefix || sequence_number", () => {
-    const nonce1 = buildNonce(0x12345678, 1n);
-    const nonce2 = buildNonce(0x12345678, 2n);
-    const nonce3 = buildNonce(0x87654321, 1n); // different circuit
+  test("nonce layout: nonce_prefix || frame_sequence", () => {
+    // Per spec/08 §4.3 (new API): nonce = 8-byte circuit_nonce_prefix || 4-byte frame_sequence (BE).
+    const prefixA = new Uint8Array([0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]);
+    const prefixB = new Uint8Array([0x87, 0x65, 0x43, 0x21, 0, 0, 0, 0]);
+    const nonce1 = buildNonce(prefixA, 1);
+    const nonce2 = buildNonce(prefixA, 2);
+    const nonce3 = buildNonce(prefixB, 1); // different circuit
 
     expect(nonce1.length).toBe(12);
     expect(nonce1).not.toEqual(nonce2); // different sequence
@@ -134,7 +138,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   // --- 8. AEAD: tampered ciphertext fails decryption ---
   test("AEAD: tampered ciphertext fails decryption", () => {
     const key = randomBytes(32);
-    const nonce = buildNonce(0x12345678, 1n);
+    const nonce = buildNonce(new Uint8Array([0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]), 1);
     const plaintext = new TextEncoder().encode("test payload");
     const ciphertext = encryptPayload(key, nonce, plaintext);
 
@@ -149,7 +153,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   test("AEAD: wrong key fails decryption", () => {
     const keyA = randomBytes(32);
     const keyB = randomBytes(32);
-    const nonce = buildNonce(0x12345678, 1n);
+    const nonce = buildNonce(new Uint8Array([0x12, 0x34, 0x56, 0x78, 0, 0, 0, 0]), 1);
     const plaintext = new TextEncoder().encode("test payload");
     const ciphertext = encryptPayload(keyA, nonce, plaintext);
 
@@ -196,9 +200,10 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   // --- 13. Key derivation: different hops get different keys ---
   test("HKDF: different hops get different forwarding keys", () => {
     const sharedSecret = randomBytes(32);
-    const circuitId = randomBytes(32);
-    const keys0 = deriveHopKeys(sharedSecret, 0, circuitId);
-    const keys1 = deriveHopKeys(sharedSecret, 1, circuitId);
+    // Per spec/08 §4.1 (new API): the 3rd arg is commitment_root (used as HKDF salt).
+    const commitmentRoot = randomBytes(32);
+    const keys0 = deriveHopKeys(sharedSecret, 0, commitmentRoot);
+    const keys1 = deriveHopKeys(sharedSecret, 1, commitmentRoot);
     expect(keys0.forwardingKey).not.toEqual(keys1.forwardingKey);
     expect(keys0.returnKey).not.toEqual(keys1.returnKey);
   });
@@ -206,10 +211,11 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   // --- 14. Key derivation: different circuits get different keys ---
   test("HKDF: different circuits get different keys for same hop", () => {
     const sharedSecret = randomBytes(32);
-    const circuitId1 = randomBytes(32);
-    const circuitId2 = randomBytes(32);
-    const keys1 = deriveHopKeys(sharedSecret, 0, circuitId1);
-    const keys2 = deriveHopKeys(sharedSecret, 0, circuitId2);
+    // Per spec/08 §4.1 (new API): different commitment_roots → different salts → different keys.
+    const commitmentRoot1 = randomBytes(32);
+    const commitmentRoot2 = randomBytes(32);
+    const keys1 = deriveHopKeys(sharedSecret, 0, commitmentRoot1);
+    const keys2 = deriveHopKeys(sharedSecret, 0, commitmentRoot2);
     expect(keys1.forwardingKey).not.toEqual(keys2.forwardingKey);
   });
 
@@ -220,7 +226,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
     const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
 
     const plaintext = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
-    const seq = 1n;
+    const seq = 1; // frame sequence is a 32-bit number per spec/08 §4.3 (new API)
 
     // Onion encrypt from initiator
     const { encryptedPayload } = onionEncrypt(circuit, seq, plaintext);
@@ -268,8 +274,9 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
 
     for (let i = 1; i <= 10; i++) {
       const plaintext = new TextEncoder().encode(`packet ${i}`);
-      const { encryptedPayload } = onionEncrypt(circuit, BigInt(i), plaintext);
-      const { decrypted } = relayDecrypt(circuit, 0, BigInt(i), encryptedPayload);
+      // Per spec/08 §4.3 (new API): frame_sequence is a 32-bit number (NOT bigint).
+      const { encryptedPayload } = onionEncrypt(circuit, i, plaintext);
+      const { decrypted } = relayDecrypt(circuit, 0, i, encryptedPayload);
       expect(new TextDecoder().decode(decrypted)).toBe(`packet ${i}`);
     }
   });

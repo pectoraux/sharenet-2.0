@@ -1255,3 +1255,55 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - Both structural divergences are now reconciled: the reference implementation matches the normative spec for both GatewayServiceAgreement and LedgerEntry. No registry entry carries an unresolved "Structural reconciliation is future work" note.
+
+---
+Task ID: R-008-circuit-protocol-reconciliation
+Agent: main (Z.ai Code)
+Task: Reconcile spec/08-circuits.md with the reference implementation — the circuit cryptographic substrate (CircuitId, key derivation, nonce layout, CircuitFrame AD) diverged between spec and implementation.
+
+Work Log:
+- Reconciled spec/08-circuits.md — rewrote §3-5 to match the R-001 protocol freeze (BLAKE3, SHARENET/.../N domain tags) and the implementation's evolved security model:
+  - §3 CircuitId: now uses BLAKE3-256(SHARENET/CIRCUIT/ID/1 || commitment_root || initiator_x25519_pub) — derived from the raw 32-byte commitment_root, NOT the routeId string
+  - §4.1 Key Agreement: now uses commitment_root as HKDF salt (not empty), ephemeral relay keys (stronger than spec's original static-key model)
+  - §4.3 Nonce: now uses 64-bit nonce prefix (derived from commitment_root via HKDF) || 32-bit frame_sequence — replacing the old 32-bit routeIdPrefix || 64-bit sequenceNumber layout
+  - §4.6 CircuitFrame: explicitly defined the data-plane wire object with AD = SHARENET/CIRCUIT/FRAME/1 || commitment_root || frame_sequence || direction
+  - §5 Setup Protocol: documented the per-relay setup model (not the spec's original onion-chain model)
+
+- Updated reference/circuit/circuit.ts:
+  - deriveCircuitId: now takes (commitmentRoot: Uint8Array, initiatorX25519PublicKey: Uint8Array) — uses raw commitment_root bytes, not routeId string
+  - deriveHopKeys: now takes (sharedSecret, hopIndex, commitmentRoot: Uint8Array) — uses commitment_root as HKDF salt
+  - Added deriveNoncePrefix(commitmentRoot) — derives 8-byte nonce prefix from commitment_root via HKDF
+  - buildNonce: now takes (noncePrefix: Uint8Array, frameSequence: number) — 64-bit prefix || 32-bit big-endian sequence
+  - Added buildCircuitFrameAD(commitmentRoot, frameSequence, direction) — constructs the AEAD AD per spec/08 §4.6
+  - ActiveCircuit interface: replaced routeIdPrefix with noncePrefix + commitmentRoot
+  - setupCircuit: uses route.commitmentRoot for all derivations
+  - onionEncrypt/relayDecrypt: use new nonce + AD construction, frameSequence as number (not bigint)
+
+- Updated reference/circuit/distributed-setup.ts:
+  - handleCircuitSetup: takes commitmentRoot instead of circuitIdBytes for key derivation
+  - processCircuitSetupAck: same
+  - establishDistributedCircuit: derives circuitId from route.commitmentRoot, derives noncePrefix, passes commitmentRoot to ack processing
+
+- Updated all test files (gate-06, r008, r008h) for the new API:
+  - deriveCircuitId calls use commitmentRoot instead of routeId
+  - handleCircuitSetup/processCircuitSetupAck use commitmentRoot
+  - onionEncrypt/relayDecrypt use number instead of bigint
+  - buildNonce tests use 8-byte prefix + number
+
+- Regenerated V-CIRCUIT-001.json with real values from the new API:
+  - circuit-id-deterministic: BLAKE3(commitment_root || initiator_pub)
+  - hop-keys-deterministic: HKDF(salt=commitment_root, ...)
+  - nonce-prefix-deterministic: HKDF(salt=commitment_root, ikm="nonce-prefix")
+  - nonce-layout: 8-byte prefix || 4-byte frame_sequence
+  - replay-guard cases (unchanged)
+
+- Updated TS + Python runners for the new circuit API — both independently reproduce the same bytes.
+
+Stage Summary:
+- Tests: 336 pass, 0 fail. 1103 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 35/35 vectors pass.
+- Python conformance runner: 35/35 vectors pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The circuit cryptographic substrate is now reconciled: spec/08 and the implementation use the same BLAKE3-based constructions, commitment_root as the canonical binding input, and the 64+32 nonce layout. The CircuitFrame AD is explicitly defined.

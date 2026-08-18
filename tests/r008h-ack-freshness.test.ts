@@ -71,12 +71,14 @@ function makeFreshAck(ackCreatedAt: number = NOW) {
   const ctx = setupRoute(1);
   const initSk = randomBytes(32);
   const initPk = x25519.getPublicKey(initSk);
-  const circuitId = deriveCircuitId(ctx.branded.routeId, initPk);
+  // Per spec/08 §3 (new API): circuit_id derives from commitment_root, NOT routeId.
+  const circuitId = deriveCircuitId(ctx.branded.commitmentRoot, initPk);
   const req: CircuitSetupRequest = {
     route: ctx.branded, hopIndex: 0,
     initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
   };
-  const relayResult = handleCircuitSetup(req, ctx.kps[0]!.secretKey, circuitId, ackCreatedAt);
+  // handleCircuitSetup now takes commitmentRoot (used as HKDF salt) instead of circuitId.
+  const relayResult = handleCircuitSetup(req, ctx.kps[0]!.secretKey, ctx.branded.commitmentRoot, ackCreatedAt);
   if (!relayResult.ok) throw new Error("relay setup failed");
   const commitDigestHex = toHex(routeCommitmentDigest(ctx.branded));
   return {
@@ -91,9 +93,10 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
   test("expired ack (ackExpiry <= now) → REJECT", () => {
     const f = makeFreshAck();
     const expiredAck: CircuitSetupAck = { ...f.ack, ackExpiry: NOW - 1 };
+    // processCircuitSetupAck now takes commitmentRoot (not circuitId) as the 8th arg.
     const r = processCircuitSetupAck(
       expiredAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.circuitId, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("expired");
@@ -109,7 +112,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     };
     const r = processCircuitSetupAck(
       malformedAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.circuitId, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("malformed");
@@ -123,7 +126,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     };
     const r = processCircuitSetupAck(
       skewedAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.circuitId, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("future-skewed");
@@ -137,7 +140,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     };
     const r = processCircuitSetupAck(
       staleAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.circuitId, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("stale");
@@ -149,7 +152,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // ackTimestamp === NOW, ackExpiry === NOW + 3600 → all freshness bounds pass.
     const r = processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.circuitId, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
     expect(r.ok).toBe(true);
   });
@@ -164,7 +167,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // age === ACK_MAX_AGE_SECONDS → `now - ackTimestamp > AGE` is false → accept.
     const r = processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.circuitId, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
     expect(r.ok).toBe(true);
   });
@@ -176,7 +179,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // ackTimestamp === NOW + SKEW → `ackTimestamp > now + SKEW` is false → accept.
     const r = processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.circuitId, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
     expect(r.ok).toBe(true);
   });
@@ -190,7 +193,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // Try to use ack1's data in circuit 2's context.
     const r = processCircuitSetupAck(
       f1.ack, f2.ctx.branded.routeId, f2.commitDigestHex, 0,
-      f2.initPk, f1.ctx.kps[0]!.publicKey, f2.initSk, f2.circuitId, NOW,
+      f2.initPk, f1.ctx.kps[0]!.publicKey, f2.initSk, f2.ctx.branded.commitmentRoot, NOW,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) {
@@ -251,7 +254,8 @@ describe("R-008 hardening: forwarding lifecycle state machine", () => {
       route: f.ctx.branded, hopIndex: 0,
       initiatorX25519PublicKey: f.initPk, setupNonce: randomBytes(16),
     };
-    const relayResult = handleCircuitSetup(req, f.ctx.kps[0]!.secretKey, f.circuitId, NOW);
+    // handleCircuitSetup now takes commitmentRoot (used as HKDF salt) instead of circuitId.
+    const relayResult = handleCircuitSetup(req, f.ctx.kps[0]!.secretKey, f.ctx.branded.commitmentRoot, NOW);
     expect(relayResult.ok).toBe(true);
     if (!relayResult.ok) return;
     expect(relayResult.state.lifecycle).toBe("INSTALLED");

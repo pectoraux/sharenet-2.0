@@ -13,9 +13,9 @@
  *   - X25519 key agreement between initiator and each relay
  *   - HKDF domain-separated key schedule
  *   - AEAD: ChaCha20-Poly1305 (256-bit key, 96-bit nonce, 128-bit tag)
- *   - Nonce layout: 32-bit route_id_prefix || 64-bit sequence_number (big-endian)
- *   - Replay protection: per-circuit monotonic sequence number, reject duplicates
- *   - Route/circuit binding: circuit_id = BLAKE3-256(route_id || initiator_x25519_pubkey)
+ *   - Nonce layout: 64-bit circuit_nonce_prefix || 32-bit frame_sequence (big-endian)
+ *   - Replay protection: per-circuit monotonic frame sequence number, reject duplicates
+ *   - Route/circuit binding: circuit_id = BLAKE3-256(commitment_root || initiator_x25519_pubkey)
  *   - Relays never receive application plaintext (onion-layered encryption)
  *
  * Domain tags (FROZEN per spec/14 §4):
@@ -87,22 +87,26 @@ export const CIRCUIT_EXPIRY_SECONDS = 3600;
 /**
  * Compute the CircuitId from a route commitment.
  *
+ * Per spec/08 §3 (FROZEN):
  * circuit_id = BLAKE3-256(
  *   utf8("SHARENET/CIRCUIT/ID/1")
- *   || route_id
- *   || initiator_x25519_public_key
+ *   || commitment_root       ; 32 bytes — the raw Merkle root
+ *   || initiator_x25519_pub  ; 32 bytes — the source's ephemeral key
  * )
  *
- * This binds the circuit to a specific committed route + the initiator's
- * ephemeral X25519 key, preventing circuit ID reuse across routes.
+ * This binds the circuit to a specific committed route (via commitment_root)
+ * + the initiator's ephemeral X25519 key, preventing circuit ID reuse.
+ *
+ * NOTE: The input is the raw 32-byte commitment_root, NOT the route_id
+ * string (which is "route:" + hex(commitment_root)).
  */
 export function deriveCircuitId(
-  routeId: string,
+  commitmentRoot: Uint8Array,
   initiatorX25519PublicKey: Uint8Array,
 ): Uint8Array {
   const h = blake3.create({ dkLen: 32 });
   h.update(new TextEncoder().encode(CIRCUIT_ID_DOMAIN));
-  h.update(new TextEncoder().encode(routeId));
+  h.update(commitmentRoot);
   h.update(initiatorX25519PublicKey);
   return h.digest();
 }
@@ -114,31 +118,28 @@ export function deriveCircuitId(
 /**
  * Derive per-hop AEAD keys using HKDF.
  *
- * For each hop, the initiator and the hop perform X25519 ECDH to get a shared
- * secret. Then HKDF extracts and expands to get:
- *   - forwardingKey: the AEAD key for this hop's relay to encrypt/decrypt
- *   - returnKey: the AEAD key for return traffic
+ * Per spec/08 §4.1 (FROZEN):
+ *   salt = commitment_root (32 bytes — binds keys to the specific route)
+ *   ikm  = X25519 shared secret
+ *   info = "SHARENET/CIRCUIT/KEY/1" || u8(hop_index)
  *
- * HKDF info = utf8("SHARENET/CIRCUIT/KEY/1") || u8be(hopIndex) || circuit_id
+ * Output is 64 bytes, split into:
+ *   - forwardingKey (bytes 0–31): AEAD key for forward traffic
+ *   - returnKey (bytes 32–63): AEAD key for return traffic
  */
 export function deriveHopKeys(
   sharedSecret: Uint8Array,
   hopIndex: number,
-  circuitId: Uint8Array,
+  commitmentRoot: Uint8Array,
 ): { forwardingKey: Uint8Array; returnKey: Uint8Array } {
-  // HKDF extract
-  const salt = new Uint8Array(0); // no salt — the shared secret is already high-entropy
-  const prk = hkdfExtract(sha256, sharedSecret, salt);
+  // HKDF extract with commitment_root as salt (per spec/08 §4.1)
+  const prk = hkdfExtract(sha256, sharedSecret, commitmentRoot);
 
   // HKDF expand: forwardingKey (32 bytes) + returnKey (32 bytes) = 64 bytes
-  const info = new Uint8Array(
-    new TextEncoder().encode(CIRCUIT_KEY_DOMAIN).length + 1 + circuitId.length,
-  );
-  let off = 0;
   const domain = new TextEncoder().encode(CIRCUIT_KEY_DOMAIN);
-  info.set(domain, off); off += domain.length;
-  info[off] = hopIndex; off += 1;
-  info.set(circuitId, off);
+  const info = new Uint8Array(domain.length + 1);
+  info.set(domain, 0);
+  info[domain.length] = hopIndex;
 
   const expanded = hkdfExpand(sha256, prk, info, 64);
   return {
@@ -147,28 +148,62 @@ export function deriveHopKeys(
   };
 }
 
+/**
+ * Derive the 64-bit circuit nonce prefix from the commitment root.
+ *
+ * Per spec/08 §4.3 (FROZEN):
+ *   prefix = first 8 bytes of HKDF-SHA256(
+ *     salt = commitment_root,
+ *     ikm  = "nonce-prefix",
+ *     info = "SHARENET/CIRCUIT/NONCE/1"
+ *   )
+ */
+export function deriveNoncePrefix(commitmentRoot: Uint8Array): Uint8Array {
+  const prk = hkdfExtract(sha256, new TextEncoder().encode("nonce-prefix"), commitmentRoot);
+  const info = new TextEncoder().encode("SHARENET/CIRCUIT/NONCE/1");
+  const expanded = hkdfExpand(sha256, prk, info, 8);
+  return expanded.slice(0, 8);
+}
+
+/**
+ * Build a 96-bit AEAD nonce from the circuit nonce prefix and frame sequence.
+ *
+ * Per spec/08 §4.3 (FROZEN):
+ *   nonce = circuit_nonce_prefix (64 bits) || frame_sequence (32 bits, big-endian)
+ */
+export function buildNonce(noncePrefix: Uint8Array, frameSequence: number): Uint8Array {
+  if (noncePrefix.length !== 8) throw new Error("nonce prefix must be 8 bytes");
+  const nonce = new Uint8Array(AEAD_NONCE_BYTES);
+  nonce.set(noncePrefix, 0);
+  const dv = new DataView(nonce.buffer);
+  dv.setUint32(8, frameSequence, false); // big-endian 32-bit
+  return nonce;
+}
+
+/**
+ * Build the AEAD associated data (AD) for a circuit frame.
+ *
+ * Per spec/08 §4.6 (FROZEN):
+ *   AD = "SHARENET/CIRCUIT/FRAME/1" || commitment_root (32) || frame_sequence (4 BE) || direction (1)
+ */
+export function buildCircuitFrameAD(
+  commitmentRoot: Uint8Array,
+  frameSequence: number,
+  direction: 0x01 | 0x02,
+): Uint8Array {
+  const domain = new TextEncoder().encode("SHARENET/CIRCUIT/FRAME/1");
+  const ad = new Uint8Array(domain.length + 32 + 4 + 1);
+  ad.set(domain, 0);
+  ad.set(commitmentRoot, domain.length);
+  const dv = new DataView(ad.buffer, domain.length + 32);
+  dv.setUint32(0, frameSequence, false); // big-endian
+  ad[domain.length + 32 + 4] = direction;
+  return ad;
+}
+
 // -----------------------------------------------------------------------
 // AEAD encryption/decryption
 // -----------------------------------------------------------------------
-
-/**
- * Nonce layout: 4-byte route_id_prefix || 8-byte sequence_number (big-endian).
- *
- * The route_id_prefix binds the nonce to a specific circuit, preventing
- * nonce reuse across circuits. The sequence_number is monotonically
- * increasing per-circuit, providing replay protection.
- */
-export function buildNonce(routeIdPrefix: number, sequenceNumber: bigint): Uint8Array {
-  const nonce = new Uint8Array(AEAD_NONCE_BYTES);
-  const dv = new DataView(nonce.buffer);
-  dv.setUint32(0, routeIdPrefix, false); // big-endian
-  // Write 64-bit sequence number as two 32-bit halves (big-endian)
-  const high = Number(sequenceNumber >> 32n);
-  const low = Number(sequenceNumber & 0xFFFFFFFFn);
-  dv.setUint32(4, high, false);
-  dv.setUint32(8, low, false);
-  return nonce;
-}
 
 /**
  * Encrypt a payload using ChaCha20-Poly1305 AEAD.
@@ -280,7 +315,10 @@ export interface ActiveCircuit {
   expiry: number;
   establishedAt: number;
   replayGuard: CircuitReplayGuard;
-  routeIdPrefix: number; // first 4 bytes of routeId as u32 (for nonce construction)
+  /** 64-bit nonce prefix derived from commitment_root (per spec/08 §4.3) */
+  noncePrefix: Uint8Array;
+  /** The 32-byte commitment_root (for CircuitFrame AD construction per spec/08 §4.6) */
+  commitmentRoot: Uint8Array;
 }
 
 // -----------------------------------------------------------------------
@@ -364,21 +402,14 @@ export function setupCircuit(
   const initiatorSecretKey = randomBytes(X25519_SECRET_KEY_BYTES);
   const initiatorPublicKey = x25519.getPublicKey(initiatorSecretKey);
 
-  // Compute CircuitId
-  // Per R-003/R-004: routeId is "route:" + hex(commitment_root).
-  // The CircuitId derivation uses the full routeId string (including prefix).
-  const circuitId = deriveCircuitId(route.routeId, initiatorPublicKey);
+  // Compute CircuitId — uses commitment_root (raw 32 bytes), NOT routeId string
+  const circuitId = deriveCircuitId(route.commitmentRoot, initiatorPublicKey);
   const circuitIdHex = toHex(circuitId);
 
-  // Route ID prefix (first 4 bytes of commitment_root hex as u32).
-  // Per R-003/R-004: routeId is "route:" + hex(commitment_root), so we
-  // extract the hex part after the "route:" prefix.
-  const routeIdHex = route.routeId.startsWith("route:")
-    ? route.routeId.slice(6) // strip "route:" prefix
-    : route.routeId; // backward compat (shouldn't happen with genuine branded routes)
-  const routeIdPrefix = parseInt(routeIdHex.slice(0, 8), 16);
+  // Derive the 64-bit nonce prefix from commitment_root (per spec/08 §4.3)
+  const noncePrefix = deriveNoncePrefix(route.commitmentRoot);
 
-  // Derive per-hop keys
+  // Derive per-hop keys — uses commitment_root as salt (per spec/08 §4.1)
   const hopKeys: HopKeyMaterial[] = [];
   for (let i = 0; i < route.hops.length; i++) {
     const hop = route.hops[i]!;
@@ -392,7 +423,7 @@ export function setupCircuit(
 
     // ECDH: initiator's secret key × relay's public key
     const sharedSecret = x25519.getSharedSecret(initiatorSecretKey, relayKeys.x25519PublicKey);
-    const keys = deriveHopKeys(sharedSecret, i, circuitId);
+    const keys = deriveHopKeys(sharedSecret, i, route.commitmentRoot);
 
     hopKeys.push({
       hopIndex: i,
@@ -413,7 +444,8 @@ export function setupCircuit(
     expiry: route.expiry,
     establishedAt: now,
     replayGuard: new CircuitReplayGuard(),
-    routeIdPrefix,
+    noncePrefix,
+    commitmentRoot: route.commitmentRoot,
   };
 }
 
@@ -433,16 +465,17 @@ export function setupCircuit(
  */
 export function onionEncrypt(
   circuit: ActiveCircuit,
-  sequenceNumber: bigint,
+  frameSequence: number,
   plaintext: Uint8Array,
 ): { encryptedPayload: Uint8Array; aad: Uint8Array } {
   let data = plaintext;
-  const aad = buildNonce(circuit.routeIdPrefix, sequenceNumber);
+  // Per spec/08 §4.6: AD = "SHARENET/CIRCUIT/FRAME/1" || commitment_root || frame_sequence || direction
+  const aad = buildCircuitFrameAD(circuit.commitmentRoot, frameSequence, 0x01);
 
   // Encrypt from the outermost hop (last) to the innermost hop (first)
   for (let i = circuit.hops.length - 1; i >= 0; i--) {
     const hop = circuit.hops[i]!;
-    const nonce = buildNonce(circuit.routeIdPrefix, sequenceNumber);
+    const nonce = buildNonce(circuit.noncePrefix, frameSequence);
     data = encryptPayload(hop.forwardingKey, nonce, data, aad);
   }
 
@@ -458,13 +491,13 @@ export function onionEncrypt(
 export function relayDecrypt(
   circuit: ActiveCircuit,
   hopIndex: number,
-  sequenceNumber: bigint,
+  frameSequence: number,
   ciphertext: Uint8Array,
 ): { decrypted: Uint8Array; aad: Uint8Array } {
   const hop = circuit.hops[hopIndex];
   if (!hop) throw new Error(`no hop at index ${hopIndex}`);
-  const nonce = buildNonce(circuit.routeIdPrefix, sequenceNumber);
-  const aad = nonce; // AAD is the nonce itself (binds to sequence + route)
+  const nonce = buildNonce(circuit.noncePrefix, frameSequence);
+  const aad = buildCircuitFrameAD(circuit.commitmentRoot, frameSequence, 0x01);
   const decrypted = decryptPayload(hop.forwardingKey, nonce, ciphertext, aad);
   return { decrypted, aad };
 }

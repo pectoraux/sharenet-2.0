@@ -61,6 +61,7 @@ import {
 import {
   deriveCircuitId,
   deriveHopKeys,
+  deriveNoncePrefix,
   buildNonce,
   CircuitReplayGuard,
 } from "@reference/circuit/circuit";
@@ -510,57 +511,52 @@ function verifyCircuitVector(data: any): VectorResult {
       const expected = v.expected;
 
       if (v.name === "circuit-id-deterministic") {
-        const routeId: string = input.routeId;
+        const commitmentRoot = hexToBytes(input.commitmentRootHex);
         const initiatorPub = hexToBytes(input.initiatorX25519PublicKeyHex);
-        const circuitId = deriveCircuitId(routeId, initiatorPub);
+        const circuitId = deriveCircuitId(commitmentRoot, initiatorPub);
         const circuitIdHex = toHex(circuitId);
-        caseOk =
-          circuitIdHex === expected.circuitIdHex &&
-          circuitId.length === expected.circuitIdLengthBytes;
+        caseOk = circuitIdHex === expected.circuitIdHex;
         if (!caseOk) {
-          failures.push(`${v.name}: circuitId ${circuitIdHex} (len=${circuitId.length}) != ${expected.circuitIdHex}`);
+          failures.push(`${v.name}: circuitId ${circuitIdHex} != ${expected.circuitIdHex}`);
         }
       } else if (v.name === "hop-keys-deterministic") {
         const sharedSecret = hexToBytes(input.sharedSecretHex);
         const hopIndex: number = input.hopIndex;
-        const circuitId = hexToBytes(input.circuitIdHex);
-        const { forwardingKey, returnKey } = deriveHopKeys(sharedSecret, hopIndex, circuitId);
+        const commitmentRoot = hexToBytes(input.commitmentRootHex);
+        const { forwardingKey, returnKey } = deriveHopKeys(sharedSecret, hopIndex, commitmentRoot);
         const fwdHex = toHex(forwardingKey);
         const retHex = toHex(returnKey);
-        caseOk =
-          fwdHex === expected.forwardingKeyHex &&
-          retHex === expected.returnKeyHex &&
-          forwardingKey.length === expected.keyLengthBytes;
+        caseOk = fwdHex === expected.forwardingKeyHex && retHex === expected.returnKeyHex;
         if (!caseOk) {
           failures.push(`${v.name}: fwd=${fwdHex} ret=${retHex} (expected fwd=${expected.forwardingKeyHex} ret=${expected.returnKeyHex})`);
         }
-      } else if (v.name === "nonce-layout") {
-        const routeIdPrefix: number = input.routeIdPrefix;
-        const sequenceNumber = BigInt(input.sequenceNumber);
-        const nonce = buildNonce(routeIdPrefix, sequenceNumber);
-        const nonceHex = toHex(nonce);
-        caseOk =
-          nonceHex === expected.nonceHex &&
-          nonce.length === expected.nonceLengthBytes;
+      } else if (v.name === "nonce-prefix-deterministic") {
+        const commitmentRoot = hexToBytes(input.commitmentRootHex);
+        const noncePrefix = deriveNoncePrefix(commitmentRoot);
+        const noncePrefixHex = toHex(noncePrefix);
+        caseOk = noncePrefixHex === expected.noncePrefixHex;
         if (!caseOk) {
-          failures.push(`${v.name}: nonce ${nonceHex} (len=${nonce.length}) != ${expected.nonceHex}`);
+          failures.push(`${v.name}: noncePrefix ${noncePrefixHex} != ${expected.noncePrefixHex}`);
+        }
+      } else if (v.name === "nonce-layout") {
+        const noncePrefix = hexToBytes(input.noncePrefixHex);
+        const frameSequence: number = input.frameSequence;
+        const nonce = buildNonce(noncePrefix, frameSequence);
+        const nonceHex = toHex(nonce);
+        caseOk = nonceHex === expected.nonceHex;
+        if (!caseOk) {
+          failures.push(`${v.name}: nonce ${nonceHex} != ${expected.nonceHex}`);
         }
       } else if (v.name === "replay-guard-rejects-duplicate" || v.name === "replay-guard-rejects-lower") {
         const guard = new CircuitReplayGuard();
-        const firstSeq = parseCallSeq(input.firstCall);
-        const secondSeq = parseCallSeq(input.secondCall);
+        const calls: string[] = input.calls || [];
+        const firstSeq = BigInt(calls[0]!.replace(/n$/, ""));
+        const secondSeq = BigInt(calls[1]!.replace(/n$/, ""));
         const firstResult = guard.checkAndRecord(firstSeq);
         const secondResult = guard.checkAndRecord(secondSeq);
-        const firstExpectedOk = expected.firstResult === "ok";
-        const secondExpectedOk = expected.secondResult === "ok";
-        caseOk = firstResult.ok === firstExpectedOk && secondResult.ok === secondExpectedOk;
-        if (caseOk && !secondResult.ok && expected.secondReason) {
-          // Verify the second-result reason mentions both seq numbers
-          // (the failing seq and the highest-so-far seq).
-          caseOk = secondResult.reason.includes(String(secondSeq)) && secondResult.reason.includes(String(firstSeq));
-        }
+        caseOk = firstResult.ok === true && secondResult.ok === expected.secondCallOk;
         if (!caseOk) {
-          failures.push(`${v.name}: first=${JSON.stringify(firstResult)} second=${JSON.stringify(secondResult)}`);
+          failures.push(`${v.name}: first=${JSON.stringify(firstResult)} second=${JSON.stringify(secondResult)} expected secondOk=${expected.secondCallOk}`);
         }
       } else {
         throw new Error(`unknown circuit case name: ${v.name}`);

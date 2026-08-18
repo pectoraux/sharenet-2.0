@@ -63,15 +63,15 @@ describe("R-008: Distributed circuit establishment", () => {
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
 
-    // Compute circuit ID
-    const circuitId = deriveCircuitId(ctx.branded.routeId, initPk);
+    // Per spec/08 §3 (new API): circuit_id derives from commitment_root, NOT routeId.
+    const circuitId = deriveCircuitId(ctx.branded.commitmentRoot, initPk);
 
-    // Relay 0 handles setup
+    // Relay 0 handles setup (handleCircuitSetup now takes commitmentRoot as 3rd arg)
     const req0: CircuitSetupRequest = {
       route: ctx.branded, hopIndex: 0,
       initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
     };
-    const relay0Result = handleCircuitSetup(req0, ctx.kps[0]!.secretKey, circuitId, NOW);
+    const relay0Result = handleCircuitSetup(req0, ctx.kps[0]!.secretKey, ctx.branded.commitmentRoot, NOW);
     expect(relay0Result.ok).toBe(true);
     if (!relay0Result.ok) return;
     expect(relay0Result.state.lifecycle).toBe("INSTALLED");
@@ -81,7 +81,7 @@ describe("R-008: Distributed circuit establishment", () => {
       route: ctx.branded, hopIndex: 1,
       initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
     };
-    const relay1Result = handleCircuitSetup(req1, ctx.kps[1]!.secretKey, circuitId, NOW);
+    const relay1Result = handleCircuitSetup(req1, ctx.kps[1]!.secretKey, ctx.branded.commitmentRoot, NOW);
     expect(relay1Result.ok).toBe(true);
     if (!relay1Result.ok) return;
 
@@ -101,13 +101,13 @@ describe("R-008: Distributed circuit establishment", () => {
     const ctx = setupRoute(2);
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
-    const circuitId = deriveCircuitId(ctx.branded.routeId, initPk);
+    const circuitId = deriveCircuitId(ctx.branded.commitmentRoot, initPk);
 
     const req0: CircuitSetupRequest = {
       route: ctx.branded, hopIndex: 0,
       initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
     };
-    const relay0Result = handleCircuitSetup(req0, ctx.kps[0]!.secretKey, circuitId, NOW);
+    const relay0Result = handleCircuitSetup(req0, ctx.kps[0]!.secretKey, ctx.branded.commitmentRoot, NOW);
     if (!relay0Result.ok) return;
 
     // Tamper: change routeId in ack
@@ -121,9 +121,10 @@ describe("R-008: Distributed circuit establishment", () => {
       [3, ctx.branded.hops.map(h => h.capability)], [4, ctx.branded.hops.map(h => h.endpoint)],
       [5, ctx.branded.expiry], [6, ctx.branded.initiatorNodeId], [7, ctx.branded.agreementDigest],
     ])), { dkLen: 32 }));
+    // processCircuitSetupAck now takes commitmentRoot (not circuitId) as the 8th arg.
     const result = processCircuitSetupAck(
       tamperedAck, ctx.branded.routeId, commitDigestHex, 0,
-      initPk, ctx.kps[0]!.publicKey, initSk, circuitId, NOW,
+      initPk, ctx.kps[0]!.publicKey, initSk, ctx.branded.commitmentRoot, NOW,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("routeId mismatch");
@@ -136,19 +137,19 @@ describe("R-008: Distributed circuit establishment", () => {
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
 
-    const circuitId1 = deriveCircuitId(ctx1.branded.routeId, initPk);
+    const circuitId1 = deriveCircuitId(ctx1.branded.commitmentRoot, initPk);
     const req1: CircuitSetupRequest = {
       route: ctx1.branded, hopIndex: 0,
       initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
     };
-    const relayResult = handleCircuitSetup(req1, ctx1.kps[0]!.secretKey, circuitId1);
+    const relayResult = handleCircuitSetup(req1, ctx1.kps[0]!.secretKey, ctx1.branded.commitmentRoot);
     if (!relayResult.ok) return;
 
     // Try to use the old ack with a DIFFERENT route (ctx2)
-    const circuitId2 = deriveCircuitId(ctx2.branded.routeId, initPk);
+    const circuitId2 = deriveCircuitId(ctx2.branded.commitmentRoot, initPk);
     const result = processCircuitSetupAck(
       relayResult.ack, ctx2.branded.routeId, bytesToHex(randomBytes(32)), 0,
-      initPk, ctx1.kps[0]!.publicKey, initSk, circuitId2, NOW,
+      initPk, ctx1.kps[0]!.publicKey, initSk, ctx2.branded.commitmentRoot, NOW,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("routeId mismatch");
@@ -159,14 +160,14 @@ describe("R-008: Distributed circuit establishment", () => {
     const ctx = setupRoute(2);
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
-    const circuitId = deriveCircuitId(ctx.branded.routeId, initPk);
+    const circuitId = deriveCircuitId(ctx.branded.commitmentRoot, initPk);
 
     // Relay 0 handles setup with ITS key
     const req0: CircuitSetupRequest = {
       route: ctx.branded, hopIndex: 0,
       initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
     };
-    const relay0Result = handleCircuitSetup(req0, ctx.kps[0]!.secretKey, circuitId, NOW);
+    const relay0Result = handleCircuitSetup(req0, ctx.kps[0]!.secretKey, ctx.branded.commitmentRoot, NOW);
     if (!relay0Result.ok) return;
 
     // But the initiator tries to verify the ack with Relay 1's key
@@ -178,7 +179,7 @@ describe("R-008: Distributed circuit establishment", () => {
     ])), { dkLen: 32 }));
     const result = processCircuitSetupAck(
       relay0Result.ack, ctx.branded.routeId, commitDigestHex, 0,
-      initPk, wrongKey, initSk, circuitId, NOW,
+      initPk, wrongKey, initSk, ctx.branded.commitmentRoot, NOW,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("signature invalid");
@@ -189,14 +190,14 @@ describe("R-008: Distributed circuit establishment", () => {
     const ctx = setupRoute(2);
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
-    const circuitId = deriveCircuitId(ctx.branded.routeId, initPk);
+    const circuitId = deriveCircuitId(ctx.branded.commitmentRoot, initPk);
 
     // Create a request with an out-of-range hopIndex
     const badReq: CircuitSetupRequest = {
       route: ctx.branded, hopIndex: 99, // out of range
       initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
     };
-    const result = handleCircuitSetup(badReq, ctx.kps[0]!.secretKey, circuitId);
+    const result = handleCircuitSetup(badReq, ctx.kps[0]!.secretKey, ctx.branded.commitmentRoot);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("out of range");
   });
@@ -226,21 +227,21 @@ describe("R-008: Distributed circuit establishment", () => {
     const ctx = setupRoute(2);
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
-    const circuitId = deriveCircuitId(ctx.branded.routeId, initPk);
+    const circuitId = deriveCircuitId(ctx.branded.commitmentRoot, initPk);
 
     // Both relays handle setup
     const req0: CircuitSetupRequest = {
       route: ctx.branded, hopIndex: 0,
       initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
     };
-    const relay0Result = handleCircuitSetup(req0, ctx.kps[0]!.secretKey, circuitId, NOW);
+    const relay0Result = handleCircuitSetup(req0, ctx.kps[0]!.secretKey, ctx.branded.commitmentRoot, NOW);
     if (!relay0Result.ok) return;
 
     const req1: CircuitSetupRequest = {
       route: ctx.branded, hopIndex: 1,
       initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
     };
-    const relay1Result = handleCircuitSetup(req1, ctx.kps[1]!.secretKey, circuitId, NOW);
+    const relay1Result = handleCircuitSetup(req1, ctx.kps[1]!.secretKey, ctx.branded.commitmentRoot, NOW);
     if (!relay1Result.ok) return;
 
     // Initiator establishes the circuit
@@ -252,9 +253,9 @@ describe("R-008: Distributed circuit establishment", () => {
     if (!estResult.ok) return;
     const circuit = estResult.circuit;
 
-    // Onion-encrypt a test payload
+    // Onion-encrypt a test payload (frame sequence is a 32-bit number per spec/08 §4.3 new API)
     const plaintext = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
-    const seq = 1n;
+    const seq = 1;
     const { encryptedPayload } = onionEncrypt(circuit, seq, plaintext);
 
     // Relay 0 decrypts one layer (using its installed forwarding state)

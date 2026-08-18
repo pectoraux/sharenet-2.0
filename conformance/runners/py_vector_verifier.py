@@ -947,16 +947,19 @@ def verify_svc_vector(data: dict) -> dict:
 
 CIRCUIT_ID_DOMAIN = b"SHARENET/CIRCUIT/ID/1"
 CIRCUIT_KEY_DOMAIN = b"SHARENET/CIRCUIT/KEY/1"
+CIRCUIT_NONCE_DOMAIN = b"SHARENET/CIRCUIT/NONCE/1"
 CIRCUIT_AEAD_NONCE_BYTES = 12
 CIRCUIT_HKDF_EXPAND_LEN = 64
+CIRCUIT_NONCE_PREFIX_BYTES = 8
+CIRCUIT_NONCE_PREFIX_IKM = b"nonce-prefix"
 
 
-def derive_circuit_id(route_id: str, initiator_x25519_pubkey: bytes) -> bytes:
-    """CircuitId = BLAKE3-256(SHARENET/CIRCUIT/ID/1 || route_id || initiator_pubkey)."""
+def derive_circuit_id(commitment_root: bytes, initiator_x25519_pub: bytes) -> bytes:
+    """CircuitId = BLAKE3-256(SHARENET/CIRCUIT/ID/1 || commitment_root || initiator_pub)."""
     h = blake3.blake3()
     h.update(CIRCUIT_ID_DOMAIN)
-    h.update(route_id.encode("utf-8"))
-    h.update(initiator_x25519_pubkey)
+    h.update(commitment_root)
+    h.update(initiator_x25519_pub)
     return h.digest(length=32)
 
 
@@ -977,23 +980,41 @@ def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
     return out[:length]
 
 
-def derive_hop_keys(shared_secret: bytes, hop_index: int, circuit_id: bytes) -> tuple:
+def derive_hop_keys(shared_secret: bytes, hop_index: int, commitment_root: bytes) -> tuple:
     """Derive (forwardingKey, returnKey) via HKDF-SHA256.
 
-    info = utf8(SHARENET/CIRCUIT/KEY/1) || u8(hopIndex) || circuit_id (32 bytes)
-    Output: 64 bytes → forwardingKey[0:32] || returnKey[32:64]
+    HKDF-SHA256(salt=commitment_root, ikm=shared_secret,
+                info=SHARENET/CIRCUIT/KEY/1 || u8(hopIndex)) → 64 bytes.
+    Output: forwardingKey[0:32] || returnKey[32:64]
     """
     if hop_index < 0 or hop_index > 255:
         raise ValueError(f"hopIndex out of u8 range: {hop_index}")
-    prk = _hkdf_extract(b"", shared_secret)
-    info = CIRCUIT_KEY_DOMAIN + bytes([hop_index]) + circuit_id
+    prk = _hkdf_extract(commitment_root, shared_secret)
+    info = CIRCUIT_KEY_DOMAIN + bytes([hop_index])
     expanded = _hkdf_expand(prk, info, CIRCUIT_HKDF_EXPAND_LEN)
     return expanded[:32], expanded[32:64]
 
 
-def build_circuit_nonce(route_id_prefix: int, sequence_number: int) -> bytes:
-    """Nonce = u32be(routeIdPrefix) || u64be(sequenceNumber)."""
-    return struct.pack(">I", route_id_prefix) + struct.pack(">Q", sequence_number)
+def derive_circuit_nonce_prefix(commitment_root: bytes) -> bytes:
+    """Derive the 8-byte per-circuit AEAD nonce prefix.
+
+    Nonce prefix = first 8 bytes of
+      HKDF-SHA256(salt=commitment_root, ikm=b"nonce-prefix",
+                  info=SHARENET/CIRCUIT/NONCE/1)
+    """
+    prk = _hkdf_extract(commitment_root, CIRCUIT_NONCE_PREFIX_IKM)
+    expanded = _hkdf_expand(prk, CIRCUIT_NONCE_DOMAIN, CIRCUIT_NONCE_PREFIX_BYTES)
+    return expanded[:CIRCUIT_NONCE_PREFIX_BYTES]
+
+
+def build_circuit_nonce(nonce_prefix: bytes, frame_sequence: int) -> bytes:
+    """Nonce = nonce_prefix (8 bytes) || u32be(frame_sequence) (4 bytes) = 12 bytes."""
+    if len(nonce_prefix) != CIRCUIT_NONCE_PREFIX_BYTES:
+        raise ValueError(
+            f"nonce_prefix must be {CIRCUIT_NONCE_PREFIX_BYTES} bytes, "
+            f"got {len(nonce_prefix)}"
+        )
+    return nonce_prefix + struct.pack(">I", frame_sequence)
 
 
 class CircuitReplayGuard:
@@ -1031,9 +1052,9 @@ def verify_circuit_vector(data: dict) -> dict:
             exp = v["expected"]
 
             if name == "circuit-id-deterministic":
-                route_id = inp["routeId"]
+                commitment_root = bytes.fromhex(inp["commitmentRootHex"])
                 initiator_pub = bytes.fromhex(inp["initiatorX25519PublicKeyHex"])
-                cid = derive_circuit_id(route_id, initiator_pub)
+                cid = derive_circuit_id(commitment_root, initiator_pub)
                 if cid.hex() != exp["circuitIdHex"]:
                     failures.append(
                         f'{name}: circuitId {cid.hex()} != {exp["circuitIdHex"]}'
@@ -1042,8 +1063,8 @@ def verify_circuit_vector(data: dict) -> dict:
             elif name == "hop-keys-deterministic":
                 shared = bytes.fromhex(inp["sharedSecretHex"])
                 hop_index = inp["hopIndex"]
-                cid = bytes.fromhex(inp["circuitIdHex"])
-                fwd, ret = derive_hop_keys(shared, hop_index, cid)
+                commitment_root = bytes.fromhex(inp["commitmentRootHex"])
+                fwd, ret = derive_hop_keys(shared, hop_index, commitment_root)
                 if fwd.hex() != exp["forwardingKeyHex"]:
                     failures.append(
                         f'{name}: forwardingKey {fwd.hex()} != {exp["forwardingKeyHex"]}'
@@ -1053,10 +1074,19 @@ def verify_circuit_vector(data: dict) -> dict:
                         f'{name}: returnKey {ret.hex()} != {exp["returnKeyHex"]}'
                     )
 
+            elif name == "nonce-prefix-deterministic":
+                commitment_root = bytes.fromhex(inp["commitmentRootHex"])
+                prefix = derive_circuit_nonce_prefix(commitment_root)
+                if prefix.hex() != exp["noncePrefixHex"]:
+                    failures.append(
+                        f'{name}: noncePrefix {prefix.hex()} '
+                        f'!= {exp["noncePrefixHex"]}'
+                    )
+
             elif name == "nonce-layout":
-                prefix = inp["routeIdPrefix"]
-                seq = int(inp["sequenceNumber"])
-                nonce = build_circuit_nonce(prefix, seq)
+                prefix = bytes.fromhex(inp["noncePrefixHex"])
+                frame_sequence = int(inp["frameSequence"])
+                nonce = build_circuit_nonce(prefix, frame_sequence)
                 if nonce.hex() != exp["nonceHex"]:
                     failures.append(
                         f'{name}: nonce {nonce.hex()} != {exp["nonceHex"]}'
@@ -1065,21 +1095,21 @@ def verify_circuit_vector(data: dict) -> dict:
             elif name in ("replay-guard-rejects-duplicate",
                           "replay-guard-rejects-lower"):
                 guard = CircuitReplayGuard()
-                # First call sequence — "checkAndRecord(Nn)" → parse N from the string.
-                first_call = inp["firstCall"]
-                second_call = inp["secondCall"]
-                first_seq = _parse_seq_from_call(first_call)
-                second_seq = _parse_seq_from_call(second_call)
-                r1 = guard.check_and_record(first_seq)
-                if r1["ok"] != (exp["firstResult"] == "ok"):
+                # Each entry in `calls` is a BigInt literal string (e.g. "1", "5n").
+                calls = inp["calls"]
+                if len(calls) < 2:
                     failures.append(
-                        f'{name}: first call expected {exp["firstResult"]}, '
-                        f'got {"ok" if r1["ok"] else "fail"}'
+                        f'{name}: expected >=2 calls, got {len(calls)}'
                     )
+                    continue
+                first_seq = _parse_seq_from_call(calls[0])
+                second_seq = _parse_seq_from_call(calls[1])
+                guard.check_and_record(first_seq)
                 r2 = guard.check_and_record(second_seq)
-                if r2["ok"] != (exp["secondResult"] == "ok"):
+                if r2["ok"] != exp["secondCallOk"]:
                     failures.append(
-                        f'{name}: second call expected {exp["secondResult"]}, '
+                        f'{name}: second call expected secondCallOk='
+                        f'{exp["secondCallOk"]}, '
                         f'got {"ok" if r2["ok"] else "fail"}'
                     )
             else:
@@ -1097,10 +1127,18 @@ def verify_circuit_vector(data: dict) -> dict:
 
 
 def _parse_seq_from_call(call_str: str) -> int:
-    """Parse a 'checkAndRecord(Nn)' string into an int N."""
-    # Strip trailing 'n' (JS BigInt literal) and surrounding parens.
-    inner = call_str.split("(", 1)[1].rstrip(")")
-    inner = inner.rstrip("n")
+    """Parse a BigInt literal string into an int.
+
+    Accepts plain BigInt literals such as `"1"`, `"5n` (with optional trailing
+    `n`) and legacy `"checkAndRecord(Nn)"` wrappers used by older vectors.
+    """
+    inner = call_str.strip()
+    # Legacy form: "checkAndRecord(Nn)" → take the inside of the parens.
+    if "(" in inner and inner.endswith(")"):
+        inner = inner.split("(", 1)[1].rstrip(")")
+    # Strip trailing 'n' (JS BigInt literal suffix).
+    if inner.endswith("n"):
+        inner = inner[:-1]
     return int(inner)
 
 

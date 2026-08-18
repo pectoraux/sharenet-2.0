@@ -46,6 +46,7 @@ import { isBrandedCommittedRoute } from "../transport/validated-types";
 import {
   deriveHopKeys,
   deriveCircuitId,
+  deriveNoncePrefix,
   CircuitReplayGuard,
   type ActiveCircuit,
   type HopKeyMaterial,
@@ -283,7 +284,7 @@ export interface RelaySetupState {
 export function handleCircuitSetup(
   req: CircuitSetupRequest,
   relayEd25519SecretKey: Uint8Array,
-  circuitIdBytes: Uint8Array,
+  commitmentRoot: Uint8Array,
   now: number = Math.floor(Date.now() / 1000),
 ): { ok: true; ack: CircuitSetupAck; state: RelaySetupState } | { ok: false; reason: string } {
   // 1. Verify the route is genuine
@@ -303,8 +304,8 @@ export function handleCircuitSetup(
   // 4. Compute shared secret
   const sharedSecret = x25519.getSharedSecret(relayX25519SecretKey, req.initiatorX25519PublicKey);
 
-  // 5. Derive forwarding + return keys
-  const keys = deriveHopKeys(sharedSecret, req.hopIndex, circuitIdBytes);
+  // 5. Derive forwarding + return keys (commitment_root used as HKDF salt per spec/08 §4.1)
+  const keys = deriveHopKeys(sharedSecret, req.hopIndex, commitmentRoot);
 
   // 6. Compute route commitment digest
   const commitDigest = routeCommitmentDigest(req.route);
@@ -372,7 +373,7 @@ export function processCircuitSetupAck(
   expectedInitiatorX25519PublicKey: Uint8Array,
   relayEd25519PublicKey: Uint8Array,
   initiatorX25519SecretKey: Uint8Array,
-  circuitIdBytes: Uint8Array,
+  commitmentRoot: Uint8Array,
   now: number = Math.floor(Date.now() / 1000),
 ): { ok: true; hopKey: HopKeyMaterial } | { ok: false; reason: string } {
   // 1. Verify routeId matches
@@ -435,8 +436,8 @@ export function processCircuitSetupAck(
   // 7. Compute shared secret
   const sharedSecret = x25519.getSharedSecret(initiatorX25519SecretKey, ack.relayX25519PublicKey);
 
-  // 8. Derive keys
-  const keys = deriveHopKeys(sharedSecret, expectedHopIndex, circuitIdBytes);
+  // 8. Derive keys (commitment_root used as HKDF salt per spec/08 §4.1)
+  const keys = deriveHopKeys(sharedSecret, expectedHopIndex, commitmentRoot);
 
   return {
     ok: true,
@@ -492,15 +493,12 @@ export function establishDistributedCircuit(
     return { ok: false, reason: `expected ${route.hops.length} acks, got ${acks.length}` };
   }
 
-  // 3. Compute circuit ID + route commitment digest
-  const circuitId = deriveCircuitId(route.routeId, initiatorX25519PublicKey);
+  // 3. Compute circuit ID + nonce prefix from commitment_root
+  //    Per spec/08 §3 + §4.3: circuit_id and nonce_prefix both bind to the
+  //    raw 32-byte commitment_root (NOT the routeId string).
+  const circuitId = deriveCircuitId(route.commitmentRoot, initiatorX25519PublicKey);
   const circuitIdHex = toHex(circuitId);
-  // Per R-003/R-004: routeId is "route:" + hex(commitment_root).
-  // Strip the prefix to get the raw hex for the nonce prefix.
-  const routeIdHex = route.routeId.startsWith("route:")
-    ? route.routeId.slice(6)
-    : route.routeId;
-  const routeIdPrefix = parseInt(routeIdHex.slice(0, 8), 16);
+  const noncePrefix = deriveNoncePrefix(route.commitmentRoot);
   const commitDigestHex = toHex(routeCommitmentDigest(route));
 
   // 4. Process each ack
@@ -515,12 +513,13 @@ export function establishDistributedCircuit(
       return { ok: false, reason: `no Ed25519 public key for relay ${i} (${hop.nodeId})` };
     }
 
-    // Process the ack (with full binding verification)
+    // Process the ack (with full binding verification).
+    // Pass the route's commitment_root as the HKDF salt for key derivation.
     const result = processCircuitSetupAck(
       ack, route.routeId, commitDigestHex, i,
       initiatorX25519PublicKey,
       relayEd25519PubKey,
-      initiatorX25519SecretKey, circuitId, now,
+      initiatorX25519SecretKey, route.commitmentRoot, now,
     );
     if (!result.ok) {
       return { ok: false, reason: result.reason };
@@ -543,7 +542,8 @@ export function establishDistributedCircuit(
     expiry: route.expiry,
     establishedAt: now,
     replayGuard: new CircuitReplayGuard(),
-    routeIdPrefix,
+    noncePrefix,
+    commitmentRoot: route.commitmentRoot,
   };
 
   return { ok: true, circuit };
