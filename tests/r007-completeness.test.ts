@@ -1,16 +1,20 @@
 /**
- * ShareNet 2.0 — R-007: Vector completeness guard.
+ * ShareNet 2.0 — R-007: Registry-driven vector completeness guard.
  *
- * Per the R-007 exit condition:
+ * Per the R-007 final exit condition:
  *
- *   "A completeness test that enumerates the machine-readable schema
- *    artifact and fails when a protocol object lacks a vector family.
- *    That prevents the vector suite from silently falling behind the
- *    specification again."
+ *   "adding a new normative protocol object without adding a conformance
+ *    vector MUST fail CI automatically."
  *
- * This test reads the MANIFEST.json and the routing-schemas.json artifact,
- * and verifies that every protocol object defined in the schema artifact
- * has at least one vector family in the manifest.
+ * This test reads the canonical protocol-schema registry
+ * (`spec/schemas/protocol-registry.json`) and derives the required vector
+ * families from it — NOT from a hard-coded list. Every object in the
+ * registry declares a `conformance_vector_family` prefix; the test
+ * verifies that the MANIFEST contains at least one entry matching each
+ * prefix.
+ *
+ * If a new protocol object is added to the registry without a
+ * corresponding vector family in the manifest, this test fails.
  */
 
 import { describe, test, expect } from "bun:test";
@@ -20,75 +24,89 @@ import { join } from "node:path";
 const MANIFEST_PATH = join(process.cwd(), "conformance", "vectors", "MANIFEST.json");
 const MANIFEST = JSON.parse(readFileSync(MANIFEST_PATH, "utf-8"));
 
-const SCHEMA_PATH = join(process.cwd(), "spec", "schemas", "routing-schemas.json");
-const SCHEMA = JSON.parse(readFileSync(SCHEMA_PATH, "utf-8"));
+const REGISTRY_PATH = join(process.cwd(), "spec", "schemas", "protocol-registry.json");
+const REGISTRY = JSON.parse(readFileSync(REGISTRY_PATH, "utf-8"));
 
-/** Map schema artifact object names to expected vector prefix families. */
-const SCHEMA_OBJECT_TO_VECTOR_PREFIX: Record<string, string> = {
-  RouteHop: "V-ROUTE-COMMIT",
-  RouteProposal: "V-ROUTE-COMMIT",
-  SignedRouteProposal: "V-ROUTE-COMMIT",
-  RouteAcceptance: "V-ROUTE-COMMIT",
-  RouteCommitment: "V-ROUTE-COMMIT",
-};
+/**
+ * Derive the set of required vector-family prefixes from the protocol
+ * registry. Each object in the registry declares a
+ * `conformance_vector_family` — we collect the unique set.
+ */
+function getRequiredVectorFamilies(): Set<string> {
+  const families = new Set<string>();
+  for (const layer of Object.values(REGISTRY.layers)) {
+    for (const obj of Object.values((layer as any).objects)) {
+      const family = (obj as any).conformance_vector_family;
+      if (family) families.add(family);
+    }
+  }
+  return families;
+}
 
-/** Additional protocol objects that must have vectors (not in the routing schema artifact). */
-const REQUIRED_VECTOR_FAMILIES: Array<{ name: string; prefix: string }> = [
-  { name: "NodeId", prefix: "V-NODEID" },
-  { name: "CBOR encoding", prefix: "V-CBOR" },
-  { name: "NodeAdvertisement", prefix: "V-ADV" },
-  { name: "Link handshake", prefix: "V-LINK-HANDSHAKE" },
-  { name: "Link auth", prefix: "V-LINK-AUTH" },
-  { name: "RemoteNodeHint", prefix: "V-HINT" },
-  { name: "ServiceAgreement", prefix: "V-SVC" },
-  { name: "Circuit", prefix: "V-CIRCUIT" },
-  { name: "Gateway", prefix: "V-GATEWAY" },
-  { name: "BilateralReceipt", prefix: "V-RECEIPT" },
-];
+/**
+ * Get all vector IDs from the manifest.
+ */
+function getManifestVectorIds(): string[] {
+  return MANIFEST.vectors.map((v: any) => v.id);
+}
 
-describe("R-007: Vector completeness (every protocol object has a vector family)", () => {
+describe("R-007: Registry-driven vector completeness", () => {
+  test("protocol registry is valid JSON with the expected structure", () => {
+    expect(REGISTRY.version).toBe(1);
+    expect(REGISTRY.layers).toBeDefined();
+    expect(Object.keys(REGISTRY.layers).length).toBeGreaterThan(0);
+  });
+
   test("MANIFEST.json has the expected structure", () => {
     expect(MANIFEST.vectors).toBeDefined();
     expect(Array.isArray(MANIFEST.vectors)).toBe(true);
     expect(MANIFEST.vectors.length).toBeGreaterThan(0);
   });
 
-  test("every required vector family has at least one entry in the manifest", () => {
-    const manifestIds: string[] = MANIFEST.vectors.map((v: any) => v.id);
+  test("every protocol-registry object has a corresponding vector family in the manifest", () => {
+    const requiredFamilies = getRequiredVectorFamilies();
+    const manifestIds = getManifestVectorIds();
     const missing: string[] = [];
 
-    for (const family of REQUIRED_VECTOR_FAMILIES) {
-      const hasVector = manifestIds.some((id) => id.startsWith(family.prefix));
+    for (const family of requiredFamilies) {
+      const hasVector = manifestIds.some((id) => id.startsWith(family));
       if (!hasVector) {
-        missing.push(family.name);
+        missing.push(family);
       }
     }
 
+    // If this fails, a protocol object was added to the registry without
+    // a corresponding conformance vector family. Add the vector file +
+    // manifest entry, or remove the object from the registry.
     expect(missing).toEqual([]);
   });
 
-  test("routing schema artifact objects have corresponding vector families", () => {
-    const manifestIds: string[] = MANIFEST.vectors.map((v: any) => v.id);
-    const missing: string[] = [];
-
-    for (const [objName, prefix] of Object.entries(SCHEMA_OBJECT_TO_VECTOR_PREFIX)) {
-      const hasVector = manifestIds.some((id) => id.startsWith(prefix));
-      if (!hasVector) {
-        missing.push(objName);
-      }
-    }
-
-    expect(missing).toEqual([]);
-  });
-
-  test("total vector count meets the minimum threshold (≥ 20)", () => {
-    expect(MANIFEST.vectors.length).toBeGreaterThanOrEqual(20);
+  test("total vector count meets the minimum threshold (≥ 25)", () => {
+    expect(MANIFEST.vectors.length).toBeGreaterThanOrEqual(25);
   });
 
   test("every manifest entry references a file that exists", () => {
     for (const v of MANIFEST.vectors) {
       const path = join(process.cwd(), "conformance", "vectors", v.file);
       expect(existsSync(path)).toBe(true);
+    }
+  });
+
+  test("registry covers all protocol layers", () => {
+    const expectedLayers = [
+      "identity", "encoding", "link", "topology",
+      "routing", "service", "circuit", "gateway", "economics",
+    ];
+    for (const layer of expectedLayers) {
+      expect(REGISTRY.layers[layer]).toBeDefined();
+    }
+  });
+
+  test("every registry object has a conformance_vector_family declared", () => {
+    for (const [layerName, layer] of Object.entries(REGISTRY.layers)) {
+      for (const [objName, obj] of Object.entries((layer as any).objects)) {
+        expect((obj as any).conformance_vector_family).toBeDefined();
+      }
     }
   });
 });

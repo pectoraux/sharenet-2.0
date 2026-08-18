@@ -1,0 +1,93 @@
+{
+  "id": "V-TOPOLOGY-PROPAGATION-001",
+  "status": "draft",
+  "spec": "spec/06-topology.md §4.2 (bounded propagation), §4.3 (freshness)",
+  "description": "RemoteNodeHint bounded propagation: hopCount ≤ MAX_HINT_HOPS (3), timestamp within MAX_HINT_FRESHNESS_SECONDS (3600) of `now`. A hint that exceeds either bound is REJECTED by verifyRemoteNodeHint even if its reporter signature is still valid. This vector exercises the hintToHex canonical serialization plus the two propagation-limit rejection paths.",
+  "constants": {
+    "hintSignatureDomain": "SHARENET/HINT/1",
+    "maxHintHops": 3,
+    "maxHintFreshnessSeconds": 3600,
+    "nonceLengthBytes": 16
+  },
+  "referenceNow": 1786876545,
+  "sharedKeys": {
+    "reporterPublicKeyHex": "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
+    "reporterNodeId": "zzg3j4g7p6tahzjsnw5qf2mqydde7l4apm5gveegjdjelclent4q",
+    "subjectNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+    "note": "Public key only — no secret-key material is committed. The reporter keypair was derived from a fixed 32-byte test seed inside the generator script for byte stability."
+  },
+  "vectors": [
+    {
+      "name": "valid-propagation",
+      "description": "Genuine RemoteNodeHint with hopCount=1 and timestamp=referenceNow. hintToHex produces the canonical CBOR serialization (integer-keyed map per ADR-0004). verifyRemoteNodeHint returns ok.",
+      "input": {
+        "reporterNodeId": "zzg3j4g7p6tahzjsnw5qf2mqydde7l4apm5gveegjdjelclent4q",
+        "subjectNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+        "subjectEndpointHint": "10.0.0.42:7788",
+        "claimedCapabilities": [
+          "MESH_RELAY",
+          "INTERNET_GATEWAY"
+        ],
+        "hopCount": 1,
+        "timestamp": 1786876545,
+        "nonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+      },
+      "intermediate": {
+        "hintHex": "a80178347a7a67336a34673770367461687a6a736e77357166326d7179646465376c3461706d3567766565676a646a656c636c656e74347102783461726e376d786966366d6a74757168336532736f666533326b34766c646c687a793266766370346269746276646970757a6e6761036e31302e302e302e34323a3737383804826a4d4553485f52454c415970494e5445524e45545f474154455741590501061a6a8192810750a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6085840bb03fd9bc025c3efce6667312d5dca4255a47fd31a7407aca289a61a44fb2b9693641698ab81fe8992e313d95261eae6b83755d5b54a0b331be802d8119e110b",
+        "reporterSignatureHex": "bb03fd9bc025c3efce6667312d5dca4255a47fd31a7407aca289a61a44fb2b9693641698ab81fe8992e313d95261eae6b83755d5b54a0b331be802d8119e110b"
+      },
+      "expected": {
+        "verificationResult": "ok",
+        "actualVerificationResult": "ok"
+      }
+    },
+    {
+      "name": "hop-count-exceeds-max",
+      "description": "A hint is created at hopCount=MAX_HINT_HOPS (3, the maximum createRemoteNodeHint accepts) and then mutated post-hoc to hopCount=4 (MAX_HINT_HOPS + 1). The brand is preserved so verifyRemoteNodeHint treats the mutated object as a RemoteNodeHint and runs the verification path. The hopCount check rejects: 'hopCount 4 exceeds max 3'.",
+      "input": {
+        "reporterNodeId": "zzg3j4g7p6tahzjsnw5qf2mqydde7l4apm5gveegjdjelclent4q",
+        "subjectNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+        "subjectEndpointHint": "10.0.0.42:7788",
+        "claimedCapabilities": [
+          "MESH_RELAY",
+          "INTERNET_GATEWAY"
+        ],
+        "hopCount": 4,
+        "timestamp": 1786876545,
+        "nonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "reporterSignatureHex": "7a120b4b51f3efe89750f9c101c3fdaede5609c82691174492abd87dc1d53def984d132b5b8238e3a17b84576bae3a1f26f2db021d5506f40ce5af563aea4c06",
+        "mutation": "hopCount: 3 → 4"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "HOP_COUNT_EXCEEDED",
+        "actualVerificationResult": "fail/hopCount 4 exceeds max 3"
+      }
+    },
+    {
+      "name": "stale-hint",
+      "description": "A genuine hint is created at timestamp=referenceNow, then mutated post-hoc to timestamp=referenceNow - MAX_HINT_FRESHNESS_SECONDS - 60 (3660 seconds in the past). The brand is preserved, so verifyRemoteNodeHint runs the freshness check, which rejects: 'hint outside freshness window'.",
+      "input": {
+        "reporterNodeId": "zzg3j4g7p6tahzjsnw5qf2mqydde7l4apm5gveegjdjelclent4q",
+        "subjectNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+        "subjectEndpointHint": "10.0.0.42:7788",
+        "claimedCapabilities": [
+          "MESH_RELAY",
+          "INTERNET_GATEWAY"
+        ],
+        "hopCount": 1,
+        "timestamp": 1786872885,
+        "nonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "reporterSignatureHex": "bb03fd9bc025c3efce6667312d5dca4255a47fd31a7407aca289a61a44fb2b9693641698ab81fe8992e313d95261eae6b83755d5b54a0b331be802d8119e110b",
+        "mutation": "timestamp: 1786876545 → 1786872885 (= now - 3660)"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "STALE",
+        "actualVerificationResult": "fail/hint outside freshness window"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/topology/remote-node-hint.ts — createRemoteNodeHint, hintToHex, verifyRemoteNodeHint, MAX_HINT_HOPS, MAX_HINT_FRESHNESS_SECONDS.",
+  "notes": "The hop-overflow and stale-timestamp mutations are constructed by spreading a genuine RemoteNodeHint and overriding a single field. The __brand field is preserved so verifyRemoteNodeHint still treats the mutated object as a RemoteNodeHint — this exercises the runtime verification path, not the constructor's input validation. This complements V-HINT-001 (which covers signature tampering and expired-timestamp mutations)."
+}

@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sharenet://spec/protocol-registry",
+  "title": "ShareNet 2.0 Protocol Object Registry (FROZEN)",
+  "description": "Canonical machine-readable registry of ALL normative protocol objects that can cross an implementation boundary. Each object declares its required conformance vector family. The completeness test derives its requirements from this file — adding a new object without a corresponding vector family MUST fail CI.",
+  "version": 1,
+  "layers": {
+    "identity": {
+      "spec_ref": "spec/02-identity.md",
+      "objects": {
+        "NodeId": {
+          "conformance_vector_family": "V-NODEID",
+          "description": "BLAKE3-256 + RFC 4648 base32 NodeId derivation"
+        },
+        "NodeAdvertisement": {
+          "conformance_vector_family": "V-ADV",
+          "description": "Signed node advertisement with capabilities + endpoints"
+        },
+        "VerifiedNodeAdvertisement": {
+          "conformance_vector_family": "V-ADV",
+          "description": "WeakSet-verified advertisement proof artifact"
+        }
+      }
+    },
+    "encoding": {
+      "spec_ref": "spec/04-links.md (ADR-0004)",
+      "objects": {
+        "CanonicalCBOR": {
+          "conformance_vector_family": "V-CBOR",
+          "description": "RFC 8949 §4.2.2 deterministic CBOR encoding"
+        }
+      }
+    },
+    "link": {
+      "spec_ref": "spec/04-links.md",
+      "objects": {
+        "LinkHandshake": {
+          "conformance_vector_family": "V-LINK-HANDSHAKE",
+          "description": "3-message Initiate→Accept→Confirm handshake with possession proofs"
+        },
+        "AuthenticatedLink": {
+          "conformance_vector_family": "V-LINK-AUTH",
+          "description": "Proof-carrying authenticated link artifact (WeakSet-registered)"
+        }
+      }
+    },
+    "topology": {
+      "spec_ref": "spec/06-topology.md",
+      "objects": {
+        "RemoteNodeHint": {
+          "conformance_vector_family": "V-HINT",
+          "description": "Signed discovery hint with hopCount, freshness, nonce"
+        },
+        "HintPropagation": {
+          "conformance_vector_family": "V-TOPOLOGY-PROPAGATION",
+          "description": "Bounded propagation with MAX_HINT_HOPS, freshness decay, replay rejection"
+        }
+      }
+    },
+    "routing": {
+      "spec_ref": "spec/07-routing.md",
+      "objects": {
+        "SignedRouteProposal": {
+          "conformance_vector_family": "V-ROUTE-PROPOSAL",
+          "description": "Canonical signed wire object: { proposal, signature }"
+        },
+        "RouteAcceptance": {
+          "conformance_vector_family": "V-ROUTE-COMMIT",
+          "description": "Per-hop signed acceptance binding proposal/hop/service digests — covered by V-ROUTE-COMMIT-001 which tests the full commitment including acceptance verification"
+        },
+        "RouteCommitment": {
+          "conformance_vector_family": "V-ROUTE-COMMIT",
+          "description": "Merkle commitment root + source signature + commitment nonce"
+        },
+        "PathValidationResult": {
+          "conformance_vector_family": "V-PATH-VALIDATION",
+          "description": "Per-link measurement: RTT, loss, valid_until, source signature"
+        }
+      }
+    },
+    "service": {
+      "spec_ref": "spec/09-internet-gateway.md §4",
+      "objects": {
+        "ServiceAgreement": {
+          "conformance_vector_family": "V-SVC",
+          "description": "Negotiated service terms: capability, bandwidth, expiry, policyVersion"
+        }
+      }
+    },
+    "circuit": {
+      "spec_ref": "spec/08-circuits.md",
+      "objects": {
+        "CircuitId": {
+          "conformance_vector_family": "V-CIRCUIT",
+          "description": "BLAKE3-256(route_id || initiator_x25519_pubkey) + HKDF hop key derivation + nonce layout + replay guard"
+        },
+        "CircuitSetupRequest": {
+          "conformance_vector_family": "V-CIRCUIT-SETUP",
+          "description": "Initiator→Relay setup: route, hopIndex, initiator X25519 pubkey, nonce"
+        },
+        "CircuitSetupAck": {
+          "conformance_vector_family": "V-CIRCUIT-ACK",
+          "description": "Relay→Initiator ack: relay X25519 pubkey, possession proof, freshness bounds"
+        }
+      }
+    },
+    "gateway": {
+      "spec_ref": "spec/09-internet-gateway.md",
+      "objects": {
+        "GatewayPolicy": {
+          "conformance_vector_family": "V-GATEWAY",
+          "description": "Policy evaluation: SSRF/private/loopback/allowlist/quota/rate/bandwidth"
+        },
+        "ServiceMeasurement": {
+          "conformance_vector_family": "V-GATEWAY",
+          "description": "Signed gateway service measurement (bytes sent/received, timestamps, HTTP status)"
+        }
+      }
+    },
+    "economics": {
+      "spec_ref": "spec/11-contribution.md",
+      "objects": {
+        "BilateralReceipt": {
+          "conformance_vector_family": "V-RECEIPT",
+          "description": "Dual-signed receipt: gateway + peer signatures over service session"
+        },
+        "ContributionProof": {
+          "conformance_vector_family": "V-CONTRIBUTION-PROOF",
+          "description": "Derived proof from verified receipt: receiptHash, contributor, bytesForwarded"
+        }
+      }
+    }
+  }
+}

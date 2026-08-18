@@ -1,0 +1,73 @@
+{
+  "id": "V-CIRCUIT-SETUP-001",
+  "status": "draft",
+  "spec": "spec/08-circuits.md §4 (CircuitSetupRequest), spec/00 §24, GATE-06, R-008",
+  "adr": "adr/0017-protocol-freeze-reconciliation.md",
+  "description": "CircuitSetupRequest canonical CBOR encoding (Initiator → Relay). Encoded as an integer-keyed CBOR map: { 1: routeId, 2: hopIndex, 3: initiatorX25519PublicKey, 4: setupNonce }. The signing payload is prefixed by the SHARENET/CIRCUIT/SETUP/1 domain tag. The route MUST be a genuine BrandedCommittedRoute (WeakSet-verified by handleCircuitSetup); only the routeId is encoded — the full route is conveyed out-of-band.",
+  "constants": {
+    "domain": "SHARENET/CIRCUIT/SETUP/1",
+    "bodyEncoding": "canonical CBOR (RFC 8949 §4.2.2), integer-keyed map per ADR-0004",
+    "signingPayload": "utf8(domain) || canonicalEncode(bodyMap)",
+    "bodyMapKeys": {
+      "1": "routeId (text, format 'route:' + lowercase hex)",
+      "2": "hopIndex (uint)",
+      "3": "initiatorX25519PublicKey (bstr .size 32)",
+      "4": "setupNonce (bstr .size 16)"
+    }
+  },
+  "referenceNow": 1786876545,
+  "sharedKeys": {
+    "brandedRouteRouteId": "route:23e1e5428c6596557e9e6e550d1b99aca16effd03d655a0f1753ef169f9c0103",
+    "brandedRouteCommitmentRootHex": "23e1e5428c6596557e9e6e550d1b99aca16effd03d655a0f1753ef169f9c0103",
+    "brandedRouteHopCount": 2,
+    "brandedRouteInitiatorNodeId": "7qnpqxlu7mxcpwzxztggj4hy7osd3igu6ol75r7rz7axkop5lpmq",
+    "brandedRouteExpiry": 1786880145,
+    "initiatorX25519PublicKeyHex": "1b674234d987f29799b2f064b21f7b50ef60d4448840ae740392b286c7d2cb0a",
+    "setupNonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+    "note": "The BrandedCommittedRoute was produced by makeGenuineBrandedRoute (tests/helpers/branded-route-helper) which runs the full proof-carrying pipeline: advertisement verification → 3-message handshake → AuthenticatedLink → ValidatedHop → RouteAcceptance signatures → createRouteCommitment → createBrandedCommittedRoute. The X25519 key and setup nonce are fixed test values for byte-stable encoding."
+  },
+  "vectors": [
+    {
+      "name": "valid-setup-request",
+      "description": "Build a CircuitSetupRequest from a genuine BrandedCommittedRoute, encode via encodeCircuitSetupRequest, capture the canonical CBOR hex. Also compute circuitSetupSigningPayload (domain-prefixed) and capture its hex.",
+      "input": {
+        "routeId": "route:23e1e5428c6596557e9e6e550d1b99aca16effd03d655a0f1753ef169f9c0103",
+        "hopIndex": 0,
+        "initiatorX25519PublicKeyHex": "1b674234d987f29799b2f064b21f7b50ef60d4448840ae740392b286c7d2cb0a",
+        "setupNonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+      },
+      "intermediate": {
+        "encodedHex": "a4017846726f7574653a3233653165353432386336353936353537653965366535353064316239396163613136656666643033643635356130663137353365663136396639633031303302000358201b674234d987f29799b2f064b21f7b50ef60d4448840ae740392b286c7d2cb0a0450a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "signingPayloadHex": "53484152454e45542f434952435549542f53455455502f31a4017846726f7574653a3233653165353432386336353936353537653965366535353064316239396163613136656666643033643635356130663137353365663136396639633031303302000358201b674234d987f29799b2f064b21f7b50ef60d4448840ae740392b286c7d2cb0a0450a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "encodedLengthBytes": 129,
+        "signingPayloadLengthBytes": 153
+      },
+      "expected": {
+        "encodingResult": "ok",
+        "actualEncodingResult": "ok"
+      }
+    },
+    {
+      "name": "tampered-hopindex",
+      "description": "Change hopIndex from 0 to 1. The canonical encoded bytes differ (the CBOR integer in map slot 2 changes), so the encoding is NOT byte-stable across mutations. A relay verifying the setup request against its expected hopIndex MUST reject. The signing payload likewise differs.",
+      "input": {
+        "routeId": "route:23e1e5428c6596557e9e6e550d1b99aca16effd03d655a0f1753ef169f9c0103",
+        "hopIndex": 1,
+        "initiatorX25519PublicKeyHex": "1b674234d987f29799b2f064b21f7b50ef60d4448840ae740392b286c7d2cb0a",
+        "setupNonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "mutation": "hopIndex: 0 → 1"
+      },
+      "intermediate": {
+        "tamperedEncodedHex": "a4017846726f7574653a3233653165353432386336353936353537653965366535353064316239396163613136656666643033643635356130663137353365663136396639633031303302010358201b674234d987f29799b2f064b21f7b50ef60d4448840ae740392b286c7d2cb0a0450a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "originalEncodedHex": "a4017846726f7574653a3233653165353432386336353936353537653965366535353064316239396163613136656666643033643635356130663137353365663136396639633031303302000358201b674234d987f29799b2f064b21f7b50ef60d4448840ae740392b286c7d2cb0a0450a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "bytesDiffer": true
+      },
+      "expected": {
+        "encodingResult": "ok (still valid CBOR, but different bytes)",
+        "actualEncodingResult": "ok/bytes differ"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/circuit/distributed-setup.ts — encodeCircuitSetupRequest, circuitSetupSigningPayload.",
+  "notes": "The BrandedCommittedRoute is NOT serialized inside the CircuitSetupRequest encoding — only its routeId is. The full route is conveyed out-of-band and verified at the relay via isBrandedCommittedRoute (WeakSet). This prevents a forged route object from being substituted at the wire layer. To re-encode at the verifier side, construct a CircuitSetupRequest with a minimal stand-in for route that has only the routeId field (encodeCircuitSetupRequest reads req.route.routeId only)."
+}

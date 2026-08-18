@@ -1,0 +1,116 @@
+{
+  "id": "V-ROUTE-PROPOSAL-001",
+  "status": "draft",
+  "spec": "spec/07-routing.md §5.1 (FROZEN wire object SignedRouteProposal)",
+  "adr": "adr/0017-protocol-freeze-reconciliation.md",
+  "description": "SignedRouteProposal wire object: { proposal, signature }. The signature is over the canonical CBOR map of the RouteProposal fields (integer keys per ADR-0004), prefixed by the SHARENET/ROUTE/PROPOSAL/1 domain tag. The proposal MUST NOT carry a routeId — the only route identity is the commitment_root derived later. Mutating ANY semantically-significant proposal field invalidates the signature.",
+  "constants": {
+    "domain": "SHARENET/ROUTE/PROPOSAL/1",
+    "bodyEncoding": "canonical CBOR (RFC 8949 §4.2.2), integer-keyed map per ADR-0004",
+    "signingPayload": "utf8(domain) || canonicalEncode(proposal_fields)",
+    "bodyMapKeys": {
+      "1": "hops[].nodeId (array of text)",
+      "2": "requirementDigest (text)",
+      "3": "expiry (uint)",
+      "4": "initiatorNodeId (text)",
+      "5": "agreementDigest (text)"
+    },
+    "signatureAlgorithm": "Ed25519 (RFC 8032), 64-byte signature",
+    "signatureSizeBytes": 64
+  },
+  "referenceNow": 1786876545,
+  "sharedKeys": {
+    "initiatorPublicKeyHex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "initiatorNodeId": "x357ma3xyrp7zbut665hue65qr2r34eltk2vfbd4lvolm74emrqa",
+    "note": "Public key only — no secret-key material is committed. The initiator keypair was derived from a fixed 32-byte test seed inside the generator script for byte stability."
+  },
+  "vectors": [
+    {
+      "name": "valid-signed-proposal",
+      "description": "Genuine RouteProposal (no routeId) signed by the initiator. verifySignature(initiatorPublicKey, routeProposalSigningPayload(proposal), signature) returns true.",
+      "input": {
+        "proposal": {
+          "hops": [
+            {
+              "nodeId": "x357ma3xyrp7zbut665hue65qr2r34eltk2vfbd4lvolm74emrqa",
+              "capability": "MESH_RELAY",
+              "endpoint": "10.0.0.1:7788",
+              "linkUp": true
+            }
+          ],
+          "requirementDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "expiry": 1786880145,
+          "initiatorNodeId": "x357ma3xyrp7zbut665hue65qr2r34eltk2vfbd4lvolm74emrqa",
+          "agreementDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "intermediate": {
+        "signingPayloadHex": "53484152454e45542f524f5554452f50524f504f53414c2f31a501817834783335376d613378797270377a6275743636356875653635717232723334656c746b3276666264346c766f6c6d3734656d72716102784062626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262031a6a81a091047834783335376d613378797270377a6275743636356875653635717232723334656c746b3276666264346c766f6c6d3734656d72716105784063636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363",
+        "signatureHex": "1d28d00e609bba157b25dc098e4f6d570a11738be31f6c67a16e1c0b1c4c915d0f26b518cc7c69c70e55c03266cb413b9259ce11d4e23c53bc083cbd995b2804"
+      },
+      "expected": {
+        "verificationResult": "ok",
+        "actualVerificationResult": "ok"
+      }
+    },
+    {
+      "name": "tampered-signature",
+      "description": "One byte of the signature is flipped (signature[0] ^= 0xff). The proposal payload is unchanged, but the signature no longer matches the canonical payload. verifySignature returns false.",
+      "input": {
+        "proposal": {
+          "hops": [
+            {
+              "nodeId": "x357ma3xyrp7zbut665hue65qr2r34eltk2vfbd4lvolm74emrqa",
+              "capability": "MESH_RELAY",
+              "endpoint": "10.0.0.1:7788",
+              "linkUp": true
+            }
+          ],
+          "requirementDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "expiry": 1786880145,
+          "initiatorNodeId": "x357ma3xyrp7zbut665hue65qr2r34eltk2vfbd4lvolm74emrqa",
+          "agreementDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "tamperedSignatureHex": "e228d00e609bba157b25dc098e4f6d570a11738be31f6c67a16e1c0b1c4c915d0f26b518cc7c69c70e55c03266cb413b9259ce11d4e23c53bc083cbd995b2804",
+        "mutation": "signature[0] ^= 0xff"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "SIGNATURE_INVALID",
+        "actualVerificationResult": "fail/signature invalid"
+      }
+    },
+    {
+      "name": "tampered-proposal",
+      "description": "The requirementDigest field of the proposal is changed (bbbb... → dddd...). The signing payload is recomputed for the mutated proposal, and the ORIGINAL signature is verified against it. The signature no longer matches because the canonical payload differs.",
+      "input": {
+        "proposal": {
+          "hops": [
+            {
+              "nodeId": "x357ma3xyrp7zbut665hue65qr2r34eltk2vfbd4lvolm74emrqa",
+              "capability": "MESH_RELAY",
+              "endpoint": "10.0.0.1:7788",
+              "linkUp": true
+            }
+          ],
+          "requirementDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "expiry": 1786880145,
+          "initiatorNodeId": "x357ma3xyrp7zbut665hue65qr2r34eltk2vfbd4lvolm74emrqa",
+          "agreementDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "originalSignatureHex": "1d28d00e609bba157b25dc098e4f6d570a11738be31f6c67a16e1c0b1c4c915d0f26b518cc7c69c70e55c03266cb413b9259ce11d4e23c53bc083cbd995b2804",
+        "mutation": "requirementDigest: bbbb... → dddd..."
+      },
+      "intermediate": {
+        "tamperedSigningPayloadHex": "53484152454e45542f524f5554452f50524f504f53414c2f31a501817834783335376d613378797270377a6275743636356875653635717232723334656c746b3276666264346c766f6c6d3734656d72716102784064646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464031a6a81a091047834783335376d613378797270377a6275743636356875653635717232723334656c746b3276666264346c766f6c6d3734656d72716105784063636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "SIGNATURE_INVALID",
+        "actualVerificationResult": "fail/signature invalid"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/routing/route.ts — createRouteProposal, routeProposalSigningPayload, verifySignature (reference/identity/keys.ts).",
+  "notes": "Per spec/07 §5.1: the signature is over the canonical proposal payload only — never over a caller-chosen routeId. Mutating any field of the proposal (hops[].nodeId, requirementDigest, expiry, initiatorNodeId, agreementDigest) invalidates the signature."
+}

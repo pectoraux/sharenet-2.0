@@ -1,0 +1,80 @@
+{
+  "id": "V-CONTRIBUTION-PROOF-001",
+  "status": "draft",
+  "spec": "spec/11-contribution.md, GATE-11, spec/00 §2 (Economics), spec/00 §31 (forbidden self-report)",
+  "description": "ContributionProof derivation: a ContributionProof is created ONLY from a verified bilateral receipt. The proof captures: receiptHash (BLAKE3-256 of the receipt signing payload), bytesForwarded (sent + received), durationSeconds (sessionEnd - sessionStart), contributorNodeId (= gatewayNodeId). A tampered gateway signature causes createContributionProof to fail — the receipt no longer verifies, and self-reported traffic creates NO proof (and hence NO credit).",
+  "constants": {
+    "receiptDomain": "SHARENET/CONTRIBUTION/RECEIPT/1",
+    "contributionProofDomain": "SHARENET/CONTRIBUTION/PROOF/1",
+    "receiptHashAlgorithm": "BLAKE3-256 over receiptSigningPayload(body)",
+    "serviceType": "INTERNET_GATEWAY"
+  },
+  "referenceNow": 1786876545,
+  "sharedKeys": {
+    "gatewayPublicKeyHex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+    "gatewayNodeId": "bqfbvcl7yjyuv4bbym7z2ywkrj35x4mjjolzt2snt3mqrpklyuba",
+    "peerPublicKeyHex": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+    "peerNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+    "note": "Public keys only — no secret-key material is committed. Keypairs were derived from fixed 32-byte test seeds inside the generator script for byte stability."
+  },
+  "vectors": [
+    {
+      "name": "valid-proof",
+      "description": "Create a BilateralReceipt via createBilateralReceipt (gateway signs first, then peer). verifyBilateralReceipt returns ok. Call createContributionProof — it re-verifies the receipt, computes the receiptHash, and emits a ContributionProof. Capture: receiptHash hex, bytesForwarded, durationSeconds, contributorNodeId.",
+      "input": {
+        "receiptId": "d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718",
+        "gatewayNodeId": "bqfbvcl7yjyuv4bbym7z2ywkrj35x4mjjolzt2snt3mqrpklyuba",
+        "peerNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+        "destination": "example.com:443",
+        "bytesSent": 4096,
+        "bytesReceived": 16384,
+        "sessionStart": 1786876485,
+        "sessionEnd": 1786876545,
+        "httpStatus": 200
+      },
+      "intermediate": {
+        "receiptSigningPayloadHex": "53484152454e45542f434f4e545249425554494f4e2f524543454950542f31a9017840643163326233613466356536303731386431633262336134663565363037313864316332623361346635653630373138643163326233613466356536303731380278346271666276636c37796a797576346262796d377a3279776b726a333578346d6a6a6f6c7a7432736e74336d7172706b6c7975626103783461726e376d786966366d6a74757168336532736f666533326b34766c646c687a793266766370346269746276646970757a6e6761046f6578616d706c652e636f6d3a3434330519100006194000071a6a819245081a6a8192810918c8",
+        "gatewaySignatureHex": "b15c235f055fdce1ed9c91956882d3deec13175769f2387ad52a56bee3cfed54e9b89fb82665927b99c42e3ef139a729916208ba27802b45a040350afa62bd07",
+        "peerSignatureHex": "caed23d3bab214246a31f95a2ca37d1d10595e45bd60bd837ebdabf4c34807840730c8df970df836631f8385829ef7eacc1c94ce446e7e367d18fda43cfe9c0c"
+      },
+      "expected": {
+        "createResult": "ok",
+        "receiptHashHex": "91b237f2a0a9ea5b5130c3bb6936112f359c1bb6b086f9f93619527ce7d766c6",
+        "bytesForwarded": 20480,
+        "durationSeconds": 60,
+        "contributorNodeId": "bqfbvcl7yjyuv4bbym7z2ywkrj35x4mjjolzt2snt3mqrpklyuba",
+        "serviceType": "INTERNET_GATEWAY",
+        "peerNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+        "receiptId": "d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718",
+        "createdAt": 1786876545,
+        "actualCreateResult": "ok"
+      }
+    },
+    {
+      "name": "invalid-receipt",
+      "description": "Tamper the gatewaySignature of a genuine receipt. createContributionProof first calls verifyBilateralReceipt — verification now fails ('gateway signature invalid'). Per spec/11: a tampered bilateral receipt is a UNILATERAL claim at best, and creates NO proof. No ContributionProof is emitted.",
+      "input": {
+        "receiptId": "d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718",
+        "gatewayNodeId": "bqfbvcl7yjyuv4bbym7z2ywkrj35x4mjjolzt2snt3mqrpklyuba",
+        "peerNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+        "destination": "example.com:443",
+        "bytesSent": 4096,
+        "bytesReceived": 16384,
+        "sessionStart": 1786876485,
+        "sessionEnd": 1786876545,
+        "httpStatus": 200,
+        "tamperedGatewaySignatureHex": "4e5c235f055fdce1ed9c91956882d3deec13175769f2387ad52a56bee3cfed54e9b89fb82665927b99c42e3ef139a729916208ba27802b45a040350afa62bd07",
+        "peerSignatureHex": "caed23d3bab214246a31f95a2ca37d1d10595e45bd60bd837ebdabf4c34807840730c8df970df836631f8385829ef7eacc1c94ce446e7e367d18fda43cfe9c0c",
+        "mutation": "gatewaySignature[0] ^= 0xff"
+      },
+      "expected": {
+        "createResult": "fail",
+        "errorCode": "RECEIPT_VERIFICATION_FAILED",
+        "failReason": "receipt verification failed: gateway signature invalid",
+        "actualCreateResult": "fail/receipt verification failed: gateway signature invalid"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/economics/contribution.ts — createBilateralReceipt, verifyBilateralReceipt, createContributionProof, receiptSigningPayload.",
+  "notes": "Per spec/00 §31 and spec/11: self-reported contribution → Civic Points is FORBIDDEN. A ContributionProof is created ONLY from a verified bilateral receipt (both gateway and peer signatures). Tampering either signature breaks the bilateral property and no proof is emitted. The receiptHash is BLAKE3-256 of the receiptSigningPayload (the domain-prefixed canonical CBOR of the receipt body), providing ledger deduplication."
+}

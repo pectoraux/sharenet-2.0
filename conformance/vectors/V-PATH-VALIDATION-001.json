@@ -1,0 +1,60 @@
+{
+  "id": "V-PATH-VALIDATION-001",
+  "status": "spec-only",
+  "spec": "spec/07-routing.md §4 (Path Validation)",
+  "description": "PathValidationResult — per-link measurement: source_id, next_hop_id, destination_id, measured_rtt_ms, measured_loss_pct, valid_until, and the source's Ed25519 signature over the canonical encoding of the other fields. The spec defines the wire object fields, but there is NO TypeScript implementation yet. This vector is a SPEC-ONLY freeze of the canonical encoding so that any future TS/Rust/Go implementation produces byte-identical output.",
+  "statusNote": "spec-only — no TS implementation exists in reference/ at the time of authoring. This vector FREEZES the expected canonical encoding. A future TS implementation MUST be byte-compatible with the hex values below. The encoding is proposed: domain SHARENET/PATH/VALIDATION/1, integer-keyed CBOR map per ADR-0004 (consistent with all other routing/economics objects).",
+  "constants": {
+    "domain": "SHARENET/PATH/VALIDATION/1",
+    "bodyEncoding": "canonical CBOR (RFC 8949 §4.2.2), integer-keyed map per ADR-0004",
+    "signingPayload": "utf8(domain) || canonicalEncode(bodyMap keys 1-6)",
+    "bodyMapKeys": {
+      "1": "source_id (text, NodeId of the source)",
+      "2": "next_hop_id (text, NodeId of the next hop)",
+      "3": "destination_id (text, NodeId of the destination)",
+      "4": "measured_rtt_ms (uint, measured round-trip time in milliseconds)",
+      "5": "measured_loss_pct (uint, measured packet loss as a percentage 0-100)",
+      "6": "valid_until (uint, unix seconds — when this measurement expires)",
+      "7": "signature (bstr .size 64, Ed25519 by source over the canonical encoding of keys 1-6)"
+    },
+    "signatureAlgorithm": "Ed25519 (RFC 8032), 64-byte signature",
+    "signatureSizeBytes": 64,
+    "note": "Field names use snake_case (source_id, next_hop_id, destination_id, measured_rtt_ms, measured_loss_pct, valid_until) per spec/07 §4 wire-object declaration, mirroring the spec's prose. The integer keys (1-7) follow ADR-0004."
+  },
+  "referenceNow": 1786876545,
+  "sharedKeys": {
+    "sourcePublicKeyHex": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "sourceNodeId": "gktqf2kotnwfnrepystvknfyyqpmcb43nso7hqbbazj7penhgrdq",
+    "nextHopNodeId": "bqfbvcl7yjyuv4bbym7z2ywkrj35x4mjjolzt2snt3mqrpklyuba",
+    "destinationNodeId": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+    "note": "Public key only — no secret-key material is committed. The source keypair was derived from a fixed 32-byte test seed inside the generator script for byte stability."
+  },
+  "vectors": [
+    {
+      "name": "valid-path-validation",
+      "description": "A source node measures RTT=42ms and loss=1% on the link to a next-hop toward the destination. The source signs the canonical encoding of the measurement (fields 1-6). The full PathValidationResult wire object (including the signature as field 7) is captured as hex.",
+      "input": {
+        "source_id": "gktqf2kotnwfnrepystvknfyyqpmcb43nso7hqbbazj7penhgrdq",
+        "next_hop_id": "bqfbvcl7yjyuv4bbym7z2ywkrj35x4mjjolzt2snt3mqrpklyuba",
+        "destination_id": "arn7mxif6mjtuqh3e2sofe32k4vldlhzy2fvcp4bitbvdipuznga",
+        "measured_rtt_ms": 42,
+        "measured_loss_pct": 1,
+        "valid_until": 1786877145
+      },
+      "intermediate": {
+        "bodyHex": "a6017834676b747166326b6f746e77666e726570797374766b6e66797971706d636234336e736f3768716262617a6a3770656e68677264710278346271666276636c37796a797576346262796d377a3279776b726a333578346d6a6a6f6c7a7432736e74336d7172706b6c7975626103783461726e376d786966366d6a74757168336532736f666533326b34766c646c687a793266766370346269746276646970757a6e676104182a0501061a6a8194d9",
+        "signingPayloadHex": "53484152454e45542f504154482f56414c49444154494f4e2f31a6017834676b747166326b6f746e77666e726570797374766b6e66797971706d636234336e736f3768716262617a6a3770656e68677264710278346271666276636c37796a797576346262796d377a3279776b726a333578346d6a6a6f6c7a7432736e74336d7172706b6c7975626103783461726e376d786966366d6a74757168336532736f666533326b34766c646c687a793266766370346269746276646970757a6e676104182a0501061a6a8194d9",
+        "signatureHex": "38cf39a4709e64cfb0551e0776e33ce5d97c25abd406e8c028767708949b478dcd9e61f3bd31c6c30bef13ba657461dc896c145213e46246c23310764f0e4c00",
+        "signatureLengthBytes": 64
+      },
+      "expected": {
+        "verificationResult": "ok",
+        "wireHex": "a7017834676b747166326b6f746e77666e726570797374766b6e66797971706d636234336e736f3768716262617a6a3770656e68677264710278346271666276636c37796a797576346262796d377a3279776b726a333578346d6a6a6f6c7a7432736e74336d7172706b6c7975626103783461726e376d786966366d6a74757168336532736f666533326b34766c646c687a793266766370346269746276646970757a6e676104182a0501061a6a8194d907584038cf39a4709e64cfb0551e0776e33ce5d97c25abd406e8c028767708949b478dcd9e61f3bd31c6c30bef13ba657461dc896c145213e46246c23310764f0e4c00",
+        "wireLengthBytes": 244,
+        "actualVerificationResult": "ok"
+      }
+    }
+  ],
+  "verification": "No TS implementation exists in reference/. The signature was computed using signMessage from reference/identity/keys.ts (Ed25519) over the canonical encoding of fields 1-6, prefixed by the proposed domain tag SHARENET/PATH/VALIDATION/1. The wire hex is canonicalEncode(integer-keyed map of fields 1-7).",
+  "notes": "This vector is SPEC-ONLY: it freezes the expected canonical encoding so that future TS/Rust/Go implementations are byte-compatible. The domain tag is NOT yet registered in spec/14-security.md §4 (the protocol-registry.json declares the vector family, but the domain-tag registry entry will need to be added when the TS implementation lands). Per spec/07 §4: Path Validation is per-link, not end-to-end — the source accumulates PathValidationResults for each hop in the candidate path. The result is signed by the SOURCE (not the next-hop), as it is the source's measurement."
+}

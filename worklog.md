@@ -1072,3 +1072,36 @@ Stage Summary:
 - **Secrets hygiene**: All four user-provided secrets (Neon password, GitHub PAT, Vercel token, bootstrap admin password) were used ONLY as runtime environment variables. None appear in any committed file. `.env` (gitignored) contains the Neon connection strings for local dev only. The Vercel project holds the encrypted production copies.
 - **ROTATION REMINDER**: User confirmed they will rotate the PAT and Vercel token. Also recommend rotating: the Neon database password (was pasted in chat during the original 2026-08-16 attempt), the bootstrap admin password (set to a placeholder on Vercel; user should set their own), and the demo account passwords (random per-boot, already safe).
 - **This is the FIRST real, pushed, verified Neon PostgreSQL cutover for ShareNet 2.0.** The false 2026-08-16 claim is now superseded by real evidence.
+
+---
+Task ID: R-007-registry-driven-completeness
+Agent: main (Z.ai Code)
+Task: R-007 final hardening — create canonical protocol-schema registry, add 6 missing vector families, replace hard-coded completeness test with registry-driven guard.
+
+Work Log:
+- Created `spec/schemas/protocol-registry.json` — the canonical machine-readable protocol-schema registry covering ALL normative cross-boundary objects across 9 protocol layers (identity, encoding, link, topology, routing, service, circuit, gateway, economics). Each object declares its `conformance_vector_family` prefix. This is the single source of truth from which the completeness test derives its requirements.
+
+- Generated 6 new vector families with real computed values:
+  - V-ROUTE-PROPOSAL-001: SignedRouteProposal (valid signature + tampered sig + tampered proposal)
+  - V-CIRCUIT-SETUP-001: CircuitSetupRequest encoding (valid + tampered hopIndex)
+  - V-CIRCUIT-ACK-001: CircuitSetupAck signing payload (valid + tampered routeId)
+  - V-CONTRIBUTION-PROOF-001: ContributionProof derivation (valid + invalid receipt)
+  - V-PATH-VALIDATION-001: PathValidationResult (spec-only canonical encoding — no TS impl yet, but the vector freezes the expected wire format)
+  - V-TOPOLOGY-PROPAGATION-001: Hint propagation (valid hint hex + hop overflow + stale freshness)
+
+- Added TS + Python runner handlers for all 6 new families — both runners independently verify the same frozen artifacts.
+
+- Replaced the hard-coded `REQUIRED_VECTOR_FAMILIES` list in `tests/r007-completeness.test.ts` with a registry-driven guard that:
+  - Reads `spec/schemas/protocol-registry.json`
+  - Derives the required vector-family prefixes from the registry's `conformance_vector_family` declarations
+  - Verifies the MANIFEST contains at least one entry matching each prefix
+  - Fails automatically if a new protocol object is added to the registry without a corresponding vector family
+
+Stage Summary:
+- Tests: 324 → 326 pass, 0 fail (+2 from expanded completeness test). 988 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 31/31 vectors pass (was 25/25).
+- Python conformance runner: 31/31 vectors pass (was 25/25).
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The conformance system is now self-enforcing: adding a new normative protocol object to the registry without a corresponding conformance vector family MUST fail CI automatically.

@@ -15,6 +15,7 @@ import {
   deriveNodeId,
   verifyNodeIdBinding,
   isValidNodeIdFormat,
+  verifySignature,
   hexToBytes,
   bytesToHex,
 } from "@reference/identity/keys";
@@ -40,6 +41,7 @@ import {
 import {
   computeCommitmentRoot,
   deriveRouteId,
+  routeProposalSigningPayload,
   type RouteProposal,
   type RouteAcceptance,
   type RouteHop,
@@ -63,6 +65,12 @@ import {
   CircuitReplayGuard,
 } from "@reference/circuit/circuit";
 import {
+  encodeCircuitSetupRequest,
+  circuitSetupSigningPayload,
+  circuitAckSigningPayload,
+  type CircuitSetupRequest,
+} from "@reference/circuit/distributed-setup";
+import {
   evaluateGatewayRequest,
   defaultGatewayPolicy,
   defaultGatewayCapacity,
@@ -73,6 +81,8 @@ import {
 import {
   createBilateralReceipt,
   verifyBilateralReceipt,
+  createContributionProof,
+  receiptSigningPayload,
   type BilateralReceipt,
 } from "@reference/economics/contribution";
 
@@ -704,6 +714,555 @@ function verifyReceiptVector(data: any): VectorResult {
   };
 }
 
+// ---------------------------------------------------------------------------
+// V-ROUTE-PROPOSAL-001 — SignedRouteProposal signature verification.
+// The proposal signature is over canonicalEncode({1:hops[].nodeId, 2:requirementDigest,
+// 3:expiry, 4:initiatorNodeId, 5:agreementDigest}) prefixed by SHARENET/ROUTE/PROPOSAL/1.
+// Mutating ANY semantically-significant field invalidates the signature.
+// ---------------------------------------------------------------------------
+
+function verifyRouteProposalVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const initiatorPublicKey = hexToBytes(data.sharedKeys.initiatorPublicKeyHex);
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const proposal: RouteProposal = {
+        hops: v.input.proposal.hops.map((h: any) => ({
+          nodeId: h.nodeId,
+          capability: h.capability,
+          endpoint: h.endpoint,
+          linkUp: h.linkUp,
+        })),
+        requirementDigest: v.input.proposal.requirementDigest,
+        expiry: v.input.proposal.expiry,
+        initiatorNodeId: v.input.proposal.initiatorNodeId,
+        agreementDigest: v.input.proposal.agreementDigest,
+      };
+      const payload = routeProposalSigningPayload(proposal);
+      const payloadHex = toHex(payload);
+
+      // Sanity: compare the recomputed signing payload to the vector's
+      // intermediate (when provided — the tampered-signature case carries
+      // the same payload as the valid case, but the tampered-proposal case
+      // carries a `tamperedSigningPayloadHex`).
+      const expectedPayloadHex =
+        v.intermediate?.signingPayloadHex ??
+        v.intermediate?.tamperedSigningPayloadHex;
+      if (expectedPayloadHex && payloadHex !== expectedPayloadHex) {
+        allOk = false;
+        failures.push(
+          `${v.name}: signingPayload ${payloadHex} != ${expectedPayloadHex}`,
+        );
+        continue;
+      }
+
+      // The signature under test. For valid + tampered-proposal: use the
+      // original signature (intermediate.signatureHex or input.originalSignatureHex).
+      // For tampered-signature: use the tampered signature (input.tamperedSignatureHex).
+      const signatureHex =
+        v.input.tamperedSignatureHex ??
+        v.input.originalSignatureHex ??
+        v.intermediate?.signatureHex;
+      if (!signatureHex) {
+        throw new Error("no signature found in vector input");
+      }
+      const signature = hexToBytes(signatureHex);
+
+      const valid = verifySignature(initiatorPublicKey, payload, signature);
+      const expected = v.expected;
+      let caseOk: boolean;
+      if (expected.verificationResult === "ok") {
+        caseOk = valid === true;
+      } else {
+        caseOk = valid === false;
+      }
+      if (!caseOk) {
+        allOk = false;
+        failures.push(
+          `${v.name}: expected ${expected.verificationResult}, got valid=${valid}`,
+        );
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} route-proposal cases match`,
+    actual: allOk ? `${vectors.length} route-proposal cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// V-CIRCUIT-SETUP-001 — CircuitSetupRequest canonical encoding.
+// Encoded as CBOR map {1: routeId, 2: hopIndex, 3: initiatorX25519PublicKey,
+// 4: setupNonce}. Signing payload = utf8(domain) || encoded body.
+// Only the routeId is read from req.route (the full BrandedCommittedRoute is
+// conveyed out-of-band), so we construct a minimal stand-in for re-encoding.
+// ---------------------------------------------------------------------------
+
+function verifyCircuitSetupVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const input = v.input;
+      // Construct a minimal CircuitSetupRequest stand-in. encodeCircuitSetupRequest
+      // only reads req.route.routeId, so a { routeId } stub suffices.
+      const req: CircuitSetupRequest = {
+        route: { routeId: input.routeId } as any,
+        hopIndex: input.hopIndex,
+        initiatorX25519PublicKey: hexToBytes(input.initiatorX25519PublicKeyHex),
+        setupNonce: hexToBytes(input.setupNonceHex),
+      };
+      const encoded = encodeCircuitSetupRequest(req);
+      const encodedHex = toHex(encoded);
+      const signingPayload = circuitSetupSigningPayload(req);
+      const signingPayloadHex = toHex(signingPayload);
+
+      // The vector provides either encodedHex + signingPayloadHex (valid case)
+      // or tamperedEncodedHex + originalEncodedHex (mutation case). Both must
+      // match our recomputed values byte-for-byte.
+      const expectedEncodedHex =
+        v.intermediate?.encodedHex ?? v.intermediate?.tamperedEncodedHex;
+      const expectedSigningPayloadHex =
+        v.intermediate?.signingPayloadHex ??
+        v.intermediate?.tamperedSigningPayloadHex;
+
+      let caseOk = true;
+      if (expectedEncodedHex && encodedHex !== expectedEncodedHex) {
+        caseOk = false;
+        failures.push(
+          `${v.name}: encoded ${encodedHex} != ${expectedEncodedHex}`,
+        );
+      }
+      if (
+        expectedSigningPayloadHex &&
+        signingPayloadHex !== expectedSigningPayloadHex
+      ) {
+        caseOk = false;
+        failures.push(
+          `${v.name}: signingPayload ${signingPayloadHex} != ${expectedSigningPayloadHex}`,
+        );
+      }
+      // For tampered-hopindex: verify the bytes differ from originalEncodedHex.
+      if (v.intermediate?.originalEncodedHex) {
+        if (encodedHex === v.intermediate.originalEncodedHex) {
+          caseOk = false;
+          failures.push(
+            `${v.name}: tampered encoding matches original (bytes did not differ)`,
+          );
+        }
+      }
+      if (!caseOk) {
+        allOk = false;
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} circuit-setup cases match`,
+    actual: allOk ? `${vectors.length} circuit-setup cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// V-CIRCUIT-ACK-001 — CircuitSetupAck signing payload.
+// Payload = utf8(SHARENET/CIRCUIT/ACK/1) || canonicalEncode({
+//   1: routeId, 2: routeCommitmentDigestHex, 3: hopIndex,
+//   4: relayX25519PublicKey, 5: initiatorX25519PublicKey,
+//   6: ackNonce, 7: ackTimestamp, 8: ackExpiry
+// }).
+// ---------------------------------------------------------------------------
+
+function verifyCircuitAckVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const input = v.input;
+      const payload = circuitAckSigningPayload(
+        input.routeId,
+        input.routeCommitmentDigestHex,
+        input.hopIndex,
+        hexToBytes(input.relayX25519PublicKeyHex),
+        hexToBytes(input.initiatorX25519PublicKeyHex),
+        hexToBytes(input.ackNonceHex),
+        input.ackTimestamp,
+        input.ackExpiry,
+      );
+      const payloadHex = toHex(payload);
+
+      // The vector carries either signingPayloadHex (valid case) or
+      // tamperedSigningPayloadHex + originalSigningPayloadHex (mutation case).
+      const expectedHex =
+        v.intermediate?.signingPayloadHex ??
+        v.intermediate?.tamperedSigningPayloadHex;
+      let caseOk = true;
+      if (expectedHex && payloadHex !== expectedHex) {
+        caseOk = false;
+        failures.push(`${v.name}: payload ${payloadHex} != ${expectedHex}`);
+      }
+      // For tampered-routeId: the recomputed (tampered) payload MUST differ
+      // from the originalSigningPayloadHex — this is the route-substitution
+      // defense.
+      if (v.intermediate?.originalSigningPayloadHex) {
+        if (payloadHex === v.intermediate.originalSigningPayloadHex) {
+          caseOk = false;
+          failures.push(
+            `${v.name}: tampered payload matches original (bytes did not differ)`,
+          );
+        }
+      }
+      if (!caseOk) {
+        allOk = false;
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} circuit-ack cases match`,
+    actual: allOk ? `${vectors.length} circuit-ack cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// V-CONTRIBUTION-PROOF-001 — ContributionProof derivation.
+// A ContributionProof is created ONLY from a verified bilateral receipt.
+// We reconstruct the receipt from input + intermediate signatures, then
+// call createContributionProof and verify the receiptHash + fields.
+// For the invalid-receipt case, the tampered gateway signature causes
+// verifyBilateralReceipt (called internally by createContributionProof)
+// to fail with "receipt verification failed: gateway signature invalid".
+// ---------------------------------------------------------------------------
+
+function verifyContributionProofVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const gatewayPublicKey = hexToBytes(data.sharedKeys.gatewayPublicKeyHex);
+  const peerPublicKey = hexToBytes(data.sharedKeys.peerPublicKeyHex);
+  const now: number = data.referenceNow;
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const input = v.input;
+      // Signatures may live under `input` (tampered case) or `intermediate`
+      // (valid case). The tampered case overrides the gateway signature only.
+      const intermediate = v.intermediate ?? {};
+      const gatewaySigHex =
+        input.tamperedGatewaySignatureHex ??
+        input.gatewaySignatureHex ??
+        intermediate.gatewaySignatureHex;
+      const peerSigHex =
+        input.peerSignatureHex ?? intermediate.peerSignatureHex;
+      if (!gatewaySigHex || !peerSigHex) {
+        throw new Error("missing gateway/peer signature");
+      }
+      const receipt: BilateralReceipt = {
+        receiptId: input.receiptId,
+        gatewayNodeId: input.gatewayNodeId,
+        peerNodeId: input.peerNodeId,
+        destination: input.destination,
+        bytesSent: input.bytesSent,
+        bytesReceived: input.bytesReceived,
+        sessionStart: input.sessionStart,
+        sessionEnd: input.sessionEnd,
+        httpStatus: input.httpStatus,
+        gatewaySignature: hexToBytes(gatewaySigHex),
+        peerSignature: hexToBytes(peerSigHex),
+      };
+
+      // Sanity: the recomputed receiptSigningPayload must match the
+      // intermediate.receiptSigningPayloadHex (when present).
+      if (intermediate.receiptSigningPayloadHex) {
+        const payload = receiptSigningPayload(receipt);
+        const payloadHex = toHex(payload);
+        if (payloadHex !== intermediate.receiptSigningPayloadHex) {
+          allOk = false;
+          failures.push(
+            `${v.name}: receiptSigningPayload ${payloadHex} != ${intermediate.receiptSigningPayloadHex}`,
+          );
+          continue;
+        }
+      }
+
+      const result = createContributionProof(
+        receipt,
+        gatewayPublicKey,
+        peerPublicKey,
+        now,
+      );
+      const expected = v.expected;
+      let caseOk: boolean;
+      if (expected.createResult === "ok") {
+        if (!result.ok) {
+          caseOk = false;
+          failures.push(
+            `${v.name}: expected ok, got fail: ${result.reason}`,
+          );
+        } else {
+          const proof = result.proof;
+          // Verify every field against the expected object.
+          caseOk =
+            proof.receiptHash === expected.receiptHashHex &&
+            proof.bytesForwarded === expected.bytesForwarded &&
+            proof.durationSeconds === expected.durationSeconds &&
+            proof.contributorNodeId === expected.contributorNodeId &&
+            proof.serviceType === expected.serviceType &&
+            proof.peerNodeId === expected.peerNodeId &&
+            proof.receiptId === expected.receiptId &&
+            proof.createdAt === expected.createdAt;
+          if (!caseOk) {
+            failures.push(
+              `${v.name}: proof fields mismatch — got receiptHash=${proof.receiptHash} bytesForwarded=${proof.bytesForwarded} durationSeconds=${proof.durationSeconds} contributorNodeId=${proof.contributorNodeId} createdAt=${proof.createdAt}`,
+            );
+          }
+        }
+      } else {
+        // Expected fail. createContributionProof returns
+        //   { ok: false, reason: "receipt verification failed: <innerReason>" }
+        // The vector's failReason is the full reason string.
+        if (result.ok) {
+          caseOk = false;
+          failures.push(
+            `${v.name}: expected fail/${expected.errorCode}, got ok`,
+          );
+        } else {
+          caseOk = result.reason === expected.failReason;
+          if (!caseOk) {
+            failures.push(
+              `${v.name}: expected reason "${expected.failReason}", got "${result.reason}"`,
+            );
+          }
+        }
+      }
+      if (!caseOk) {
+        allOk = false;
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} contribution-proof cases match`,
+    actual: allOk ? `${vectors.length} contribution-proof cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// V-PATH-VALIDATION-001 — PathValidationResult canonical encoding (spec-only).
+// No TS implementation exists in reference/. This vector FREEZES the expected
+// canonical encoding. Body = canonicalEncode({
+//   1: source_id, 2: next_hop_id, 3: destination_id,
+//   4: measured_rtt_ms, 5: measured_loss_pct, 6: valid_until
+// }). Signing payload = utf8(SHARENET/PATH/VALIDATION/1) || body.
+// Wire object = canonicalEncode({1..6, 7: signature(bstr .size 64)}).
+// We verify: (a) recomputed bodyHex matches, (b) recomputed signingPayloadHex
+// matches, (c) the Ed25519 signature verifies under the source public key,
+// (d) the recomputed wireHex matches.
+// ---------------------------------------------------------------------------
+
+const PATH_VALIDATION_DOMAIN = "SHARENET/PATH/VALIDATION/1";
+
+function verifyPathValidationVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const sourcePublicKey = hexToBytes(data.sharedKeys.sourcePublicKeyHex);
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const input = v.input;
+      const intermediate = v.intermediate ?? {};
+      const expected = v.expected;
+
+      // Build the body map (keys 1-6).
+      const bodyMap = new Map<number, unknown>([
+        [1, input.source_id],
+        [2, input.next_hop_id],
+        [3, input.destination_id],
+        [4, input.measured_rtt_ms],
+        [5, input.measured_loss_pct],
+        [6, input.valid_until],
+      ]);
+      const bodyBytes = canonicalEncode(bodyMap);
+      const bodyHex = toHex(bodyBytes);
+
+      if (intermediate.bodyHex && bodyHex !== intermediate.bodyHex) {
+        allOk = false;
+        failures.push(`${v.name}: bodyHex ${bodyHex} != ${intermediate.bodyHex}`);
+        continue;
+      }
+
+      // Signing payload = domain || body.
+      const domainBytes = new TextEncoder().encode(PATH_VALIDATION_DOMAIN);
+      const signingPayload = new Uint8Array(domainBytes.length + bodyBytes.length);
+      signingPayload.set(domainBytes, 0);
+      signingPayload.set(bodyBytes, domainBytes.length);
+      const signingPayloadHex = toHex(signingPayload);
+
+      if (
+        intermediate.signingPayloadHex &&
+        signingPayloadHex !== intermediate.signingPayloadHex
+      ) {
+        allOk = false;
+        failures.push(
+          `${v.name}: signingPayloadHex ${signingPayloadHex} != ${intermediate.signingPayloadHex}`,
+        );
+        continue;
+      }
+
+      // Verify the Ed25519 signature against the source public key.
+      const signature = hexToBytes(intermediate.signatureHex);
+      const sigValid = verifySignature(sourcePublicKey, signingPayload, signature);
+      if (!sigValid) {
+        allOk = false;
+        failures.push(`${v.name}: signature did not verify under source public key`);
+        continue;
+      }
+
+      // Build the full wire object (keys 1-7, with signature as field 7).
+      const wireMap = new Map<number, unknown>([
+        [1, input.source_id],
+        [2, input.next_hop_id],
+        [3, input.destination_id],
+        [4, input.measured_rtt_ms],
+        [5, input.measured_loss_pct],
+        [6, input.valid_until],
+        [7, signature],
+      ]);
+      const wireBytes = canonicalEncode(wireMap);
+      const wireHex = toHex(wireBytes);
+
+      if (expected.wireHex && wireHex !== expected.wireHex) {
+        allOk = false;
+        failures.push(`${v.name}: wireHex ${wireHex} != ${expected.wireHex}`);
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} path-validation cases match`,
+    actual: allOk ? `${vectors.length} path-validation cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// V-TOPOLOGY-PROPAGATION-001 — RemoteNodeHint bounded propagation.
+// Verifies hintToHex(constructed hint) == intermediate.hintHex (canonical
+// serialization freeze) AND verifyRemoteNodeHint returns the expected result
+// for each propagation-limit case (valid, hop-overflow, stale).
+// ---------------------------------------------------------------------------
+
+function verifyTopologyPropagationVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const reporterPublicKey = hexToBytes(data.sharedKeys.reporterPublicKeyHex);
+  const referenceNow = data.referenceNow;
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const input = v.input;
+      const intermediate = v.intermediate ?? {};
+      // The signature may live under `input` (mutation cases) or under
+      // `intermediate` (valid case).
+      const signatureHex =
+        input.reporterSignatureHex ?? intermediate.reporterSignatureHex;
+      if (!signatureHex) {
+        throw new Error("no reporter signature found in vector input");
+      }
+      // Reconstruct the hint object directly. The brand is preserved so
+      // verifyRemoteNodeHint exercises its runtime verification path (the
+      // constructor's input validation is intentionally bypassed so we can
+      // test mutated fields like hopCount=4).
+      const hint: RemoteNodeHint = {
+        __brand: "RemoteNodeHint",
+        reporterNodeId: input.reporterNodeId,
+        subjectNodeId: input.subjectNodeId,
+        subjectEndpointHint: input.subjectEndpointHint,
+        claimedCapabilities: input.claimedCapabilities,
+        hopCount: input.hopCount,
+        timestamp: input.timestamp,
+        nonce: hexToBytes(input.nonceHex),
+        reporterSignature: hexToBytes(signatureHex),
+      };
+
+      // Forward hex check: hintToHex(constructed hint) == intermediate.hintHex.
+      // Only the valid case carries intermediate.hintHex.
+      if (intermediate.hintHex) {
+        const recomputedHex = hintToHex(hint);
+        if (recomputedHex !== intermediate.hintHex) {
+          allOk = false;
+          failures.push(
+            `${v.name}: hintToHex ${recomputedHex} != ${intermediate.hintHex}`,
+          );
+          continue;
+        }
+      }
+
+      // Verify the hint against the propagation bounds + signature.
+      const result = verifyRemoteNodeHint(hint, reporterPublicKey, referenceNow);
+      const expected = v.expected;
+      let caseOk: boolean;
+      if (expected.verificationResult === "ok") {
+        caseOk = result.ok === true;
+      } else {
+        // Expected fail — compare the reason against the
+        // actualVerificationResult string after stripping the "fail/" prefix.
+        if (!result.ok) {
+          const expectedReason = String(
+            expected.actualVerificationResult,
+          ).replace(/^fail\//, "");
+          caseOk = result.reason === expectedReason;
+        } else {
+          caseOk = false;
+        }
+      }
+      if (!caseOk) {
+        allOk = false;
+        failures.push(
+          `${v.name}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(result)}`,
+        );
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} topology-propagation cases match`,
+    actual: allOk ? `${vectors.length} topology-propagation cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
 // Main
 const files = walkJsonFiles(vectorsDir);
 const results: VectorResult[] = [];
@@ -728,18 +1287,30 @@ for (const file of files) {
     result = verifyAdvVector(data);
   } else if (data.id?.startsWith("V-LINK-HANDSHAKE-") || data.id?.startsWith("V-LINK-AUTH-")) {
     result = verifyHandshakeVector(data);
+  } else if (data.id?.startsWith("V-ROUTE-PROPOSAL-")) {
+    result = verifyRouteProposalVector(data);
   } else if (data.id?.startsWith("V-ROUTE-COMMIT-")) {
     result = verifyRouteCommitVector(data);
   } else if (data.id?.startsWith("V-HINT-")) {
     result = verifyHintVector(data);
   } else if (data.id?.startsWith("V-SVC-")) {
     result = verifyServiceNegotiationVector(data);
+  } else if (data.id?.startsWith("V-CIRCUIT-SETUP-")) {
+    result = verifyCircuitSetupVector(data);
+  } else if (data.id?.startsWith("V-CIRCUIT-ACK-")) {
+    result = verifyCircuitAckVector(data);
   } else if (data.id?.startsWith("V-CIRCUIT-")) {
     result = verifyCircuitVector(data);
   } else if (data.id?.startsWith("V-GATEWAY-")) {
     result = verifyGatewayVector(data);
   } else if (data.id?.startsWith("V-RECEIPT-")) {
     result = verifyReceiptVector(data);
+  } else if (data.id?.startsWith("V-CONTRIBUTION-PROOF-")) {
+    result = verifyContributionProofVector(data);
+  } else if (data.id?.startsWith("V-PATH-VALIDATION-")) {
+    result = verifyPathValidationVector(data);
+  } else if (data.id?.startsWith("V-TOPOLOGY-PROPAGATION-")) {
+    result = verifyTopologyPropagationVector(data);
   } else if (data.id === "MANIFEST" || data.file === "MANIFEST.json") {
     // Manifest is metadata, not a protocol vector — skip it
     result = { id: data.id ?? file, passed: true, expected: "manifest metadata", actual: "manifest (not a protocol vector)" };

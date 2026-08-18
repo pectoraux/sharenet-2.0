@@ -382,6 +382,9 @@ def verify_vector(data: dict) -> dict:
     elif vid.startswith("V-LINK-HANDSHAKE-") or vid.startswith("V-LINK-AUTH-"):
         return verify_handshake_vector(data)
 
+    elif vid.startswith("V-ROUTE-PROPOSAL-"):
+        return verify_route_proposal_vector(data)
+
     elif vid.startswith("V-ROUTE-COMMIT-"):
         return verify_route_commit_vector(data)
 
@@ -391,6 +394,12 @@ def verify_vector(data: dict) -> dict:
     elif vid.startswith("V-SVC-"):
         return verify_svc_vector(data)
 
+    elif vid.startswith("V-CIRCUIT-SETUP-"):
+        return verify_circuit_setup_vector(data)
+
+    elif vid.startswith("V-CIRCUIT-ACK-"):
+        return verify_circuit_ack_vector(data)
+
     elif vid.startswith("V-CIRCUIT-"):
         return verify_circuit_vector(data)
 
@@ -399,6 +408,15 @@ def verify_vector(data: dict) -> dict:
 
     elif vid.startswith("V-RECEIPT-"):
         return verify_receipt_vector(data)
+
+    elif vid.startswith("V-CONTRIBUTION-PROOF-"):
+        return verify_contribution_proof_vector(data)
+
+    elif vid.startswith("V-PATH-VALIDATION-"):
+        return verify_path_validation_vector(data)
+
+    elif vid.startswith("V-TOPOLOGY-PROPAGATION-"):
+        return verify_topology_propagation_vector(data)
 
     return {"id": vid, "passed": False, "expected": "known type", "actual": "unknown type"}
 
@@ -1367,6 +1385,670 @@ def verify_receipt_vector(data: dict) -> dict:
         "passed": passed,
         "expected": f"{len(vectors)} receipt vectors match",
         "actual": f"{len(vectors)} receipt vectors match" if passed else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# SignedRouteProposal signature verification (added for V-ROUTE-PROPOSAL-001)
+# -----------------------------------------------------------------------
+
+ROUTE_PROPOSAL_DOMAIN = b"SHARENET/ROUTE/PROPOSAL/1"
+
+
+def route_proposal_signing_payload(proposal: dict) -> bytes:
+    """Compute the bytes-to-be-signed for a RouteProposal.
+
+    Body = canonical CBOR of integer-keyed map:
+      1: hops[].nodeId (array of text)
+      2: requirementDigest (text)
+      3: expiry (uint)
+      4: initiatorNodeId (text)
+      5: agreementDigest (text)
+    Payload = utf8(SHARENET/ROUTE/PROPOSAL/1) || body
+    """
+    m = {
+        1: [h["nodeId"] for h in proposal["hops"]],
+        2: proposal["requirementDigest"],
+        3: proposal["expiry"],
+        4: proposal["initiatorNodeId"],
+        5: proposal["agreementDigest"],
+    }
+    return ROUTE_PROPOSAL_DOMAIN + canonical_cbor_encode(m)
+
+
+def verify_route_proposal_vector(data: dict) -> dict:
+    """Verify a V-ROUTE-PROPOSAL-* vector (SignedRouteProposal signature)."""
+    vid = data.get("id", "unknown")
+    shared_keys = data.get("sharedKeys", {})
+    initiator_pubkey = bytes.fromhex(shared_keys["initiatorPublicKeyHex"])
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            exp = v["expected"]
+            intermediate = v.get("intermediate", {})
+
+            proposal = inp["proposal"]
+            payload = route_proposal_signing_payload(proposal)
+
+            # Sanity: recompute the signing payload and compare.
+            expected_payload_hex = (
+                intermediate.get("signingPayloadHex")
+                or intermediate.get("tamperedSigningPayloadHex")
+            )
+            if expected_payload_hex and payload.hex() != expected_payload_hex:
+                failures.append(
+                    f'{v["name"]}: payload {payload.hex()} != {expected_payload_hex}'
+                )
+                continue
+
+            # Resolve which signature to verify: tampered-signature case carries
+            # tamperedSignatureHex; tampered-proposal case carries originalSignatureHex;
+            # valid case carries intermediate.signatureHex.
+            sig_hex = (
+                inp.get("tamperedSignatureHex")
+                or inp.get("originalSignatureHex")
+                or intermediate.get("signatureHex")
+            )
+            if not sig_hex:
+                failures.append(f'{v["name"]}: no signature found')
+                continue
+            sig = bytes.fromhex(sig_hex)
+
+            try:
+                VerifyKey(initiator_pubkey).verify(payload, sig)
+                valid = True
+            except BadSignatureError:
+                valid = False
+            except Exception:
+                valid = False
+
+            if exp["verificationResult"] == "ok":
+                if not valid:
+                    failures.append(
+                        f'{v["name"]}: expected ok, got invalid signature'
+                    )
+            else:
+                if valid:
+                    failures.append(
+                        f'{v["name"]}: expected fail/{exp.get("errorCode")}, '
+                        f'got valid'
+                    )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} route-proposal vectors match",
+        "actual": f"{len(vectors)} route-proposal vectors match" if passed
+        else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# CircuitSetupRequest encoding (added for V-CIRCUIT-SETUP-001)
+# -----------------------------------------------------------------------
+
+CIRCUIT_SETUP_DOMAIN = b"SHARENET/CIRCUIT/SETUP/1"
+
+
+def encode_circuit_setup_request(req: dict) -> bytes:
+    """Encode a CircuitSetupRequest as canonical CBOR.
+
+    Only `req["route"]["routeId"]` is read from the route (the full
+    BrandedCommittedRoute is conveyed out-of-band). Map keys:
+      1: routeId (text), 2: hopIndex (uint),
+      3: initiatorX25519PublicKey (bstr .size 32), 4: setupNonce (bstr .size 16)
+    """
+    m = {
+        1: req["route"]["routeId"],
+        2: req["hopIndex"],
+        3: req["initiatorX25519PublicKey"],
+        4: req["setupNonce"],
+    }
+    return canonical_cbor_encode(m)
+
+
+def circuit_setup_signing_payload(req: dict) -> bytes:
+    """Compute the bytes-to-be-signed for a CircuitSetupRequest."""
+    return CIRCUIT_SETUP_DOMAIN + encode_circuit_setup_request(req)
+
+
+def verify_circuit_setup_vector(data: dict) -> dict:
+    """Verify a V-CIRCUIT-SETUP-* vector (CircuitSetupRequest encoding)."""
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            intermediate = v.get("intermediate", {})
+
+            req = {
+                "route": {"routeId": inp["routeId"]},
+                "hopIndex": inp["hopIndex"],
+                "initiatorX25519PublicKey": bytes.fromhex(
+                    inp["initiatorX25519PublicKeyHex"]
+                ),
+                "setupNonce": bytes.fromhex(inp["setupNonceHex"]),
+            }
+            encoded = encode_circuit_setup_request(req)
+            encoded_hex = encoded.hex()
+            signing_payload = circuit_setup_signing_payload(req)
+            signing_payload_hex = signing_payload.hex()
+
+            expected_encoded = (
+                intermediate.get("encodedHex")
+                or intermediate.get("tamperedEncodedHex")
+            )
+            expected_signing = (
+                intermediate.get("signingPayloadHex")
+                or intermediate.get("tamperedSigningPayloadHex")
+            )
+
+            if expected_encoded and encoded_hex != expected_encoded:
+                failures.append(
+                    f'{v["name"]}: encoded {encoded_hex} != {expected_encoded}'
+                )
+            if expected_signing and signing_payload_hex != expected_signing:
+                failures.append(
+                    f'{v["name"]}: signingPayload {signing_payload_hex} '
+                    f'!= {expected_signing}'
+                )
+            # For tampered-hopindex: the recomputed encoding MUST differ from
+            # the originalEncodedHex.
+            original_encoded = intermediate.get("originalEncodedHex")
+            if original_encoded and encoded_hex == original_encoded:
+                failures.append(
+                    f'{v["name"]}: tampered encoding matches original '
+                    f'(bytes did not differ)'
+                )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} circuit-setup vectors match",
+        "actual": f"{len(vectors)} circuit-setup vectors match" if passed
+        else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# CircuitSetupAck signing payload (added for V-CIRCUIT-ACK-001)
+# -----------------------------------------------------------------------
+
+CIRCUIT_ACK_DOMAIN = b"SHARENET/CIRCUIT/ACK/1"
+
+
+def circuit_ack_signing_payload(route_id: str, route_commitment_digest_hex: str,
+                                hop_index: int, relay_x25519_pubkey: bytes,
+                                initiator_x25519_pubkey: bytes, ack_nonce: bytes,
+                                ack_timestamp: int, ack_expiry: int) -> bytes:
+    """Compute the bytes-to-be-signed for a CircuitSetupAck.
+
+    Body = canonical CBOR of integer-keyed map:
+      1: routeId, 2: routeCommitmentDigestHex, 3: hopIndex,
+      4: relayX25519PublicKey, 5: initiatorX25519PublicKey,
+      6: ackNonce, 7: ackTimestamp, 8: ackExpiry
+    Payload = utf8(SHARENET/CIRCUIT/ACK/1) || body
+    """
+    m = {
+        1: route_id,
+        2: route_commitment_digest_hex,
+        3: hop_index,
+        4: relay_x25519_pubkey,
+        5: initiator_x25519_pubkey,
+        6: ack_nonce,
+        7: ack_timestamp,
+        8: ack_expiry,
+    }
+    return CIRCUIT_ACK_DOMAIN + canonical_cbor_encode(m)
+
+
+def verify_circuit_ack_vector(data: dict) -> dict:
+    """Verify a V-CIRCUIT-ACK-* vector (CircuitSetupAck signing payload)."""
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            intermediate = v.get("intermediate", {})
+
+            payload = circuit_ack_signing_payload(
+                inp["routeId"],
+                inp["routeCommitmentDigestHex"],
+                inp["hopIndex"],
+                bytes.fromhex(inp["relayX25519PublicKeyHex"]),
+                bytes.fromhex(inp["initiatorX25519PublicKeyHex"]),
+                bytes.fromhex(inp["ackNonceHex"]),
+                inp["ackTimestamp"],
+                inp["ackExpiry"],
+            )
+            payload_hex = payload.hex()
+
+            expected_hex = (
+                intermediate.get("signingPayloadHex")
+                or intermediate.get("tamperedSigningPayloadHex")
+            )
+            if expected_hex and payload_hex != expected_hex:
+                failures.append(
+                    f'{v["name"]}: payload {payload_hex} != {expected_hex}'
+                )
+            # For tampered-routeId: the recomputed payload MUST differ from
+            # the originalSigningPayloadHex — this is the route-substitution
+            # defense.
+            original_payload = intermediate.get("originalSigningPayloadHex")
+            if original_payload and payload_hex == original_payload:
+                failures.append(
+                    f'{v["name"]}: tampered payload matches original '
+                    f'(bytes did not differ)'
+                )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} circuit-ack vectors match",
+        "actual": f"{len(vectors)} circuit-ack vectors match" if passed
+        else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# ContributionProof derivation (added for V-CONTRIBUTION-PROOF-001)
+# -----------------------------------------------------------------------
+
+def create_contribution_proof(receipt: dict, gateway_public_key: bytes,
+                              peer_public_key: bytes, now: int) -> dict:
+    """Independent implementation of createContributionProof.
+
+    Mirrors reference/economics/contribution.ts — createContributionProof:
+      1. Verify the bilateral receipt (both signatures).
+      2. Compute receiptHash = BLAKE3-256(receiptSigningPayload(receipt)).
+      3. Emit ContributionProof {receiptId, contributorNodeId, peerNodeId,
+         serviceType, bytesForwarded, durationSeconds, receiptHash,
+         gatewaySignature, peerSignature, createdAt}.
+    Returns {"ok": True, "proof": {...}} on success or
+    {"ok": False, "reason": "receipt verification failed: <inner>"} on failure.
+    """
+    verification = verify_bilateral_receipt(receipt, gateway_public_key,
+                                           peer_public_key)
+    if not verification["ok"]:
+        return {
+            "ok": False,
+            "reason": f"receipt verification failed: {verification['detail']}",
+        }
+
+    payload = receipt_signing_payload(receipt)
+    receipt_hash = blake3.blake3(payload).digest(length=32).hex()
+
+    proof = {
+        "receiptId": receipt["receiptId"],
+        "contributorNodeId": receipt["gatewayNodeId"],
+        "peerNodeId": receipt["peerNodeId"],
+        "serviceType": "INTERNET_GATEWAY",
+        "bytesForwarded": receipt["bytesSent"] + receipt["bytesReceived"],
+        "durationSeconds": receipt["sessionEnd"] - receipt["sessionStart"],
+        "receiptHash": receipt_hash,
+        "gatewaySignatureHex": receipt["gatewaySignatureHex"],
+        "peerSignatureHex": receipt["peerSignatureHex"],
+        "createdAt": now,
+    }
+    return {"ok": True, "proof": proof}
+
+
+def verify_contribution_proof_vector(data: dict) -> dict:
+    """Verify a V-CONTRIBUTION-PROOF-* vector (ContributionProof derivation)."""
+    vid = data.get("id", "unknown")
+    shared_keys = data.get("sharedKeys", {})
+    gateway_pubkey = bytes.fromhex(shared_keys["gatewayPublicKeyHex"])
+    peer_pubkey = bytes.fromhex(shared_keys["peerPublicKeyHex"])
+    now = data["referenceNow"]
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            intermediate = v.get("intermediate", {})
+            exp = v["expected"]
+
+            # Signatures may live under `input` (tampered case) or
+            # `intermediate` (valid case).
+            gateway_sig_hex = (
+                inp.get("tamperedGatewaySignatureHex")
+                or inp.get("gatewaySignatureHex")
+                or intermediate.get("gatewaySignatureHex")
+            )
+            peer_sig_hex = (
+                inp.get("peerSignatureHex")
+                or intermediate.get("peerSignatureHex")
+            )
+            if not gateway_sig_hex or not peer_sig_hex:
+                failures.append(f'{v["name"]}: missing gateway/peer signature')
+                continue
+
+            receipt = {
+                "receiptId": inp["receiptId"],
+                "gatewayNodeId": inp["gatewayNodeId"],
+                "peerNodeId": inp["peerNodeId"],
+                "destination": inp["destination"],
+                "bytesSent": inp["bytesSent"],
+                "bytesReceived": inp["bytesReceived"],
+                "sessionStart": inp["sessionStart"],
+                "sessionEnd": inp["sessionEnd"],
+                "httpStatus": inp["httpStatus"],
+                "gatewaySignatureHex": gateway_sig_hex,
+                "peerSignatureHex": peer_sig_hex,
+            }
+
+            # Sanity: recompute receiptSigningPayload and compare.
+            expected_payload_hex = intermediate.get("receiptSigningPayloadHex")
+            if expected_payload_hex:
+                payload = receipt_signing_payload(receipt)
+                if payload.hex() != expected_payload_hex:
+                    failures.append(
+                        f'{v["name"]}: receiptSigningPayload {payload.hex()} '
+                        f'!= {expected_payload_hex}'
+                    )
+                    continue
+
+            result = create_contribution_proof(receipt, gateway_pubkey,
+                                               peer_pubkey, now)
+
+            if exp["createResult"] == "ok":
+                if not result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected ok, got fail: '
+                        f'{result.get("reason")}'
+                    )
+                else:
+                    proof = result["proof"]
+                    ok = (
+                        proof["receiptHash"] == exp["receiptHashHex"]
+                        and proof["bytesForwarded"] == exp["bytesForwarded"]
+                        and proof["durationSeconds"] == exp["durationSeconds"]
+                        and proof["contributorNodeId"] == exp["contributorNodeId"]
+                        and proof["serviceType"] == exp["serviceType"]
+                        and proof["peerNodeId"] == exp["peerNodeId"]
+                        and proof["receiptId"] == exp["receiptId"]
+                        and proof["createdAt"] == exp["createdAt"]
+                    )
+                    if not ok:
+                        failures.append(
+                            f'{v["name"]}: proof fields mismatch — '
+                            f'got receiptHash={proof["receiptHash"]} '
+                            f'bytesForwarded={proof["bytesForwarded"]} '
+                            f'durationSeconds={proof["durationSeconds"]} '
+                            f'contributorNodeId={proof["contributorNodeId"]} '
+                            f'createdAt={proof["createdAt"]}'
+                        )
+            else:
+                # Expected fail. The vector's failReason is the full reason
+                # string returned by createContributionProof:
+                #   "receipt verification failed: gateway signature invalid"
+                if result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected fail/{exp.get("errorCode")}, '
+                        f'got ok'
+                    )
+                elif result.get("reason") != exp.get("failReason"):
+                    failures.append(
+                        f'{v["name"]}: expected reason '
+                        f'"{exp.get("failReason")}", '
+                        f'got "{result.get("reason")}"'
+                    )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} contribution-proof vectors match",
+        "actual": f"{len(vectors)} contribution-proof vectors match" if passed
+        else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# PathValidationResult canonical encoding (spec-only — V-PATH-VALIDATION-001)
+# -----------------------------------------------------------------------
+
+PATH_VALIDATION_DOMAIN = b"SHARENET/PATH/VALIDATION/1"
+
+
+def encode_path_validation_body(body: dict) -> bytes:
+    """Encode a PathValidationResult body (keys 1-6) as canonical CBOR."""
+    m = {
+        1: body["source_id"],
+        2: body["next_hop_id"],
+        3: body["destination_id"],
+        4: body["measured_rtt_ms"],
+        5: body["measured_loss_pct"],
+        6: body["valid_until"],
+    }
+    return canonical_cbor_encode(m)
+
+
+def encode_path_validation_wire(body: dict, signature: bytes) -> bytes:
+    """Encode the full PathValidationResult wire object (keys 1-7)."""
+    m = {
+        1: body["source_id"],
+        2: body["next_hop_id"],
+        3: body["destination_id"],
+        4: body["measured_rtt_ms"],
+        5: body["measured_loss_pct"],
+        6: body["valid_until"],
+        7: signature,
+    }
+    return canonical_cbor_encode(m)
+
+
+def verify_path_validation_vector(data: dict) -> dict:
+    """Verify a V-PATH-VALIDATION-* vector (spec-only canonical encoding freeze).
+
+    No TS implementation exists in reference/. We verify:
+      (a) recomputed bodyHex matches intermediate.bodyHex,
+      (b) recomputed signingPayloadHex matches intermediate.signingPayloadHex,
+      (c) the Ed25519 signature verifies under the source public key,
+      (d) the recomputed wireHex matches expected.wireHex.
+    """
+    vid = data.get("id", "unknown")
+    shared_keys = data.get("sharedKeys", {})
+    source_pubkey = bytes.fromhex(shared_keys["sourcePublicKeyHex"])
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            intermediate = v.get("intermediate", {})
+            exp = v["expected"]
+
+            body_bytes = encode_path_validation_body(inp)
+            if intermediate.get("bodyHex") and body_bytes.hex() != intermediate["bodyHex"]:
+                failures.append(
+                    f'{v["name"]}: bodyHex {body_bytes.hex()} '
+                    f'!= {intermediate["bodyHex"]}'
+                )
+                continue
+
+            signing_payload = PATH_VALIDATION_DOMAIN + body_bytes
+            if (intermediate.get("signingPayloadHex")
+                    and signing_payload.hex() != intermediate["signingPayloadHex"]):
+                failures.append(
+                    f'{v["name"]}: signingPayloadHex '
+                    f'{signing_payload.hex()} '
+                    f'!= {intermediate["signingPayloadHex"]}'
+                )
+                continue
+
+            signature = bytes.fromhex(intermediate["signatureHex"])
+            try:
+                VerifyKey(source_pubkey).verify(signing_payload, signature)
+                sig_valid = True
+            except BadSignatureError:
+                sig_valid = False
+            except Exception:
+                sig_valid = False
+
+            if not sig_valid:
+                failures.append(
+                    f'{v["name"]}: signature did not verify under '
+                    f'source public key'
+                )
+                continue
+
+            wire_bytes = encode_path_validation_wire(inp, signature)
+            if exp.get("wireHex") and wire_bytes.hex() != exp["wireHex"]:
+                failures.append(
+                    f'{v["name"]}: wireHex {wire_bytes.hex()} '
+                    f'!= {exp["wireHex"]}'
+                )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} path-validation vectors match",
+        "actual": f"{len(vectors)} path-validation vectors match" if passed
+        else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# RemoteNodeHint bounded propagation (added for V-TOPOLOGY-PROPAGATION-001)
+# -----------------------------------------------------------------------
+
+def encode_full_hint(hint: dict) -> bytes:
+    """Encode a full RemoteNodeHint (body + signature) as canonical CBOR.
+
+    Mirrors reference/topology/remote-node-hint.ts — hintToHex.
+    Map keys: 1=reporterNodeId, 2=subjectNodeId, 3=subjectEndpointHint,
+              4=claimedCapabilities[], 5=hopCount, 6=timestamp,
+              7=nonce (16-byte bstr), 8=reporterSignature (64-byte bstr).
+    """
+    nonce = (hint["nonce"] if isinstance(hint.get("nonce"), bytes)
+             else bytes.fromhex(hint["nonceHex"]))
+    sig = (hint["reporterSignature"] if isinstance(hint.get("reporterSignature"), bytes)
+           else bytes.fromhex(hint["reporterSignatureHex"]))
+    m = {
+        1: hint["reporterNodeId"],
+        2: hint["subjectNodeId"],
+        3: hint["subjectEndpointHint"],
+        4: list(hint["claimedCapabilities"]),
+        5: hint["hopCount"],
+        6: hint["timestamp"],
+        7: nonce,
+        8: sig,
+    }
+    return canonical_cbor_encode(m)
+
+
+def verify_topology_propagation_vector(data: dict) -> dict:
+    """Verify a V-TOPOLOGY-PROPAGATION-* vector.
+
+    For each case:
+      (a) Construct the hint from input (+ intermediate signature).
+      (b) For valid case: verify encode_full_hint(hint) matches
+          intermediate.hintHex (canonical serialization freeze).
+      (c) Verify verify_remote_node_hint returns the expected result.
+    """
+    vid = data.get("id", "unknown")
+    shared_keys = data.get("sharedKeys", {})
+    reporter_pubkey = bytes.fromhex(shared_keys["reporterPublicKeyHex"])
+    reference_now = data["referenceNow"]
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            intermediate = v.get("intermediate", {})
+            exp = v["expected"]
+
+            sig_hex = (
+                inp.get("reporterSignatureHex")
+                or intermediate.get("reporterSignatureHex")
+            )
+            if not sig_hex:
+                failures.append(f'{v["name"]}: no reporter signature found')
+                continue
+
+            hint = {
+                "reporterNodeId": inp["reporterNodeId"],
+                "subjectNodeId": inp["subjectNodeId"],
+                "subjectEndpointHint": inp["subjectEndpointHint"],
+                "claimedCapabilities": inp["claimedCapabilities"],
+                "hopCount": inp["hopCount"],
+                "timestamp": inp["timestamp"],
+                "nonceHex": inp["nonceHex"],
+                "reporterSignatureHex": sig_hex,
+            }
+
+            # Forward hex check: encode_full_hint(hint) == intermediate.hintHex.
+            # Only the valid case carries intermediate.hintHex.
+            if intermediate.get("hintHex"):
+                recomputed = encode_full_hint(hint).hex()
+                if recomputed != intermediate["hintHex"]:
+                    failures.append(
+                        f'{v["name"]}: hintToHex {recomputed} '
+                        f'!= {intermediate["hintHex"]}'
+                    )
+                    continue
+
+            # Verify the hint against the propagation bounds + signature.
+            result = verify_remote_node_hint(hint, reporter_pubkey, reference_now)
+
+            if exp["verificationResult"] == "ok":
+                if not result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected ok, '
+                        f'got {result.get("error")}: {result.get("detail")}'
+                    )
+            else:
+                # Expected fail — compare reason against actualVerificationResult
+                # (after stripping the "fail/" prefix).
+                if result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected fail/{exp.get("errorCode")}, '
+                        f'got ok'
+                    )
+                else:
+                    expected_reason = str(
+                        exp.get("actualVerificationResult", "")
+                    ).replace("fail/", "", 1)
+                    if result.get("detail") != expected_reason:
+                        failures.append(
+                            f'{v["name"]}: expected reason '
+                            f'"{expected_reason}", '
+                            f'got "{result.get("detail")}"'
+                        )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} topology-propagation vectors match",
+        "actual": f"{len(vectors)} topology-propagation vectors match" if passed
+        else f"FAILED: {'; '.join(failures)}",
     }
 
 

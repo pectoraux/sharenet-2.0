@@ -176,6 +176,48 @@
       "schema_version": "1",
       "expected_result": "bilateral receipt valid + mutations (tampered gateway sig / peer sig / receipt id)",
       "file": "V-RECEIPT-001.json"
+    },
+    {
+      "id": "V-ROUTE-PROPOSAL-001",
+      "protocol": "routing",
+      "schema_version": "1",
+      "expected_result": "SignedRouteProposal wire object: valid signature + tampered signature/proposal mutations",
+      "file": "V-ROUTE-PROPOSAL-001.json"
+    },
+    {
+      "id": "V-CIRCUIT-SETUP-001",
+      "protocol": "circuit",
+      "schema_version": "1",
+      "expected_result": "CircuitSetupRequest canonical encoding + tampered hopIndex",
+      "file": "V-CIRCUIT-SETUP-001.json"
+    },
+    {
+      "id": "V-CIRCUIT-ACK-001",
+      "protocol": "circuit",
+      "schema_version": "1",
+      "expected_result": "CircuitSetupAck signing payload + tampered routeId",
+      "file": "V-CIRCUIT-ACK-001.json"
+    },
+    {
+      "id": "V-CONTRIBUTION-PROOF-001",
+      "protocol": "economics",
+      "schema_version": "1",
+      "expected_result": "ContributionProof derivation + invalid receipt rejection",
+      "file": "V-CONTRIBUTION-PROOF-001.json"
+    },
+    {
+      "id": "V-PATH-VALIDATION-001",
+      "protocol": "routing",
+      "schema_version": "1",
+      "expected_result": "PathValidationResult canonical encoding (spec-only — no TS impl yet)",
+      "file": "V-PATH-VALIDATION-001.json"
+    },
+    {
+      "id": "V-TOPOLOGY-PROPAGATION-001",
+      "protocol": "topology",
+      "schema_version": "1",
+      "expected_result": "RemoteNodeHint propagation limits: valid + hopCount overflow + stale freshness",
+      "file": "V-TOPOLOGY-PROPAGATION-001.json"
     }
   ]
 }

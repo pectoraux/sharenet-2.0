@@ -1,0 +1,75 @@
+{
+  "id": "V-CIRCUIT-ACK-001",
+  "status": "draft",
+  "spec": "spec/08-circuits.md §4.4, spec/00 §24, GATE-06, R-008H",
+  "adr": "adr/0017-protocol-freeze-reconciliation.md",
+  "description": "CircuitSetupAck signing payload: binds routeId, routeCommitmentDigestHex, hopIndex, relay X25519 pubkey, initiator X25519 pubkey, ackNonce, ackTimestamp, ackExpiry into a canonical CBOR map prefixed by the SHARENET/CIRCUIT/ACK/1 domain tag. Per R-008H: the ack cryptographically binds the relay to the EXACT committed route (routeCommitmentDigest), preventing route substitution. The payload is signed by the relay's Ed25519 key as proof-of-possession + transcript binding.",
+  "constants": {
+    "domain": "SHARENET/CIRCUIT/ACK/1",
+    "bodyEncoding": "canonical CBOR (RFC 8949 §4.2.2), integer-keyed map per ADR-0004",
+    "signingPayload": "utf8(domain) || canonicalEncode(bodyMap)",
+    "bodyMapKeys": {
+      "1": "routeId (text)",
+      "2": "routeCommitmentDigestHex (text, 64 hex chars = 32 bytes)",
+      "3": "hopIndex (uint)",
+      "4": "relayX25519PublicKey (bstr .size 32)",
+      "5": "initiatorX25519PublicKey (bstr .size 32, transcript binding)",
+      "6": "ackNonce (bstr .size 16)",
+      "7": "ackTimestamp (uint, unix seconds)",
+      "8": "ackExpiry (uint, unix seconds)"
+    },
+    "ackMaxAgeSeconds": 120,
+    "ackMaxClockSkewSeconds": 60
+  },
+  "referenceNow": 1786876545,
+  "vectors": [
+    {
+      "name": "valid-ack-payload",
+      "description": "Call circuitAckSigningPayload with fixed parameters. Capture the exact hex output. This payload is signed by the relay's Ed25519 key as the proof-of-possession + transcript binding (the signature itself is NOT computed in this vector — the payload hex is the artifact under test).",
+      "input": {
+        "routeId": "route:5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9",
+        "routeCommitmentDigestHex": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "hopIndex": 2,
+        "relayX25519PublicKeyHex": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff",
+        "initiatorX25519PublicKeyHex": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+        "ackNonceHex": "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
+        "ackTimestamp": 1786876545,
+        "ackExpiry": 1786880145
+      },
+      "intermediate": {
+        "signingPayloadHex": "53484152454e45542f434952435549542f41434b2f31a8017846726f7574653a3565646132643032386330343632326162393732656336663830306463666662356136616239613266373039356530653833326232393232646233326438623902784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400650e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6071a6a819281081a6a81a091",
+        "signingPayloadLengthBytes": 265
+      },
+      "expected": {
+        "result": "ok",
+        "actualResult": "ok"
+      }
+    },
+    {
+      "name": "tampered-routeId",
+      "description": "Change routeId to a different value. The signing payload hex differs because the CBOR map slot 1 encodes a different text string. A relay signature computed over the original routeId will NOT verify against the tampered payload — this is the route-substitution defense.",
+      "input": {
+        "routeId": "route:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "routeCommitmentDigestHex": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "hopIndex": 2,
+        "relayX25519PublicKeyHex": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff",
+        "initiatorX25519PublicKeyHex": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
+        "ackNonceHex": "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
+        "ackTimestamp": 1786876545,
+        "ackExpiry": 1786880145,
+        "mutation": "routeId changed to a different 32-byte hex string"
+      },
+      "intermediate": {
+        "tamperedSigningPayloadHex": "53484152454e45542f434952435549542f41434b2f31a8017842726f7574653a65656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656502784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400650e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6071a6a819281081a6a81a091",
+        "originalSigningPayloadHex": "53484152454e45542f434952435549542f41434b2f31a8017846726f7574653a3565646132643032386330343632326162393732656336663830306463666662356136616239613266373039356530653833326232393232646233326438623902784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400650e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6071a6a819281081a6a81a091",
+        "bytesDiffer": true
+      },
+      "expected": {
+        "result": "ok (still valid CBOR, but different bytes)",
+        "actualResult": "ok/bytes differ"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/circuit/distributed-setup.ts — circuitAckSigningPayload, routeCommitmentDigest.",
+  "notes": "Per R-008H: the ack binds to BOTH the routeId (identity) AND the routeCommitmentDigest (cryptographic binding to the exact committed route). A relay that signs an ack is committing to forward traffic for THIS exact route — substitution of the underlying route (different hops, different terms) is cryptographically detectable. The ack freshness bounds (ackMaxAgeSeconds=120, ackMaxClockSkewSeconds=60) are enforced by processCircuitSetupAck independently of this payload encoding."
+}
