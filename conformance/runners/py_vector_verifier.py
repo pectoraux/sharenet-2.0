@@ -418,6 +418,9 @@ def verify_vector(data: dict) -> dict:
     elif vid.startswith("V-TOPOLOGY-PROPAGATION-"):
         return verify_topology_propagation_vector(data)
 
+    elif vid.startswith("V-DISCOVERY-"):
+        return verify_discovery_vector(data)
+
     return {"id": vid, "passed": False, "expected": "known type", "actual": "unknown type"}
 
 
@@ -2058,6 +2061,38 @@ def verify_topology_propagation_vector(data: dict) -> dict:
         "expected": f"{len(vectors)} topology-propagation vectors match",
         "actual": f"{len(vectors)} topology-propagation vectors match" if passed
         else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+def verify_discovery_vector(data: dict) -> dict:
+    """Verify a V-DISCOVERY-* vector (canonical CandidateDestination encoding)."""
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            m = {}
+            m[1] = inp["nodeIdHint"]
+            m[2] = inp["reportedBy"]
+            m[3] = inp["endpointHints"]
+            m[4] = inp["distanceHint"]
+            m[5] = inp["lastSeen"]
+            m[6] = inp["evidenceType"]
+            encoded = cbor2.dumps(m, canonical=True)
+            actual_hex = encoded.hex()
+            if actual_hex != v["expected"]["canonicalEncodingHex"]:
+                failures.append(f'{v["name"]}: {actual_hex} != {v["expected"]["canonicalEncodingHex"]}')
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} discovery vectors match",
+        "actual": f"{len(vectors)} discovery vectors match" if passed else f"FAILED: {'; '.join(failures)}",
     }
 
 

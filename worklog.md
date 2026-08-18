@@ -1155,3 +1155,39 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The conformance system is now fully self-enforcing: the completeness guard verifies the entire chain from protocol-registry.json → MANIFEST.json → TS runner dispatch → Python runner dispatch. Adding a new wire object to the registry without a corresponding vector family in the manifest AND dispatch branches in BOTH runners MUST fail CI.
+
+---
+Task ID: R-007-spec-reconciliation-final
+Agent: main (Z.ai Code)
+Task: R-007 final spec reconciliation — complete registry against all normative specs, add spec↔registry inventory check, reconcile spec/08 sliding-window contradiction.
+
+Work Log:
+- Completed protocol-registry.json against ALL normative specs:
+  - Added CandidateDestination (kind: wire, V-DISCOVERY) from spec/05
+  - Added GatewayCapability (kind: sub_object) from spec/09
+  - Added GatewayAuthorization (kind: rule) from spec/09
+  - Added GatewayServiceAgreement (kind: sub_object) from spec/09
+  - Added CircuitPossessionProof (kind: wire) from spec/08
+  - Added CircuitFrame (kind: rule) from spec/08
+  - Added LedgerEntry (kind: sub_object) from spec/11
+  - Added ShareNetAdvertisement (kind: sub_object) — spec CDDL name for NodeAdvertisement
+
+- Created V-DISCOVERY-001.json: canonical CandidateDestination encoding vector (frozen, with real computed CBOR hex). Added to MANIFEST.
+- Added TS + Python runner handlers for V-DISCOVERY (both runners verify canonical CBOR encoding).
+
+- Reconciled spec/08 §4.5: removed the old sliding-window requirement ("MUST maintain a sliding window of accepted sequences (default: window of 64 sequences)"). The section now states the FROZEN ORDERED_STREAM model exclusively: "There is no sliding window. The earlier 'window of 64 sequences' language is superseded and MUST NOT be implemented."
+
+- Added spec↔registry inventory check to tests/r007-completeness.test.ts:
+  - Parses ALL normative spec markdown files (02-11) for CDDL-style object definitions (ObjectName = { pattern)
+  - Verifies every CDDL-defined object name appears in the protocol registry
+  - This prevents a new normative object from being added to a spec without appearing in the registry
+  - Combined with the existing registry→manifest→TS→Python chain, the full enforcement is now: spec → registry → manifest → TS runner → Python runner
+
+Stage Summary:
+- Tests: 333 → 334 pass, 0 fail (+1 spec↔registry inventory test). 1027 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 32/32 vectors pass.
+- Python conformance runner: 32/32 vectors pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The conformance system now enforces the full chain: normative spec → registry → manifest → TS runner → Python runner. Adding a new wire object to any spec without adding it to the registry, creating a vector, and adding dispatch branches to both runners MUST fail CI.

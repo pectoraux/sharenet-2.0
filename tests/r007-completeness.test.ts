@@ -287,4 +287,87 @@ describe("R-007: Registry-driven vector completeness", () => {
     // orphan vector from the manifest.
     expect(orphans).toEqual([]);
   });
+
+  // -----------------------------------------------------------------
+  // Spec ↔ Registry inventory check.
+  //
+  // Every CDDL-defined wire object in the normative specs MUST appear in
+  // the protocol registry. This test parses the spec markdown files for
+  // CDDL-style object definitions (```
+  // ObjectName = { ... }```) and verifies each ObjectName appears as a
+  // key in the registry. This prevents a new spec object from being added
+  // without the registry being updated.
+  // -----------------------------------------------------------------
+
+  test("every CDDL-defined object in spec markdown appears in the protocol registry", () => {
+    const specDir = join(process.cwd(), "spec");
+    const specFiles = [
+      "02-identity.md", "03-node-advertisements.md", "04-links.md",
+      "05-discovery.md", "06-topology.md", "07-routing.md",
+      "08-circuits.md", "09-internet-gateway.md", "11-contribution.md",
+    ];
+
+    // Collect all object names defined in the registry
+    const registryObjectNames = new Set<string>();
+    for (const layer of Object.values(REGISTRY.layers)) {
+      for (const objName of Object.keys((layer as any).objects)) {
+        registryObjectNames.add(objName);
+      }
+    }
+
+    const missing: string[] = [];
+
+    for (const specFile of specFiles) {
+      const specPath = join(specDir, specFile);
+      if (!existsSync(specPath)) continue;
+
+      const spec = readFileSync(specPath, "utf-8");
+
+      // Match CDDL-style definitions: "ObjectName = {" or "ObjectName = ["
+      // These are the normative wire object definitions in the specs.
+      const cddlRegex = /^(\w+)\s*=\s*[{[]/gm;
+      let match: RegExpExecArray | null;
+
+      while ((match = cddlRegex.exec(spec)) !== null) {
+        const objName = match[1]!;
+
+        // Skip non-object constructs (keywords, comments, etc.)
+        // These are common spec words that appear before `{` but are not
+        // CDDL object definitions.
+        const skipNames = new Set([
+          "PathValidationResult", // this one IS in the registry already
+          "RouteProposal", "RouteHop", "RouteAcceptance", "RouteCommitment",
+          "CommittedRoute", "SignedRouteProposal",
+        ]);
+        // Actually we should NOT skip — we should check ALL of them.
+        // Let me just check if the object name is in the registry.
+        if (!registryObjectNames.has(objName)) {
+          // Check if it's a known sub-object or a spec-only name that
+          // isn't a wire object (e.g. "PathValidationResult" body)
+          // We allow a small allowlist of known non-registry constructs
+          const knownNonRegistry = new Set([
+            // These are spec constructs that are NOT protocol objects:
+            "PathValidationResult", // IS in registry
+            "if", "for", "while", // code blocks
+          ]);
+          if (!knownNonRegistry.has(objName)) {
+            // Check more carefully — is this really a CDDL object definition
+            // or just a markdown table/code fence?
+            // Only flag if it looks like a real wire object (has fields inside)
+            const afterMatch = spec.slice(match.index! + match[0].length);
+            const hasFields = /^\s*\w+:/m.test(afterMatch);
+            if (hasFields && !missing.includes(objName)) {
+              missing.push(objName);
+            }
+          }
+        }
+      }
+    }
+
+    // If this fails, a CDDL object was defined in a normative spec but
+    // is not present in the protocol registry. Either add the object to
+    // spec/schemas/protocol-registry.json or remove the CDDL definition
+    // from the spec.
+    expect(missing).toEqual([]);
+  });
 });

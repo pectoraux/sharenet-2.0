@@ -1,0 +1,26 @@
+{
+  "id": "V-DISCOVERY-001",
+  "status": "frozen",
+  "spec": "spec/05-discovery.md §2",
+  "adr": "adr/0006-sequence-floor-persistence.md",
+  "description": "Canonical CandidateDestination encoding. CandidateDestination is the output of the Discovery phase — it carries node identity hints, endpoint hints, distance hints, and evidence type. This vector freezes the canonical CBOR encoding and field layout for cross-language conformance.",
+  "statusNote": "frozen — the canonical encoding is frozen here. A TS reference implementation does not yet exist; the vector is verified by the TS runner's manual encoding path and the Python runner's independent implementation.",
+  "vectors": [
+    {
+      "name": "valid-candidate-destination",
+      "description": "A valid CandidateDestination with all fields populated",
+      "input": {
+        "nodeIdHint": "candidate-node-001",
+        "reportedBy": "reporter-node-002",
+        "endpointHints": ["10.0.0.5:7788", "10.0.0.6:7789"],
+        "distanceHint": 2,
+        "lastSeen": 1786876545,
+        "evidenceType": "REPORTED"
+      },
+      "expected": {
+        "canonicalEncodingHex": "a6017263616e6469646174652d6e6f64652d30303102717265706f727465722d6e6f64652d30303203826d31302e302e302e353a373738386d31302e302e302e363a373738390402051a6a81928106685245504f52544544"
+      }
+    }
+  ],
+  "verification": "tests/r007-completeness.test.ts verifies the vector family is in the manifest. TS+Python runners verify the canonical encoding matches."
+}

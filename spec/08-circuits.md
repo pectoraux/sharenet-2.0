@@ -130,26 +130,21 @@ prefixed by a unique domain-separation string. The full set:
 
 No two uses share a domain string (see `spec/14-security.md` §4).
 
-### 4.5 Replay Protection
+### 4.5 Replay Protection (FROZEN — ORDERED_STREAM)
 
-Each frame's `frame_sequence` MUST be strictly increasing. Receivers
-MUST maintain a sliding window of accepted sequences (default:
-window of 64 sequences). Frames outside the window, or with a
-sequence already seen, MUST be dropped.
-
-Sequence floors persist across circuit re-key events (see
-`spec/14-security.md` §3); a re-key MUST continue the counter from
-the prior floor.
-
-#### 4.5.1 Frozen Replay Model (R-008 hardening)
-
-The reference implementation freezes the data-plane replay model as
-**ORDERED_STREAM** semantics:
+The data-plane replay model is **ORDERED_STREAM** (frozen per R-008
+hardening). This supersedes any earlier sliding-window language.
 
 - `frame_sequence` is strictly increasing per circuit (starts at 1).
 - A receiver rejects any frame whose sequence is `<=` the highest
   sequence already accepted on that circuit.
 - There is no out-of-order acceptance window: gap tolerance is 0.
+- There is no sliding window. The earlier "window of 64 sequences"
+  language is **superseded** and MUST NOT be implemented.
+
+Sequence floors persist across circuit re-key events (see
+`spec/14-security.md` §3); a re-key MUST continue the counter from
+the prior floor.
 
 This freeze is recorded as the constant `CIRCUIT_REPLAY_MODEL =
 "ORDERED_STREAM"` in `reference/circuit/circuit.ts` and is asserted by

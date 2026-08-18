@@ -1297,6 +1297,42 @@ function verifyTopologyPropagationVector(data: any): VectorResult {
   };
 }
 
+function verifyDiscoveryVector(data: any): VectorResult {
+  const vectors = data.vectors || [];
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const inp = v.input;
+      const m = new Map<number, unknown>([
+        [1, inp.nodeIdHint],
+        [2, inp.reportedBy],
+        [3, inp.endpointHints],
+        [4, inp.distanceHint],
+        [5, inp.lastSeen],
+        [6, inp.evidenceType],
+      ]);
+      const encoded = canonicalEncode(m);
+      const actualHex = toHex(encoded);
+      if (actualHex !== v.expected.canonicalEncodingHex) {
+        allOk = false;
+        failures.push(`${v.name}: ${actualHex} != ${v.expected.canonicalEncodingHex}`);
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} discovery vectors match`,
+    actual: allOk ? `${vectors.length} discovery vectors match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
 // Main
 const files = walkJsonFiles(vectorsDir);
 const results: VectorResult[] = [];
@@ -1345,6 +1381,8 @@ for (const file of files) {
     result = verifyPathValidationVector(data);
   } else if (data.id?.startsWith("V-TOPOLOGY-PROPAGATION-")) {
     result = verifyTopologyPropagationVector(data);
+  } else if (data.id?.startsWith("V-DISCOVERY-")) {
+    result = verifyDiscoveryVector(data);
   } else if (data.id === "MANIFEST" || data.file === "MANIFEST.json") {
     // Manifest is metadata, not a protocol vector — skip it
     result = { id: data.id ?? file, passed: true, expected: "manifest metadata", actual: "manifest (not a protocol vector)" };

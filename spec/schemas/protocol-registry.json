@@ -16,6 +16,7 @@
       "objects": {
         "NodeId": { "kind": "wire", "conformance_vector_family": "V-NODEID", "description": "BLAKE3-256 + RFC 4648 base32 NodeId derivation" },
         "NodeAdvertisement": { "kind": "wire", "conformance_vector_family": "V-ADV", "description": "Signed node advertisement with capabilities + endpoints" },
+        "ShareNetAdvertisement": { "kind": "sub_object", "conformance_vector_family": "V-ADV", "description": "Spec CDDL name for NodeAdvertisement (spec/03 §3) — same object, covered by V-ADV" },
         "VerifiedNodeAdvertisement": { "kind": "state", "conformance_vector_family": "V-ADV", "description": "WeakSet-verified advertisement proof artifact — not wire-serializable" },
         "AuthenticatedNodeRecord": { "kind": "state", "conformance_vector_family": "V-ADV", "description": "WeakSet-registered authenticated node record — local proof artifact, not wire-serializable" }
       }
@@ -43,7 +44,8 @@
       "objects": {
         "RemoteNodeHint": { "kind": "wire", "conformance_vector_family": "V-HINT", "description": "Signed discovery hint with hopCount, freshness, nonce" },
         "HintBody": { "kind": "sub_object", "conformance_vector_family": "V-HINT", "description": "Canonical CBOR body of a RemoteNodeHint — covered by V-HINT" },
-        "HintPropagationRules": { "kind": "rule", "conformance_vector_family": "V-TOPOLOGY-PROPAGATION", "description": "MAX_HINT_HOPS, freshness decay, replay rejection — tested by V-TOPOLOGY-PROPAGATION behavioral vectors" }
+        "HintPropagationRules": { "kind": "rule", "conformance_vector_family": "V-TOPOLOGY-PROPAGATION", "description": "MAX_HINT_HOPS, freshness decay, replay rejection — tested by V-TOPOLOGY-PROPAGATION behavioral vectors" },
+        "CandidateDestination": { "kind": "wire", "conformance_vector_family": "V-DISCOVERY", "description": "Discovery output: node_id_hint, reported_by, endpoint_hints, distance_hint, last_seen, evidence_type (spec/05 §2)" }
       }
     },
     "routing": {
@@ -70,7 +72,9 @@
       "objects": {
         "CircuitId": { "kind": "wire", "conformance_vector_family": "V-CIRCUIT", "description": "BLAKE3-256 derivation + HKDF hop key derivation + nonce layout + replay guard" },
         "CircuitSetupRequest": { "kind": "wire", "conformance_vector_family": "V-CIRCUIT-SETUP", "description": "Initiator→Relay setup message: route, hopIndex, initiator X25519 pubkey, nonce" },
-        "CircuitSetupAck": { "kind": "wire", "conformance_vector_family": "V-CIRCUIT-ACK", "description": "Relay→Initiator ack: relay X25519 pubkey, possession proof, freshness bounds" }
+        "CircuitSetupAck": { "kind": "wire", "conformance_vector_family": "V-CIRCUIT-ACK", "description": "Relay→Initiator ack: relay X25519 pubkey, possession proof, freshness bounds" },
+        "CircuitPossessionProof": { "kind": "wire", "conformance_vector_family": "V-CIRCUIT-ACK", "description": "Relay's Ed25519 signature proving possession of the AEAD key — carried within CircuitSetupAck, tested by V-CIRCUIT-ACK vectors" },
+        "CircuitFrame": { "kind": "rule", "conformance_vector_family": "V-CIRCUIT", "description": "Data-plane AEAD frame construction: nonce layout (route_id_prefix || frame_sequence), AD = domain || commitment_root || seq || direction. Not a separate typed object — the construction is tested by V-CIRCUIT nonce-layout and replay-guard vectors." }
       }
     },
     "gateway": {
@@ -81,14 +85,18 @@
         "GatewayResponseFrame": { "kind": "wire", "conformance_vector_family": "V-GATEWAY", "description": "CBOR-encoded response frame crossing the gateway→relay→source boundary" },
         "ServiceMeasurement": { "kind": "wire", "conformance_vector_family": "V-GATEWAY", "description": "Signed gateway service measurement (bytes sent/received, timestamps, HTTP status)" },
         "GatewayAuditEvent": { "kind": "wire", "conformance_vector_family": "V-GATEWAY", "description": "Structured audit event with dedicated signature domain" },
-        "GatewayCapacity": { "kind": "state", "conformance_vector_family": "V-GATEWAY", "description": "In-memory capacity state — not wire-serialized, tested by V-GATEWAY policy vectors" }
+        "GatewayCapacity": { "kind": "state", "conformance_vector_family": "V-GATEWAY", "description": "In-memory capacity state — not wire-serialized, tested by V-GATEWAY policy vectors" },
+        "GatewayCapability": { "kind": "sub_object", "conformance_vector_family": "V-GATEWAY", "description": "Self-attested INTERNET_GATEWAY capability in NodeAdvertisement — covered by V-ADV + V-GATEWAY" },
+        "GatewayAuthorization": { "kind": "rule", "conformance_vector_family": "V-GATEWAY", "description": "Revocable authorization — implemented as runtime policy evaluation, not a separate signed wire object. Tested by V-GATEWAY policy vectors." },
+        "GatewayServiceAgreement": { "kind": "sub_object", "conformance_vector_family": "V-SVC", "description": "Spec/09 §3.1 defines a dual-signed agreement; the implementation uses ServiceAgreement (unsigned routing-internal). Covered by V-SVC policy vectors. Structural reconciliation is future work." }
       }
     },
     "economics": {
       "spec_ref": "spec/11-contribution.md",
       "objects": {
         "BilateralReceipt": { "kind": "wire", "conformance_vector_family": "V-RECEIPT", "description": "Dual-signed receipt: gateway + peer signatures over service session" },
-        "ContributionProof": { "kind": "wire", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Derived proof from verified receipt: receiptHash, contributor, bytesForwarded" }
+        "ContributionProof": { "kind": "wire", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Derived proof from verified receipt: receiptHash, contributor, bytesForwarded" },
+        "LedgerEntry": { "kind": "sub_object", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Ledger entry wrapping a ContributionProof with sequence + timestamp — covered by V-CONTRIBUTION-PROOF. Note: spec/11 §4 defines a hash-chained variant; the implementation uses a simpler append-only structure. Structural reconciliation is future work." }
       }
     }
   }

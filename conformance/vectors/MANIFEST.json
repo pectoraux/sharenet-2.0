@@ -218,6 +218,13 @@
       "schema_version": "1",
       "expected_result": "RemoteNodeHint propagation limits: valid + hopCount overflow + stale freshness",
       "file": "V-TOPOLOGY-PROPAGATION-001.json"
+    },
+    {
+      "id": "V-DISCOVERY-001",
+      "protocol": "discovery",
+      "schema_version": "1",
+      "expected_result": "canonical CandidateDestination encoding",
+      "file": "V-DISCOVERY-001.json"
     }
   ]
 }
