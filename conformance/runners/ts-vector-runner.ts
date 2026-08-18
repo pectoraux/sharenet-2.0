@@ -85,6 +85,14 @@ import {
   receiptSigningPayload,
   type BilateralReceipt,
 } from "@reference/economics/contribution";
+import {
+  createPathValidationResult,
+  encodePathValidationBody,
+  pathValidationSigningPayload,
+  verifyPathValidationResult,
+  encodePathValidationWire,
+  type PathValidationBody,
+} from "@reference/routing/path-validation";
 
 interface VectorResult {
   id: string;
@@ -1071,25 +1079,52 @@ function verifyContributionProofVector(data: any): VectorResult {
 }
 
 // ---------------------------------------------------------------------------
-// V-PATH-VALIDATION-001 — PathValidationResult canonical encoding (spec-only).
-// No TS implementation exists in reference/. This vector FREEZES the expected
-// canonical encoding. Body = canonicalEncode({
-//   1: source_id, 2: next_hop_id, 3: destination_id,
-//   4: measured_rtt_ms, 5: measured_loss_pct, 6: valid_until
-// }). Signing payload = utf8(SHARENET/PATH/VALIDATION/1) || body.
-// Wire object = canonicalEncode({1..6, 7: signature(bstr .size 64)}).
-// We verify: (a) recomputed bodyHex matches, (b) recomputed signingPayloadHex
-// matches, (c) the Ed25519 signature verifies under the source public key,
-// (d) the recomputed wireHex matches.
+// V-PATH-VALIDATION-001 — PathValidationResult canonical encoding (FROZEN).
+// Real implementation: reference/routing/path-validation.ts.
+// Body = encodePathValidationBody({ sourceNodeId, nextHopNodeId,
+//   destinationNodeId, measuredRttMs, measuredLossPct, validUntil }).
+// Signing payload = pathValidationSigningPayload(body) =
+//   utf8(SHARENET/PATH/VALIDATION/1) || body.
+// Result = createPathValidationResult(body, sourceSecretKey) — body + signature.
+// Wire object = encodePathValidationWire(result) = canonicalEncode({
+//   1..6 body fields, 7: signature(bstr .size 64) }).
+// We verify end-to-end: (a) recomputed bodyHex matches intermediate.bodyHex,
+// (b) recomputed signingPayloadHex matches intermediate.signingPayloadHex,
+// (c) createPathValidationResult(body, secretKey).signature matches
+//   intermediate.signatureHex, (d) verifyPathValidationResult(result, publicKey)
+//   returns true, (e) recomputed wireHex matches expected.wireHex.
+// The source keypair is reproduced from sharedKeys.sourceSeedHex via
+// keypairFromSecretKey — the same seed committed in the vector file.
 // ---------------------------------------------------------------------------
-
-const PATH_VALIDATION_DOMAIN = "SHARENET/PATH/VALIDATION/1";
 
 function verifyPathValidationVector(data: any): VectorResult {
   const vectors: any[] = data.vectors || [];
-  const sourcePublicKey = hexToBytes(data.sharedKeys.sourcePublicKeyHex);
+  const sourceSeedHex = data.sharedKeys?.sourceSeedHex;
+  const sourcePublicKeyHex = data.sharedKeys?.sourcePublicKeyHex;
   let allOk = true;
   const failures: string[] = [];
+
+  if (!sourceSeedHex) {
+    return {
+      id: data.id,
+      passed: false,
+      expected: "sharedKeys.sourceSeedHex present",
+      actual: "missing sharedKeys.sourceSeedHex — vector is not reproducible",
+    };
+  }
+
+  // Reproduce the source keypair from the seed committed in the vector file.
+  const keypair = keypairFromSecretKey(hexToBytes(sourceSeedHex));
+
+  // Cross-check the public key matches what the vector claims.
+  if (sourcePublicKeyHex && bytesToHex(keypair.publicKey) !== sourcePublicKeyHex) {
+    return {
+      id: data.id,
+      passed: false,
+      expected: `sourcePublicKeyHex ${sourcePublicKeyHex}`,
+      actual: `keypairFromSecretKey(seed) produced ${bytesToHex(keypair.publicKey)}`,
+    };
+  }
 
   for (const v of vectors) {
     try {
@@ -1097,31 +1132,28 @@ function verifyPathValidationVector(data: any): VectorResult {
       const intermediate = v.intermediate ?? {};
       const expected = v.expected;
 
-      // Build the body map (keys 1-6).
-      const bodyMap = new Map<number, unknown>([
-        [1, input.source_id],
-        [2, input.next_hop_id],
-        [3, input.destination_id],
-        [4, input.measured_rtt_ms],
-        [5, input.measured_loss_pct],
-        [6, input.valid_until],
-      ]);
-      const bodyBytes = canonicalEncode(bodyMap);
-      const bodyHex = toHex(bodyBytes);
+      // Build the body using the implementation's interface.
+      const body: PathValidationBody = {
+        sourceNodeId: input.source_id,
+        nextHopNodeId: input.next_hop_id,
+        destinationNodeId: input.destination_id,
+        measuredRttMs: input.measured_rtt_ms,
+        measuredLossPct: input.measured_loss_pct,
+        validUntil: input.valid_until,
+      };
 
+      // (a) encodePathValidationBody → bodyHex
+      const bodyBytes = encodePathValidationBody(body);
+      const bodyHex = toHex(bodyBytes);
       if (intermediate.bodyHex && bodyHex !== intermediate.bodyHex) {
         allOk = false;
         failures.push(`${v.name}: bodyHex ${bodyHex} != ${intermediate.bodyHex}`);
         continue;
       }
 
-      // Signing payload = domain || body.
-      const domainBytes = new TextEncoder().encode(PATH_VALIDATION_DOMAIN);
-      const signingPayload = new Uint8Array(domainBytes.length + bodyBytes.length);
-      signingPayload.set(domainBytes, 0);
-      signingPayload.set(bodyBytes, domainBytes.length);
+      // (b) pathValidationSigningPayload → signingPayloadHex
+      const signingPayload = pathValidationSigningPayload(body);
       const signingPayloadHex = toHex(signingPayload);
-
       if (
         intermediate.signingPayloadHex &&
         signingPayloadHex !== intermediate.signingPayloadHex
@@ -1133,28 +1165,28 @@ function verifyPathValidationVector(data: any): VectorResult {
         continue;
       }
 
-      // Verify the Ed25519 signature against the source public key.
-      const signature = hexToBytes(intermediate.signatureHex);
-      const sigValid = verifySignature(sourcePublicKey, signingPayload, signature);
-      if (!sigValid) {
+      // (c) createPathValidationResult(body, secretKey) — signature must match.
+      const result = createPathValidationResult(body, keypair.secretKey);
+      const sigHex = bytesToHex(result.signature);
+      if (intermediate.signatureHex && sigHex !== intermediate.signatureHex) {
         allOk = false;
-        failures.push(`${v.name}: signature did not verify under source public key`);
+        failures.push(
+          `${v.name}: signatureHex ${sigHex} != ${intermediate.signatureHex}`,
+        );
         continue;
       }
 
-      // Build the full wire object (keys 1-7, with signature as field 7).
-      const wireMap = new Map<number, unknown>([
-        [1, input.source_id],
-        [2, input.next_hop_id],
-        [3, input.destination_id],
-        [4, input.measured_rtt_ms],
-        [5, input.measured_loss_pct],
-        [6, input.valid_until],
-        [7, signature],
-      ]);
-      const wireBytes = canonicalEncode(wireMap);
-      const wireHex = toHex(wireBytes);
+      // (d) verifyPathValidationResult → true under the source public key.
+      const verifyOk = verifyPathValidationResult(result, keypair.publicKey);
+      if (!verifyOk) {
+        allOk = false;
+        failures.push(`${v.name}: verifyPathValidationResult returned false`);
+        continue;
+      }
 
+      // (e) encodePathValidationWire → wireHex
+      const wireBytes = encodePathValidationWire(result);
+      const wireHex = toHex(wireBytes);
       if (expected.wireHex && wireHex !== expected.wireHex) {
         allOk = false;
         failures.push(`${v.name}: wireHex ${wireHex} != ${expected.wireHex}`);
@@ -1167,8 +1199,10 @@ function verifyPathValidationVector(data: any): VectorResult {
   return {
     id: data.id,
     passed: allOk,
-    expected: `${vectors.length} path-validation cases match`,
-    actual: allOk ? `${vectors.length} path-validation cases match` : `FAILED: ${failures.join("; ")}`,
+    expected: `${vectors.length} path-validation cases match (real implementation)`,
+    actual: allOk
+      ? `${vectors.length} path-validation cases match (real implementation)`
+      : `FAILED: ${failures.join("; ")}`,
   };
 }
 

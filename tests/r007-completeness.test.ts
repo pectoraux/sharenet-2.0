@@ -6,15 +6,20 @@
  *   "adding a new normative protocol object without adding a conformance
  *    vector MUST fail CI automatically."
  *
- * This test reads the canonical protocol-schema registry
- * (`spec/schemas/protocol-registry.json`) and derives the required vector
- * families from it — NOT from a hard-coded list. Every object in the
- * registry declares a `conformance_vector_family` prefix; the test
- * verifies that the MANIFEST contains at least one entry matching each
- * prefix.
+ * This test enforces the FULL end-to-end chain:
  *
- * If a new protocol object is added to the registry without a
- * corresponding vector family in the manifest, this test fails.
+ *   registry ↔ manifest ↔ TS runner ↔ Python runner
+ *
+ *   1. Every `kind: "wire"` object in the registry has at least one
+ *      vector in the manifest with a matching ID prefix.
+ *   2. Every manifest vector ID has a dispatch branch in BOTH the TS
+ *      runner (`conformance/runners/ts-vector-runner.ts`) AND the Python
+ *      runner (`conformance/runners/py_vector_verifier.py`).
+ *   3. Dispatch prefixes are EXTRACTED FROM THE RUNNER SOURCE FILES
+ *      (not hard-coded in this test) by regex-matching the
+ *      `.startsWith("V-…")` calls — so adding a new vector family
+ *      requires a corresponding branch in BOTH runners or this test
+ *      fails.
  */
 
 import { describe, test, expect } from "bun:test";
@@ -26,6 +31,11 @@ const MANIFEST = JSON.parse(readFileSync(MANIFEST_PATH, "utf-8"));
 
 const REGISTRY_PATH = join(process.cwd(), "spec", "schemas", "protocol-registry.json");
 const REGISTRY = JSON.parse(readFileSync(REGISTRY_PATH, "utf-8"));
+
+const TS_RUNNER_PATH = join(process.cwd(), "conformance", "runners", "ts-vector-runner.ts");
+const PY_RUNNER_PATH = join(process.cwd(), "conformance", "runners", "py_vector_verifier.py");
+const TS_RUNNER_SRC = readFileSync(TS_RUNNER_PATH, "utf-8");
+const PY_RUNNER_SRC = readFileSync(PY_RUNNER_PATH, "utf-8");
 
 /**
  * Derive the set of required vector-family prefixes from the protocol
@@ -44,15 +54,72 @@ function getRequiredVectorFamilies(): Set<string> {
 }
 
 /**
+ * Derive the set of vector families required specifically for `kind: "wire"`
+ * objects. Wire objects cross a process/network/language boundary and so
+ * MUST have a conformance vector. (sub_object / state / rule kinds are
+ * covered by their parent wire object's vector family — they don't need
+ * their own.)
+ */
+function getRequiredWireVectorFamilies(): Set<string> {
+  const families = new Set<string>();
+  for (const layer of Object.values(REGISTRY.layers)) {
+    for (const obj of Object.values((layer as any).objects)) {
+      if ((obj as any).kind === "wire") {
+        const family = (obj as any).conformance_vector_family;
+        if (family) families.add(family);
+      }
+    }
+  }
+  return families;
+}
+
+/**
  * Get all vector IDs from the manifest.
  */
 function getManifestVectorIds(): string[] {
   return MANIFEST.vectors.map((v: any) => v.id);
 }
 
+/**
+ * Extract dispatch prefixes from the TS runner source.
+ *
+ * The TS runner dispatches on `data.id?.startsWith("V-…")`. We regex-match
+ * every such call and collect the unique set of prefix literals.
+ */
+function getTsRunnerDispatchPrefixes(): Set<string> {
+  const out = new Set<string>();
+  // Match: .startsWith("V-PREFIX")
+  const re = /\.startsWith\(\s*"([^"]+)"\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(TS_RUNNER_SRC)) !== null) {
+    const lit = m[1]!;
+    if (lit.startsWith("V-")) out.add(lit);
+  }
+  return out;
+}
+
+/**
+ * Extract dispatch prefixes from the Python runner source.
+ *
+ * The Python runner dispatches on `vid.startswith("V-…")`. We regex-match
+ * every such call and collect the unique set of prefix literals.
+ */
+function getPyRunnerDispatchPrefixes(): Set<string> {
+  const out = new Set<string>();
+  // Match: .startswith("V-PREFIX")
+  const re = /\.startswith\(\s*"([^"]+)"\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(PY_RUNNER_SRC)) !== null) {
+    const lit = m[1]!;
+    if (lit.startsWith("V-")) out.add(lit);
+  }
+  return out;
+}
+
 describe("R-007: Registry-driven vector completeness", () => {
   test("protocol registry is valid JSON with the expected structure", () => {
-    expect(REGISTRY.version).toBe(1);
+    expect(REGISTRY.version).toBe(2);
+    expect(REGISTRY.object_kinds).toBeDefined();
     expect(REGISTRY.layers).toBeDefined();
     expect(Object.keys(REGISTRY.layers).length).toBeGreaterThan(0);
   });
@@ -78,6 +145,26 @@ describe("R-007: Registry-driven vector completeness", () => {
     // If this fails, a protocol object was added to the registry without
     // a corresponding conformance vector family. Add the vector file +
     // manifest entry, or remove the object from the registry.
+    expect(missing).toEqual([]);
+  });
+
+  test("every `kind: \"wire\" registry object has a corresponding vector in the manifest", () => {
+    // Wire objects cross a process/network/language boundary — they are the
+    // hard requirement. sub_object / state / rule kinds are covered by their
+    // parent's vector family and don't need their own manifest entry.
+    const wireFamilies = getRequiredWireVectorFamilies();
+    const manifestIds = getManifestVectorIds();
+    const missing: string[] = [];
+
+    for (const family of wireFamilies) {
+      const hasVector = manifestIds.some((id) => id.startsWith(family));
+      if (!hasVector) {
+        missing.push(family);
+      }
+    }
+
+    // If this fails, a wire object was added to the registry without a
+    // corresponding conformance vector. Wire objects MUST have a vector.
     expect(missing).toEqual([]);
   });
 
@@ -108,5 +195,96 @@ describe("R-007: Registry-driven vector completeness", () => {
         expect((obj as any).conformance_vector_family).toBeDefined();
       }
     }
+  });
+
+  // -----------------------------------------------------------------
+  // End-to-end chain: manifest ↔ TS runner ↔ Python runner.
+  //
+  // Every manifest vector ID must be dispatched by BOTH the TS runner
+  // and the Python runner. Dispatch prefixes are extracted from the
+  // runner source files by regex-matching the `.startsWith("V-…")`
+  // calls — not hard-coded here.
+  // -----------------------------------------------------------------
+
+  test("TS runner source has at least one dispatch branch", () => {
+    const tsPrefixes = getTsRunnerDispatchPrefixes();
+    expect(tsPrefixes.size).toBeGreaterThan(0);
+  });
+
+  test("Python runner source has at least one dispatch branch", () => {
+    const pyPrefixes = getPyRunnerDispatchPrefixes();
+    expect(pyPrefixes.size).toBeGreaterThan(0);
+  });
+
+  test("every manifest vector ID is dispatched by the TS runner", () => {
+    const tsPrefixes = getTsRunnerDispatchPrefixes();
+    const manifestIds = getManifestVectorIds();
+    const undispatched: string[] = [];
+
+    for (const id of manifestIds) {
+      const matched = [...tsPrefixes].some((p) => id.startsWith(p));
+      if (!matched) {
+        undispatched.push(id);
+      }
+    }
+
+    // If this fails, a vector was added to the manifest without a
+    // corresponding `data.id?.startsWith("V-…")` branch in
+    // conformance/runners/ts-vector-runner.ts. Add the dispatch branch.
+    expect(undispatched).toEqual([]);
+  });
+
+  test("every manifest vector ID is dispatched by the Python runner", () => {
+    const pyPrefixes = getPyRunnerDispatchPrefixes();
+    const manifestIds = getManifestVectorIds();
+    const undispatched: string[] = [];
+
+    for (const id of manifestIds) {
+      const matched = [...pyPrefixes].some((p) => id.startsWith(p));
+      if (!matched) {
+        undispatched.push(id);
+      }
+    }
+
+    // If this fails, a vector was added to the manifest without a
+    // corresponding `vid.startswith("V-…")` branch in
+    // conformance/runners/py_vector_verifier.py. Add the dispatch branch.
+    expect(undispatched).toEqual([]);
+  });
+
+  test("TS runner and Python runner dispatch the same set of vector prefixes", () => {
+    const tsPrefixes = getTsRunnerDispatchPrefixes();
+    const pyPrefixes = getPyRunnerDispatchPrefixes();
+
+    const onlyTs = [...tsPrefixes].filter((p) => !pyPrefixes.has(p));
+    const onlyPy = [...pyPrefixes].filter((p) => !tsPrefixes.has(p));
+
+    // If this fails, the two runners have diverged: one has a dispatch
+    // branch the other is missing. Cross-language conformance requires
+    // both runners to dispatch the same set of vector families.
+    expect({ onlyTs, onlyPy }).toEqual({ onlyTs: [], onlyPy: [] });
+  });
+
+  test("every manifest vector ID prefix is backed by a registry family declaration", () => {
+    // Reverse direction of the existing registry→manifest test:
+    // every manifest ID's prefix must come from a registry family.
+    // This catches "phantom" manifest entries that have no corresponding
+    // registry object (orphan vectors).
+    const requiredFamilies = getRequiredVectorFamilies();
+    const manifestIds = getManifestVectorIds();
+    const orphans: string[] = [];
+
+    for (const id of manifestIds) {
+      const matched = [...requiredFamilies].some((f) => id.startsWith(f));
+      if (!matched) {
+        orphans.push(id);
+      }
+    }
+
+    // If this fails, a manifest vector ID has no corresponding
+    // conformance_vector_family in the registry. Either add the family
+    // to the registry (if it is a real protocol object) or remove the
+    // orphan vector from the manifest.
+    expect(orphans).toEqual([]);
   });
 });

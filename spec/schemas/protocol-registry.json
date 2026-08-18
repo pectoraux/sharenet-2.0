@@ -2,132 +2,93 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "sharenet://spec/protocol-registry",
   "title": "ShareNet 2.0 Protocol Object Registry (FROZEN)",
-  "description": "Canonical machine-readable registry of ALL normative protocol objects that can cross an implementation boundary. Each object declares its required conformance vector family. The completeness test derives its requirements from this file — adding a new object without a corresponding vector family MUST fail CI.",
-  "version": 1,
+  "description": "Canonical machine-readable registry of ALL normative protocol objects. Each object declares its kind (wire/state/rule), conformance vector family, and spec reference. The completeness test derives its requirements from this file — adding a new wire object without a corresponding vector family MUST fail CI automatically.",
+  "version": 2,
+  "object_kinds": {
+    "wire": "Object that crosses a process/network/language boundary. Requires a conformance vector family.",
+    "state": "In-memory proof artifact (WeakSet-bound). Does NOT cross boundaries. No wire vector required, but behavior is tested by existing vectors.",
+    "rule": "A protocol rule or invariant (e.g. propagation limits). Not an object. Tested by behavioral vectors.",
+    "sub_object": "A structural sub-element of a wire object (e.g. RouteHop). Covered by the parent object's vector."
+  },
   "layers": {
     "identity": {
       "spec_ref": "spec/02-identity.md",
       "objects": {
-        "NodeId": {
-          "conformance_vector_family": "V-NODEID",
-          "description": "BLAKE3-256 + RFC 4648 base32 NodeId derivation"
-        },
-        "NodeAdvertisement": {
-          "conformance_vector_family": "V-ADV",
-          "description": "Signed node advertisement with capabilities + endpoints"
-        },
-        "VerifiedNodeAdvertisement": {
-          "conformance_vector_family": "V-ADV",
-          "description": "WeakSet-verified advertisement proof artifact"
-        }
+        "NodeId": { "kind": "wire", "conformance_vector_family": "V-NODEID", "description": "BLAKE3-256 + RFC 4648 base32 NodeId derivation" },
+        "NodeAdvertisement": { "kind": "wire", "conformance_vector_family": "V-ADV", "description": "Signed node advertisement with capabilities + endpoints" },
+        "VerifiedNodeAdvertisement": { "kind": "state", "conformance_vector_family": "V-ADV", "description": "WeakSet-verified advertisement proof artifact — not wire-serializable" },
+        "AuthenticatedNodeRecord": { "kind": "state", "conformance_vector_family": "V-ADV", "description": "WeakSet-registered authenticated node record — local proof artifact, not wire-serializable" }
       }
     },
     "encoding": {
-      "spec_ref": "spec/04-links.md (ADR-0004)",
+      "spec_ref": "ADR-0004",
       "objects": {
-        "CanonicalCBOR": {
-          "conformance_vector_family": "V-CBOR",
-          "description": "RFC 8949 §4.2.2 deterministic CBOR encoding"
-        }
+        "CanonicalCBOR": { "kind": "wire", "conformance_vector_family": "V-CBOR", "description": "RFC 8949 §4.2.2 deterministic CBOR encoding" }
       }
     },
     "link": {
       "spec_ref": "spec/04-links.md",
       "objects": {
-        "LinkHandshake": {
-          "conformance_vector_family": "V-LINK-HANDSHAKE",
-          "description": "3-message Initiate→Accept→Confirm handshake with possession proofs"
-        },
-        "AuthenticatedLink": {
-          "conformance_vector_family": "V-LINK-AUTH",
-          "description": "Proof-carrying authenticated link artifact (WeakSet-registered)"
-        }
+        "LinkHandshake": { "kind": "wire", "conformance_vector_family": "V-LINK-HANDSHAKE", "description": "3-message Initiate→Accept→Confirm handshake with possession proofs" },
+        "InitiateMessage": { "kind": "sub_object", "conformance_vector_family": "V-LINK-HANDSHAKE", "description": "Sub-message of LinkHandshake — covered by V-LINK-HANDSHAKE" },
+        "AcceptMessage": { "kind": "sub_object", "conformance_vector_family": "V-LINK-HANDSHAKE", "description": "Sub-message of LinkHandshake — covered by V-LINK-HANDSHAKE" },
+        "ConfirmMessage": { "kind": "sub_object", "conformance_vector_family": "V-LINK-HANDSHAKE", "description": "Sub-message of LinkHandshake — covered by V-LINK-HANDSHAKE" },
+        "AuthenticatedLink": { "kind": "state", "conformance_vector_family": "V-LINK-AUTH", "description": "WeakSet-registered authenticated link artifact — local proof, not wire-serializable. Behavior tested by V-LINK-AUTH vectors." },
+        "ConsumedChallenge": { "kind": "state", "conformance_vector_family": "V-LINK-AUTH", "description": "WeakSet-registered freshness proof — not wire-serializable" },
+        "VerifiedTranscript": { "kind": "state", "conformance_vector_family": "V-LINK-AUTH", "description": "WeakSet-registered transcript proof — not wire-serializable" }
       }
     },
     "topology": {
       "spec_ref": "spec/06-topology.md",
       "objects": {
-        "RemoteNodeHint": {
-          "conformance_vector_family": "V-HINT",
-          "description": "Signed discovery hint with hopCount, freshness, nonce"
-        },
-        "HintPropagation": {
-          "conformance_vector_family": "V-TOPOLOGY-PROPAGATION",
-          "description": "Bounded propagation with MAX_HINT_HOPS, freshness decay, replay rejection"
-        }
+        "RemoteNodeHint": { "kind": "wire", "conformance_vector_family": "V-HINT", "description": "Signed discovery hint with hopCount, freshness, nonce" },
+        "HintBody": { "kind": "sub_object", "conformance_vector_family": "V-HINT", "description": "Canonical CBOR body of a RemoteNodeHint — covered by V-HINT" },
+        "HintPropagationRules": { "kind": "rule", "conformance_vector_family": "V-TOPOLOGY-PROPAGATION", "description": "MAX_HINT_HOPS, freshness decay, replay rejection — tested by V-TOPOLOGY-PROPAGATION behavioral vectors" }
       }
     },
     "routing": {
       "spec_ref": "spec/07-routing.md",
       "objects": {
-        "SignedRouteProposal": {
-          "conformance_vector_family": "V-ROUTE-PROPOSAL",
-          "description": "Canonical signed wire object: { proposal, signature }"
-        },
-        "RouteAcceptance": {
-          "conformance_vector_family": "V-ROUTE-COMMIT",
-          "description": "Per-hop signed acceptance binding proposal/hop/service digests — covered by V-ROUTE-COMMIT-001 which tests the full commitment including acceptance verification"
-        },
-        "RouteCommitment": {
-          "conformance_vector_family": "V-ROUTE-COMMIT",
-          "description": "Merkle commitment root + source signature + commitment nonce"
-        },
-        "PathValidationResult": {
-          "conformance_vector_family": "V-PATH-VALIDATION",
-          "description": "Per-link measurement: RTT, loss, valid_until, source signature"
-        }
+        "RouteProposal": { "kind": "sub_object", "conformance_vector_family": "V-ROUTE-PROPOSAL", "description": "Unsigned inner proposal — covered by V-ROUTE-PROPOSAL (signed wire object)" },
+        "SignedRouteProposal": { "kind": "wire", "conformance_vector_family": "V-ROUTE-PROPOSAL", "description": "Canonical signed wire object: { proposal, signature }" },
+        "RouteHop": { "kind": "sub_object", "conformance_vector_family": "V-ROUTE-COMMIT", "description": "Hop descriptor sub-element — covered by V-ROUTE-COMMIT" },
+        "RouteAcceptance": { "kind": "wire", "conformance_vector_family": "V-ROUTE-COMMIT", "description": "Per-hop signed acceptance binding proposal/hop/service digests" },
+        "RouteCommitment": { "kind": "wire", "conformance_vector_family": "V-ROUTE-COMMIT", "description": "Merkle commitment root + source signature + commitment nonce" },
+        "CommittedRoute": { "kind": "wire", "conformance_vector_family": "V-ROUTE-COMMIT", "description": "State object derived from RouteCommitment — the only input to circuit construction" },
+        "PathValidationResult": { "kind": "wire", "conformance_vector_family": "V-PATH-VALIDATION", "description": "Per-link measurement: RTT, loss, valid_until, source signature" }
       }
     },
     "service": {
       "spec_ref": "spec/09-internet-gateway.md §4",
       "objects": {
-        "ServiceAgreement": {
-          "conformance_vector_family": "V-SVC",
-          "description": "Negotiated service terms: capability, bandwidth, expiry, policyVersion"
-        }
+        "ServiceAgreement": { "kind": "wire", "conformance_vector_family": "V-SVC", "description": "Negotiated service terms: capability, bandwidth, expiry, policyVersion" },
+        "ServiceRequirement": { "kind": "sub_object", "conformance_vector_family": "V-SVC", "description": "Input to service negotiation — hashed into requirementDigest, covered by V-SVC" }
       }
     },
     "circuit": {
       "spec_ref": "spec/08-circuits.md",
       "objects": {
-        "CircuitId": {
-          "conformance_vector_family": "V-CIRCUIT",
-          "description": "BLAKE3-256(route_id || initiator_x25519_pubkey) + HKDF hop key derivation + nonce layout + replay guard"
-        },
-        "CircuitSetupRequest": {
-          "conformance_vector_family": "V-CIRCUIT-SETUP",
-          "description": "Initiator→Relay setup: route, hopIndex, initiator X25519 pubkey, nonce"
-        },
-        "CircuitSetupAck": {
-          "conformance_vector_family": "V-CIRCUIT-ACK",
-          "description": "Relay→Initiator ack: relay X25519 pubkey, possession proof, freshness bounds"
-        }
+        "CircuitId": { "kind": "wire", "conformance_vector_family": "V-CIRCUIT", "description": "BLAKE3-256 derivation + HKDF hop key derivation + nonce layout + replay guard" },
+        "CircuitSetupRequest": { "kind": "wire", "conformance_vector_family": "V-CIRCUIT-SETUP", "description": "Initiator→Relay setup message: route, hopIndex, initiator X25519 pubkey, nonce" },
+        "CircuitSetupAck": { "kind": "wire", "conformance_vector_family": "V-CIRCUIT-ACK", "description": "Relay→Initiator ack: relay X25519 pubkey, possession proof, freshness bounds" }
       }
     },
     "gateway": {
       "spec_ref": "spec/09-internet-gateway.md",
       "objects": {
-        "GatewayPolicy": {
-          "conformance_vector_family": "V-GATEWAY",
-          "description": "Policy evaluation: SSRF/private/loopback/allowlist/quota/rate/bandwidth"
-        },
-        "ServiceMeasurement": {
-          "conformance_vector_family": "V-GATEWAY",
-          "description": "Signed gateway service measurement (bytes sent/received, timestamps, HTTP status)"
-        }
+        "GatewayPolicy": { "kind": "wire", "conformance_vector_family": "V-GATEWAY", "description": "Policy evaluation: SSRF/private/loopback/allowlist/quota/rate/bandwidth" },
+        "GatewayRequestFrame": { "kind": "wire", "conformance_vector_family": "V-GATEWAY", "description": "CBOR-encoded request frame crossing the relay→gateway boundary" },
+        "GatewayResponseFrame": { "kind": "wire", "conformance_vector_family": "V-GATEWAY", "description": "CBOR-encoded response frame crossing the gateway→relay→source boundary" },
+        "ServiceMeasurement": { "kind": "wire", "conformance_vector_family": "V-GATEWAY", "description": "Signed gateway service measurement (bytes sent/received, timestamps, HTTP status)" },
+        "GatewayAuditEvent": { "kind": "wire", "conformance_vector_family": "V-GATEWAY", "description": "Structured audit event with dedicated signature domain" },
+        "GatewayCapacity": { "kind": "state", "conformance_vector_family": "V-GATEWAY", "description": "In-memory capacity state — not wire-serialized, tested by V-GATEWAY policy vectors" }
       }
     },
     "economics": {
       "spec_ref": "spec/11-contribution.md",
       "objects": {
-        "BilateralReceipt": {
-          "conformance_vector_family": "V-RECEIPT",
-          "description": "Dual-signed receipt: gateway + peer signatures over service session"
-        },
-        "ContributionProof": {
-          "conformance_vector_family": "V-CONTRIBUTION-PROOF",
-          "description": "Derived proof from verified receipt: receiptHash, contributor, bytesForwarded"
-        }
+        "BilateralReceipt": { "kind": "wire", "conformance_vector_family": "V-RECEIPT", "description": "Dual-signed receipt: gateway + peer signatures over service session" },
+        "ContributionProof": { "kind": "wire", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Derived proof from verified receipt: receiptHash, contributor, bytesForwarded" }
       }
     }
   }

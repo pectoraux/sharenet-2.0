@@ -1824,7 +1824,13 @@ def verify_contribution_proof_vector(data: dict) -> dict:
 
 
 # -----------------------------------------------------------------------
-# PathValidationResult canonical encoding (spec-only — V-PATH-VALIDATION-001)
+# PathValidationResult canonical encoding (V-PATH-VALIDATION-001 — FROZEN)
+#
+# An INDEPENDENT Python implementation that reproduces the exact bytes the
+# TypeScript reference implementation produces (reference/routing/
+# path-validation.ts). The TS vector now uses status="frozen" with the real
+# implementation as the source of truth; this Python verifier remains an
+# independent cross-check (cbor2 + PyNaCl, no shared code with the TS runner).
 # -----------------------------------------------------------------------
 
 PATH_VALIDATION_DOMAIN = b"SHARENET/PATH/VALIDATION/1"
@@ -1858,9 +1864,12 @@ def encode_path_validation_wire(body: dict, signature: bytes) -> bytes:
 
 
 def verify_path_validation_vector(data: dict) -> dict:
-    """Verify a V-PATH-VALIDATION-* vector (spec-only canonical encoding freeze).
+    """Verify a V-PATH-VALIDATION-* vector (FROZEN — real TS implementation).
 
-    No TS implementation exists in reference/. We verify:
+    The TS reference implementation lives at reference/routing/
+    path-validation.ts. This Python verifier is an INDEPENDENT re-
+    implementation: it uses cbor2 + PyNaCl and shares no code with the TS
+    runner. We verify:
       (a) recomputed bodyHex matches intermediate.bodyHex,
       (b) recomputed signingPayloadHex matches intermediate.signingPayloadHex,
       (c) the Ed25519 signature verifies under the source public key,

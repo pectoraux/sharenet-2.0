@@ -1105,3 +1105,53 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The conformance system is now self-enforcing: adding a new normative protocol object to the registry without a corresponding conformance vector family MUST fail CI automatically.
+
+---
+Task ID: R-007-final-reconciliation
+Agent: main (Z.ai Code)
+Task: R-007 final reconciliation — audit all specs for normative objects, reconcile protocol-registry.json, implement PathValidationResult, strengthen completeness guard to verify registry↔manifest↔TS↔Python end-to-end.
+
+Work Log:
+- Audited ALL normative specs (02/03/04/05/06/07/08/09/11) for cross-boundary protocol objects. Found 14 missing from the registry, 6 implementation-only objects, 5 misclassifications, and 3 critical structural mismatches.
+
+- Reconciled `spec/schemas/protocol-registry.json` (v2):
+  - Added `object_kinds` discriminator: `wire`, `state`, `rule`, `sub_object`
+  - Reclassified `AuthenticatedLink`, `ConsumedChallenge`, `VerifiedTranscript` as `kind: "state"` (WeakSet-bound, not wire-serializable)
+  - Reclassified `HintPropagation` as `kind: "rule"` (protocol rules, not an object)
+  - Added 14 missing objects: `AuthenticatedNodeRecord`, `HintBody`, `InitiateMessage`, `AcceptMessage`, `ConfirmMessage`, `RouteProposal`, `RouteHop`, `CommittedRoute`, `GatewayRequestFrame`, `GatewayResponseFrame`, `GatewayAuditEvent`, `GatewayCapacity`, `ServiceRequirement`, `CandidateDestination` (deferred — no vector yet, tracked as future work)
+  - Each `kind: "wire"` object requires a conformance vector family. `kind: "state"` and `kind: "rule"` objects are covered by behavioral vectors. `kind: "sub_object"` is covered by the parent's vector.
+
+- Implemented `reference/routing/path-validation.ts` — the PathValidationResult reference object:
+  - `PathValidationBody` interface (6 fields per spec/07 §4)
+  - `encodePathValidationBody()` — canonical CBOR (keys 1–6)
+  - `pathValidationSigningPayload()` — domain || body
+  - `createPathValidationResult()` — signs + returns full wire object
+  - `verifyPathValidationResult()` — verifies Ed25519 signature
+  - `encodePathValidationWire()` — full CBOR (keys 1–7)
+  - Domain: `SHARENET/PATH/VALIDATION/1`
+
+- Updated V-PATH-VALIDATION-001.json:
+  - Status: `"spec-only"` → `"frozen"`
+  - Added `implementationRef: "reference/routing/path-validation.ts"`
+  - Added `sharedKeys.sourceSeedHex` for reproducibility
+  - All hex values recomputed from the real implementation
+
+- Updated TS runner: `verifyPathValidationVector` now uses the real implementation functions instead of manual CBOR encoding.
+
+- Strengthened `tests/r007-completeness.test.ts` with 7 new end-to-end chain tests:
+  - Every `kind: "wire"` registry object has a manifest vector
+  - TS runner source has dispatch branches (regex-extracted, not hard-coded)
+  - Python runner source has dispatch branches (regex-extracted)
+  - Every manifest vector ID is dispatched by the TS runner
+  - Every manifest vector ID is dispatched by the Python runner
+  - TS and Python runners dispatch the same set of prefixes (no divergence)
+  - Every manifest vector ID prefix is backed by a registry family declaration (catches orphans)
+
+Stage Summary:
+- Tests: 326 → 333 pass, 0 fail (+7 end-to-end chain tests). 1011 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 31/31 vectors pass.
+- Python conformance runner: 31/31 vectors pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The conformance system is now fully self-enforcing: the completeness guard verifies the entire chain from protocol-registry.json → MANIFEST.json → TS runner dispatch → Python runner dispatch. Adding a new wire object to the registry without a corresponding vector family in the manifest AND dispatch branches in BOTH runners MUST fail CI.
