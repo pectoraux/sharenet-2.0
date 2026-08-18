@@ -993,3 +993,82 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-003/R-004 are now CLOSED with the machine-readable schema artifact as the single source of truth shared by spec, implementation, tests, and both conformance runners.
+
+---
+Task ID: 26-31-redo
+Agent: Z.ai Code (main orchestrator)
+Task: REAL Neon PostgreSQL cutover + GitHub push + Vercel production wiring (redo of the false 2026-08-16 claim)
+
+Work Log:
+
+## Pre-flight: discovered the user pointed at the wrong repo
+
+- User said "https://github.com/pectoraux/sharenet". That repo (`pectoraux/ShareNet` after a rename) is a DIFFERENT project — the Rust + Android conformance reference (10.9 MB, latest commits about N3 golden acceptance test). The Vercel project `sharenet-2-0` (Project ID `prj_vtYj010RpuEkfnRg2W9nHc6zgOtR`) is connected to a DIFFERENT repo: `pectoraux/sharenet-2.0` (with a period, 1.3 MB, latest commits about R-003/R-004 routing spec).
+- Cross-checked the Vercel env vars against both repos' prisma schemas. Only `sharenet-2.0`'s schema has the explicit "DO NOT CLAIM A NEON CUTOVER" warning + the five-condition TODO from ADR-0001. Only `sharenet-2.0`'s env vars (ADMIN_BOOTSTRAP_*, ENABLE_DEMO_LOGIN) match its "control plane (waitlist, admin, demo accounts)" description.
+- Read worklog Task ID 26-31 (2026-08-16) in `sharenet-2.0` — it CLAIMED a Neon cutover was done but the cutover commit was never actually pushed. The claim was retracted in corrective milestone 2026-08-16 work item F4. The checked-in schema remained `provider = "sqlite"`.
+- Pivoted: stopped working on `pectoraux/ShareNet`, re-synced the sandbox to `pectoraux/sharenet-2.0`. A chore(env) commit (`7e04b4c`) was already pushed to `pectoraux/ShareNet` by mistake before the pivot — harmless (sqlite→postgresql on a User/Post scaffold that the ShareNet project doesn't use), flagged to the user in the final report.
+
+## Phase A — Neon Postgres cutover (the real one)
+
+- `prisma/schema.prisma`: `provider = "sqlite"` → `provider = "postgresql"`, added `directUrl = env("DIRECT_DATABASE_URL")`. Also rewrote the leading comment from "DO NOT CLAIM A NEON CUTOVER" to "*** NEON POSTGRESQL CUTOVER — COMPLETE (2026-08-18) ***" with a full history section pointing at the false claim and at this redo.
+- `prisma/migrations/20260818030000_neon_cutover/migration.sql` (237 lines): generated with `bunx prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script`. Contains all CREATE TYPE (Role, WaitlistStatus, AuditAction) + CREATE TABLE (WaitlistEntry, User, Session, AuditLog, NodeRecord, SequenceFloor, DemoAccount, GatewayPolicy, GatewayPolicyDecision) + indexes + FKs.
+- `prisma/migrations/migration_lock.toml`: locks provider to `postgresql`.
+- `bun run db:push` synced the schema to Neon `neondb` at `ep-dry-scene-ayqsm9q2.c-5.us-east-2.aws.neon.tech` in 18.36s. (The `--accept-data-loss` flag dropped stray User + Post tables that an earlier mistaken `db:push` against the ShareNet repo had created on the same Neon DB — no production data existed, they were empty scaffold tables.)
+- `bunx prisma migrate resolve --applied 20260818030000_neon_cutover` recorded the migration in `_prisma_migrations`.
+- `bunx prisma migrate status` reports: `1 migration found in prisma/migrations` + `Database schema is up to date!`.
+
+## Phase B — ADR updates
+
+- `adr/0001-sandbox-sqlite-substitution-for-neon-postgres.md`: Status changed from "Accepted (local development substitution)" to "Superseded by ADR 0018". The five-condition checklist is marked with ✅. The false-claim retraction text is preserved verbatim under a "History (do not delete — prevents a repeat of the false claim)" heading.
+- `adr/0018-neon-postgresql-cutover.md` (new, 201 lines): records the cutover with the full audit trail, the five conditions, a side-by-side comparison table (false claim vs real cutover), the list of what was pushed to Neon, reproducible verification commands, and secrets-hygiene notes.
+
+## Phase C — Sandbox dev server
+
+- Discovered the sandbox orchestrator exports `DATABASE_URL=file:/home/z/my-project/db/custom.db` into the global shell environment. That value OVERRIDES anything Next.js would otherwise load from `.env` (because `process.env` wins over `.env` files). The runtime Prisma Client was therefore seeing a SQLite URL while the schema was postgresql — validation error.
+- Fixed in `.zscripts/start-dev-daemon.sh`: the setsid+exec double-detach launcher now does `set -a; . ./.env; set +a` immediately before `exec next dev`, so the Neon `DATABASE_URL` from `.env` wins over the sandbox's global SQLite default.
+- Same pattern applied to `.zscripts/start-node-link-daemon.sh` for the `mini-services/node-link` mini-service (port 3001 HTTP control + 7788 wire).
+- Both daemons survive the Bash tool's process-group cleanup: they parent to PID 1 (tini) and persist across bash invocations.
+
+## Phase D — GitHub push (the real one)
+
+- Commit `640d5d8` "feat(db): REAL Neon PostgreSQL cutover — ADR-0018 (Task 26-31-redo)" pushed to `pectoraux/sharenet-2.0` main. 10 files changed, 615 insertions(+), 39 deletions(-).
+- Verified: `git ls-remote origin main` returns `640d5d88ef10e302f52d0f4bdead7a487c60d916`.
+- Secret scan of the diff: zero matches for the Neon password, GitHub PAT, Vercel token, or bootstrap admin password. `.env` is gitignored via `.env*` in `.gitignore`.
+
+## Phase E — Vercel production wiring + build bug fix
+
+- Vercel auto-deployed from commit `640d5d8` (deployment `dpl_5qC6yS8eDoaic3B8EcQ9i2HHfKVc`, READY in 25s, production). The Vercel GitHub App is now installed on the `pectoraux` GitHub account (the previous orchestrator's note that it wasn't installed is now stale).
+- HOWEVER: production `POST /api/sharenet/waitlist/signup` returned 500 with `Error validating datasource 'db': the URL must start with the protocol 'file:'` pointing at `schema.prisma:25 provider = "sqlite"`. The runtime schema in production was STILL sqlite, even though the committed schema is postgresql.
+- Root cause: the `build` script in `package.json` was `next build && cp -r ...` — it did NOT run `prisma generate`. The Vercel build was therefore using a STALE Prisma Client that had been generated from the old sqlite schema (cached from a previous build). The `@prisma/client` package's own `postinstall` script (`node scripts/postinstall.js`) is supposed to run `prisma generate` on install, but bun didn't reliably run it on Vercel's build image.
+- Fix in commit `dfb7e0f`: added `prisma generate` to the front of the `build` script AND added a `postinstall` script (`prisma generate || true`). Belt and suspenders — the build will regenerate the client from the current schema every time.
+- Vercel auto-deployed from `dfb7e0f` (deployment `sharenet-2-0-6dtxmovha-...`, READY in 25s, production).
+
+## Verification — sandbox dev server (port 3000)
+
+  GET /                                    -> 200 (dashboard renders, 8 tabs)
+  GET /api/sharenet/auth/me                 -> 200 (no session)
+  GET /api/sharenet/demo/status            -> 200 (7 personas)
+  GET /api/sharenet/architecture/summary   -> 200, 24/24 PASS
+  POST /api/sharenet/waitlist/signup        -> 200, created waitlistId cmsy3311e000evawdhrxa2go6
+  POST /api/sharenet/demo/quick-login       -> 200, demo admin session created
+
+## Verification — Vercel production (https://sharenet-2-0.vercel.app)
+
+  GET /                                    -> 200 (dashboard renders)
+  GET /api/sharenet/auth/me                 -> 200
+  GET /api/sharenet/demo/status            -> 200 (7 personas)
+  GET /api/sharenet/architecture/summary   -> 200, 24/24 PASS
+  POST /api/sharenet/waitlist/signup        -> 200, created waitlistId cmsy3bbcf0000jw04xkjnyswt
+  POST /api/sharenet/demo/quick-login       -> 200, demo admin session created
+
+Stage Summary:
+
+- **Neon Postgres**: LIVE in BOTH sandbox and production. The five ADR-0001 cutover conditions are all satisfied (provider=postgresql checked in, directUrl checked in, reproducible migration SQL checked in, real verification done, ADR-0001 marked Superseded + ADR-0018 created). SQLite is retired.
+- **GitHub**: TWO commits pushed to `pectoraux/sharenet-2.0` main:
+  - `640d5d8` — feat(db): REAL Neon PostgreSQL cutover — ADR-0018 (Task 26-31-redo)
+  - `dfb7e0f` — fix(build): run prisma generate in build + postinstall
+- **Vercel**: Auto-deploys from `pectoraux/sharenet-2.0` main. The Vercel GitHub App is now installed (deployments auto-fire on push). Production URL `https://sharenet-2-0.vercel.app` serves the real app with working Neon-backed APIs.
+- **Mistaken commit on pectoraux/ShareNet**: commit `7e04b4c` was pushed to the wrong repo (`pectoraux/ShareNet`) before the pivot. It changes that repo's prisma schema from sqlite to postgresql + directUrl on a User/Post scaffold that ShareNet doesn't actually use. It's harmless but irrelevant to ShareNet's main development. Flagged to the user; can be reverted if they want a clean history on `ShareNet`.
+- **Secrets hygiene**: All four user-provided secrets (Neon password, GitHub PAT, Vercel token, bootstrap admin password) were used ONLY as runtime environment variables. None appear in any committed file. `.env` (gitignored) contains the Neon connection strings for local dev only. The Vercel project holds the encrypted production copies.
+- **ROTATION REMINDER**: User confirmed they will rotate the PAT and Vercel token. Also recommend rotating: the Neon database password (was pasted in chat during the original 2026-08-16 attempt), the bootstrap admin password (set to a placeholder on Vercel; user should set their own), and the demo account passwords (random per-boot, already safe).
+- **This is the FIRST real, pushed, verified Neon PostgreSQL cutover for ShareNet 2.0.** The false 2026-08-16 claim is now superseded by real evidence.
