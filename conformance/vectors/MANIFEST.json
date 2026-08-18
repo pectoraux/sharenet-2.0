@@ -260,6 +260,13 @@
       "schema_version": "1",
       "expected_result": "CircuitFrame backward (return) onion: sealReturnFrame + openFrame + forwardFrame (return-onion peel) + tamper rejection",
       "file": "V-CIRCUIT-FRAME-002.json"
+    },
+    {
+      "id": "V-CIRCUIT-RETURN-TEMPLATE-001",
+      "protocol": "circuit",
+      "schema_version": "1",
+      "expected_result": "ReturnOnionTemplate: construct + seal from template + peel envelope + decrypt return + tamper rejection",
+      "file": "V-CIRCUIT-RETURN-TEMPLATE-001.json"
     }
   ]
 }

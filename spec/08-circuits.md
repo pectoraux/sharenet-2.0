@@ -269,6 +269,54 @@ keypair produces a fresh nonce prefix by construction — satisfying the
 sequence floor `(commitmentRoot, hopIndex, direction)` (per ADR-0019)
 provides cross-re-key replay protection independently.
 
+### 4.8 Return-Onion Template Distribution (R-009 Stage 2)
+
+In the forward direction, the SOURCE holds all `forwardingKey`s (it derives
+them from the ECDH with each relay). In the backward direction, the GATEWAY
+must seal return traffic — but the gateway does NOT hold the intermediate
+relays' `returnKey`s (it is not the initiator + does not have the other
+relays' private keys).
+
+The `ReturnOnionTemplate` (Model A — layered encrypted return template)
+resolves this:
+
+1. The INITIATOR (who holds all returnKeys from the setup ECDH) constructs
+   the template during `establishDistributedCircuit`:
+   - Generates a fresh per-circuit return key `K_ret` (32-byte AEAD key).
+   - Wraps `K_ret` in N nested AEAD layers, one per hop's `returnKey`:
+     `env_0 = AEAD(returnKey_0, K_ret)`, `env_1 = AEAD(returnKey_1, env_0)`,
+     ..., `env_{N-1} = AEAD(returnKey_{N-1}, env_{N-2})`.
+   - The template = `{ circuitId, commitmentRoot, noncePrefix, kRet, envelope = env_{N-1} }`.
+
+2. The initiator sends the template to the GATEWAY (the terminal hop) during
+   setup. The gateway holds `K_ret` (a circuit-scoped key — NOT a relay key)
+   + the opaque envelope (it cannot decrypt any envelope layer).
+
+3. To send a return response, the GATEWAY:
+   - Seals the response with `K_ret`: `sealedPayload = AEAD(K_ret, nonce, response, AD)`.
+   - Constructs a backward frame with `ciphertext = CBOR { sealedPayload, envelope }`.
+   - Sends to hop N-1.
+
+4. Each RELAY (hop i, from N-1 down to 1):
+   - Decodes the ciphertext as `{ sealedPayload, envelopeLayer }`.
+   - Peels its `returnKey` from `envelopeLayer`: `innerEnv = AEAD_decrypt(returnKey_i, envelopeLayer)`.
+   - Forwards `{ sealedPayload, innerEnv }` to hop i-1.
+
+5. The SOURCE (hop 0):
+   - Peels the final envelope layer → recovers `K_ret`.
+   - Decrypts `sealedPayload` with `K_ret` → response plaintext.
+
+SECURITY PROPERTIES:
+- The gateway holds `K_ret` (circuit-scoped) — NOT the per-hop `returnKey`s.
+- Each relay peels only its own `returnKey` layer (onion property preserved
+  for key distribution).
+- The response payload is sealed once with `K_ret`. Intermediate relays see
+  the sealed payload but cannot decrypt it (they don't hold `K_ret`).
+- All material is bound to `(commitmentRoot, hopIndex, direction=BACKWARD)`
+  via the AD + the envelope nonce construction.
+
+See ADR-0021 for the full design rationale.
+
 ## 5. Circuit Setup Protocol
 
 ```

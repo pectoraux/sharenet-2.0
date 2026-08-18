@@ -83,6 +83,13 @@ import {
 } from "@reference/circuit/frame";
 import { forwardFrame } from "@reference/circuit/forwarding";
 import {
+  constructReturnOnionTemplate,
+  sealReturnFrameFromTemplate,
+  peelReturnEnvelopeLayer,
+  decryptReturnPayload,
+  encodeReturnFramePayload,
+} from "@reference/circuit/return-template";
+import {
   evaluateGatewayRequest,
   defaultGatewayPolicy,
   defaultGatewayCapacity,
@@ -1357,6 +1364,122 @@ function verifyCircuitFrameVector(data: any): VectorResult {
 // to fail with "receipt verification failed: gateway signature invalid".
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// V-CIRCUIT-RETURN-TEMPLATE-001 — ReturnOnionTemplate (R-009 Stage 2).
+// Tests the distributed return-onion template distribution: the initiator
+// constructs the template, the gateway seals using it (NOT raw returnKeys),
+// each relay peels one layer, the source recovers K_ret + decrypts.
+// ---------------------------------------------------------------------------
+
+function verifyCircuitReturnTemplateVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const shared = data.sharedInputs || {};
+  let allOk = true;
+  const failures: string[] = [];
+
+  // Reconstruct a minimal ActiveCircuit from shared inputs (for peelReturnEnvelopeLayer).
+  const commitmentRoot = hexToBytes(shared.commitmentRootHex);
+  const noncePrefix = deriveNoncePrefix(commitmentRoot, hexToBytes(shared.initiatorX25519PubHex));
+  const retKey0 = hexToBytes(shared.returnKey0Hex);
+  const retKey1 = hexToBytes(shared.returnKey1Hex);
+  const circuit = {
+    commitmentRoot,
+    noncePrefix,
+    hops: [
+      { hopIndex: 0, nodeId: "", forwardingKey: new Uint8Array(32), returnKey: retKey0, relayX25519PublicKey: new Uint8Array(32) },
+      { hopIndex: 1, nodeId: "", forwardingKey: new Uint8Array(32), returnKey: retKey1, relayX25519PublicKey: new Uint8Array(32) },
+    ],
+  } as any;
+
+  const kRet = hexToBytes(shared.kRetHex);
+  const plaintext = hexToBytes(shared.plaintextHex);
+
+  // Track state across vectors.
+  let template: any = null;
+  let ciphertext: Uint8Array | null = null;
+  let innerCiphertext: Uint8Array | null = null;
+
+  for (const v of vectors) {
+    try {
+      const input = v.input || {};
+      const expected = v.expected || {};
+      let caseOk = true;
+
+      if (v.name === "construct-template") {
+        template = constructReturnOnionTemplate(circuit, kRet);
+        if (toHex(template.kRet) !== expected.kRetHex) { caseOk = false; failures.push(`${v.name}: kRet mismatch`); }
+        if (toHex(template.envelope) !== expected.envelopeHex) { caseOk = false; failures.push(`${v.name}: envelope mismatch`); }
+        if (template.envelope.length !== expected.envelopeLen) { caseOk = false; failures.push(`${v.name}: envelopeLen ${template.envelope.length} != ${expected.envelopeLen}`); }
+      } else if (v.name === "seal-return-from-template") {
+        if (!template) { caseOk = false; failures.push(`${v.name}: no template`); }
+        else {
+          ciphertext = sealReturnFrameFromTemplate(template, input.frameSequence, plaintext);
+          if (toHex(ciphertext) !== expected.ciphertextHex) { caseOk = false; failures.push(`${v.name}: ciphertext mismatch`); }
+          if (ciphertext.length !== expected.ciphertextLen) { caseOk = false; failures.push(`${v.name}: ciphertextLen ${ciphertext.length} != ${expected.ciphertextLen}`); }
+        }
+      } else if (v.name === "peel-envelope-hop1") {
+        if (!ciphertext) { caseOk = false; failures.push(`${v.name}: no ciphertext`); }
+        else {
+          const r = peelReturnEnvelopeLayer(circuit, 1, ciphertext);
+          if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+          else if (r.ok) {
+            if (r.isTerminal !== expected.isTerminal) { caseOk = false; failures.push(`${v.name}: isTerminal ${r.isTerminal} != ${expected.isTerminal}`); }
+            else if (!r.isTerminal) {
+              innerCiphertext = encodeReturnFramePayload(r.innerPayload);
+              if (toHex(innerCiphertext) !== expected.innerCiphertextHex) { caseOk = false; failures.push(`${v.name}: innerCiphertext mismatch`); }
+            }
+          }
+        }
+      } else if (v.name === "peel-envelope-hop0-terminal") {
+        if (!innerCiphertext) { caseOk = false; failures.push(`${v.name}: no innerCiphertext`); }
+        else {
+          const r = peelReturnEnvelopeLayer(circuit, 0, innerCiphertext);
+          if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+          else if (r.ok && r.isTerminal) {
+            if (!r.kRet || toHex(r.kRet) !== expected.kRetHex) { caseOk = false; failures.push(`${v.name}: kRet mismatch`); }
+          }
+        }
+      } else if (v.name === "decrypt-return-payload") {
+        // Full chain: seal → peel1 → peel0 (terminal) → decrypt with recovered K_ret.
+        if (!template) { caseOk = false; failures.push(`${v.name}: no template`); }
+        else {
+          const ct = sealReturnFrameFromTemplate(template, 1, plaintext);
+          const p1 = peelReturnEnvelopeLayer(circuit, 1, ct);
+          if (!p1.ok) { caseOk = false; failures.push(`${v.name}: peel1 failed`); }
+          else {
+            const inner = encodeReturnFramePayload(p1.innerPayload);
+            const p0 = peelReturnEnvelopeLayer(circuit, 0, inner);
+            if (!p0.ok || !p0.isTerminal || !p0.kRet) { caseOk = false; failures.push(`${v.name}: peel0 failed`); }
+            else {
+              const dec = decryptReturnPayload(p0.kRet, template.noncePrefix, template.commitmentRoot, 1, p0.innerPayload.sealedPayload);
+              if (!dec.ok) { caseOk = false; failures.push(`${v.name}: decrypt failed`); }
+              else if (toHex(dec.plaintext) !== expected.plaintextHex) { caseOk = false; failures.push(`${v.name}: plaintext mismatch`); }
+            }
+          }
+        }
+      } else if (v.name === "tampered-envelope-rejected") {
+        const tampered = hexToBytes(input.tamperedCiphertextHex);
+        const r = peelReturnEnvelopeLayer(circuit, 1, tampered);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: expected ok=false, got ok=${r.ok}`); }
+        else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
+      } else {
+        throw new Error(`unknown return-template case name: ${v.name}`);
+      }
+
+      if (!caseOk) allOk = false;
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} return-template cases match`,
+    actual: allOk ? `${vectors.length} return-template cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
 function verifyContributionProofVector(data: any): VectorResult {
   const vectors: any[] = data.vectors || [];
   const gatewayPublicKey = hexToBytes(data.sharedKeys.gatewayPublicKeyHex);
@@ -2096,6 +2219,8 @@ for (const file of files) {
     result = verifyCircuitAckVector(data);
   } else if (data.id?.startsWith("V-CIRCUIT-FRAME-")) {
     result = verifyCircuitFrameVector(data);
+  } else if (data.id?.startsWith("V-CIRCUIT-RETURN-TEMPLATE-")) {
+    result = verifyCircuitReturnTemplateVector(data);
   } else if (data.id?.startsWith("V-CIRCUIT-")) {
     result = verifyCircuitVector(data);
   } else if (data.id?.startsWith("V-GATEWAY-SVC-")) {

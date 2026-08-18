@@ -407,6 +407,9 @@ def verify_vector(data: dict) -> dict:
     elif vid.startswith("V-CIRCUIT-FRAME-"):
         return verify_circuit_frame_vector(data)
 
+    elif vid.startswith("V-CIRCUIT-RETURN-TEMPLATE-"):
+        return verify_circuit_return_template_vector(data)
+
     elif vid.startswith("V-CIRCUIT-"):
         return verify_circuit_vector(data)
 
@@ -2185,6 +2188,597 @@ def verify_circuit_frame_vector(data: dict) -> dict:
         "passed": passed,
         "expected": f"{len(vectors)} circuit-frame cases match",
         "actual": f"{len(vectors)} circuit-frame cases match" if passed
+                  else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# Return-onion template distribution (added for R-009 Stage 2 —
+# V-CIRCUIT-RETURN-TEMPLATE-001)
+#
+# INDEPENDENT implementation of the distributed return-key/template
+# distribution protocol (Model A — layered encrypted return template).
+#
+# Per spec/08 §5a + ADR-0021:
+#   1. The INITIATOR constructs a ReturnOnionTemplate during setup:
+#        - Generates a fresh per-circuit return key K_ret (32 bytes).
+#        - Wraps K_ret in N nested AEAD layers, one per hop's returnKey:
+#            env_0     = AEAD(returnKey_0, K_ret)
+#            env_1     = AEAD(returnKey_1, env_0)
+#            ...
+#            env_{N-1} = AEAD(returnKey_{N-1}, env_{N-2})
+#        - The template = { circuitId, commitmentRoot, noncePrefix, kRet,
+#          envelope = env_{N-1} }.
+#   2. The gateway holds K_ret + the opaque envelope (NOT the per-hop
+#      returnKeys). To send a return response, it seals the payload with
+#      K_ret and attaches the envelope.
+#   3. Each RELAY peels its returnKey from the envelope (one layer).
+#   4. The SOURCE (hop 0) peels the final layer → recovers K_ret, then
+#      decrypts the sealedPayload with K_ret.
+#
+# This is the standard "return onion without the gateway holding all keys"
+# design — the onion is on the KEY DISTRIBUTION (the envelope), and the
+# payload is sealed with a circuit-scoped key that the gateway holds.
+#
+# Domain tags (FROZEN per ADR-0021):
+#   SHARENET/CIRCUIT/RETURN/ENV/1     — envelope AEAD AD domain
+#   SHARENET/CIRCUIT/RETURN/PAYLOAD/1  — payload AEAD AD domain
+# -----------------------------------------------------------------------
+
+RETURN_ENVELOPE_DOMAIN = b"SHARENET/CIRCUIT/RETURN/ENV/1"
+RETURN_PAYLOAD_DOMAIN = b"SHARENET/CIRCUIT/RETURN/PAYLOAD/1"
+
+# CBOR integer keys for ReturnFramePayload (the backward frame's ciphertext).
+RETURN_PAYLOAD_KEY_SEALED = 1
+RETURN_PAYLOAD_KEY_ENVELOPE = 2
+
+# K_ret is a 32-byte AEAD key (same size as a per-hop returnKey). The
+# terminal-hop detection in peelReturnEnvelopeLayer uses this length: a
+# peeled result of exactly 32 bytes IS K_ret (terminal = source hop).
+RETURN_AEAD_KEY_BYTES = 32
+
+
+def build_return_envelope_ad(commitment_root: bytes, hop_index: int) -> bytes:
+    """AEAD AD for a return envelope layer (spec/08 §5a + ADR-0021).
+
+    AD = "SHARENET/CIRCUIT/RETURN/ENV/1" || commitment_root (32) || hopIndex (1)
+    The hopIndex distinguishes each envelope layer (no nonce reuse across
+    layers — combined with the per-hop nonce below).
+    """
+    if hop_index < 0 or hop_index > 255:
+        raise ValueError(f"hopIndex must be a u8, got {hop_index}")
+    return RETURN_ENVELOPE_DOMAIN + commitment_root + bytes([hop_index])
+
+
+def build_return_envelope_nonce(nonce_prefix: bytes, hop_index: int) -> bytes:
+    """AEAD nonce for a return envelope layer (spec/08 §5a + ADR-0021).
+
+    nonce = circuit_nonce_prefix (8 bytes) || hopIndex (4 bytes big-endian)
+    Total = 12 bytes (ChaCha20-Poly1305 nonce size). Each hop gets a
+    distinct nonce, so there is no nonce reuse across envelope layers.
+    """
+    if len(nonce_prefix) != CIRCUIT_NONCE_PREFIX_BYTES:
+        raise ValueError(
+            f"nonce_prefix must be {CIRCUIT_NONCE_PREFIX_BYTES} bytes, "
+            f"got {len(nonce_prefix)}"
+        )
+    if hop_index < 0 or hop_index > 0xffffffff:
+        raise ValueError(f"hopIndex must be a u32, got {hop_index}")
+    return nonce_prefix + struct.pack(">I", hop_index)
+
+
+def build_return_payload_ad(commitment_root: bytes, frame_sequence: int) -> bytes:
+    """AEAD AD for the K_ret-sealed return payload (spec/08 §5a + ADR-0021).
+
+    AD = "SHARENET/CIRCUIT/RETURN/PAYLOAD/1" || commitment_root (32) ||
+         frame_sequence (4 BE) || direction (1 = 0x02 BACKWARD)
+
+    Same structure as the forward frame AD, but with RETURN_PAYLOAD_DOMAIN
+    and direction pinned to BACKWARD (return payloads only flow backward).
+    """
+    if frame_sequence < 1 or frame_sequence > 0xffffffff:
+        raise ValueError(
+            f"frame_sequence must be a u32 ≥ 1, got {frame_sequence}"
+        )
+    return (RETURN_PAYLOAD_DOMAIN + commitment_root +
+            struct.pack(">I", frame_sequence) + bytes([DIRECTION_BACKWARD]))
+
+
+def encode_return_frame_payload(payload: dict) -> bytes:
+    """Encode a ReturnFramePayload as canonical CBOR (ADR-0004 integer-keyed map).
+
+    `payload` is a dict with:
+      sealedPayload: bytes (the response sealed with K_ret)
+      envelopeLayer: bytes (the remaining envelope — opaque to the gateway;
+        each relay peels one returnKey layer)
+    Returns canonical CBOR: {1: sealedPayload, 2: envelopeLayer}.
+    """
+    m = {
+        RETURN_PAYLOAD_KEY_SEALED: bytes(payload["sealedPayload"]),
+        RETURN_PAYLOAD_KEY_ENVELOPE: bytes(payload["envelopeLayer"]),
+    }
+    return canonical_cbor_encode(m)
+
+
+def decode_return_frame_payload(data: bytes) -> dict:
+    """Decode a ReturnFramePayload from canonical CBOR.
+
+    Returns a dict {sealedPayload, envelopeLayer} on success.
+    Raises ValueError on any malformed input.
+    """
+    try:
+        m = canonical_cbor_decode(data)
+    except Exception as e:
+        raise ValueError(f"CBOR decode failed: {e}")
+
+    if not isinstance(m, dict):
+        raise ValueError(
+            f"ReturnFramePayload must be a CBOR map, got {type(m).__name__}"
+        )
+
+    # Reject unknown / extra keys (only {1, 2} are legal per ADR-0021).
+    legal_keys = {RETURN_PAYLOAD_KEY_SEALED, RETURN_PAYLOAD_KEY_ENVELOPE}
+    for k in m.keys():
+        if k not in legal_keys:
+            raise ValueError(
+                f"unknown CBOR map key {k} (only {{1,2}} are legal)"
+            )
+    if len(m) != len(legal_keys):
+        raise ValueError(
+            f"ReturnFramePayload map must have exactly "
+            f"{len(legal_keys)} keys, got {len(m)} (missing or duplicate)"
+        )
+
+    sealed = m[RETURN_PAYLOAD_KEY_SEALED]
+    envelope = m[RETURN_PAYLOAD_KEY_ENVELOPE]
+    if not isinstance(sealed, (bytes, bytearray)) or \
+            not isinstance(envelope, (bytes, bytearray)):
+        raise ValueError(
+            "ReturnFramePayload missing sealedPayload or envelopeLayer"
+        )
+    return {"sealedPayload": bytes(sealed), "envelopeLayer": bytes(envelope)}
+
+
+def construct_return_onion_template(circuit: dict,
+                                    k_ret_for_test: bytes = None) -> dict:
+    """Construct a ReturnOnionTemplate during circuit setup (initiator-side).
+
+    The INITIATOR calls this after all relay acks are verified and all
+    returnKeys are derived. The template is sent to the gateway (terminal hop).
+
+    Construction:
+      1. Generate (or accept the test hook) K_ret — 32-byte AEAD key.
+      2. Wrap K_ret in N nested AEAD layers (hop 0 innermost → hop N-1
+         outermost), each under the hop's returnKey, bound to the circuit
+         via build_return_envelope_ad(commitmentRoot, hopIndex).
+      3. The envelope = env_{N-1} (the outermost layer — for hop N-1).
+
+    `circuit` is a dict with:
+      circuitId: bytes (32)
+      commitmentRoot: bytes (32)
+      noncePrefix: bytes (8)
+      hops: list of dicts each with `returnKey` (bytes 32).
+    """
+    # Generate the circuit-scoped return key K_ret (or use the test hook).
+    if k_ret_for_test is not None:
+        if len(k_ret_for_test) != RETURN_AEAD_KEY_BYTES:
+            raise ValueError(
+                f"k_ret_for_test must be {RETURN_AEAD_KEY_BYTES} bytes, "
+                f"got {len(k_ret_for_test)}"
+            )
+        k_ret = bytes(k_ret_for_test)
+    else:
+        k_ret = os.urandom(RETURN_AEAD_KEY_BYTES)
+
+    # Wrap K_ret in N nested AEAD layers, from hop 0 (innermost) to hop N-1
+    # (outermost). Each layer is AEAD-encrypted under the hop's returnKey,
+    # bound to the circuit via the envelope AD + a per-hop nonce.
+    envelope = k_ret
+    for i, hop in enumerate(circuit["hops"]):
+        return_key = hop["returnKey"]
+        ad = build_return_envelope_ad(circuit["commitmentRoot"], i)
+        nonce = build_return_envelope_nonce(circuit["noncePrefix"], i)
+        envelope = encrypt_payload(return_key, nonce, envelope, ad)
+
+    return {
+        "circuitId": bytes(circuit["circuitId"]),
+        "commitmentRoot": bytes(circuit["commitmentRoot"]),
+        "noncePrefix": bytes(circuit["noncePrefix"]),
+        "kRet": k_ret,
+        "envelope": envelope,
+    }
+
+
+def seal_return_frame_from_template(template: dict, frame_sequence: int,
+                                    plaintext: bytes) -> bytes:
+    """Seal a return response using the ReturnOnionTemplate (gateway-side).
+
+    The GATEWAY calls this. It does NOT hold any per-hop returnKey — only
+    K_ret (the circuit-scoped key) + the opaque envelope.
+
+    Steps:
+      1. Seal the response with K_ret:
+           nonce = build_circuit_nonce(noncePrefix, frameSequence)
+           ad    = build_return_payload_ad(commitmentRoot, frameSequence)
+           sealedPayload = AEAD(K_ret, nonce, plaintext, ad)
+      2. Wrap { sealedPayload, envelope } into canonical CBOR:
+           {1: sealedPayload, 2: envelopeLayer}
+    Returns the CBOR-encoded ReturnFramePayload (the backward frame's
+    ciphertext).
+    """
+    if not isinstance(frame_sequence, int) or isinstance(frame_sequence, bool) \
+            or frame_sequence < 1 or frame_sequence > 0xffffffff:
+        raise ValueError(
+            f"sealReturnFrameFromTemplate: frameSequence must be a u32 ≥ 1, "
+            f"got {frame_sequence}"
+        )
+
+    nonce = build_circuit_nonce(template["noncePrefix"], frame_sequence)
+    ad = build_return_payload_ad(template["commitmentRoot"], frame_sequence)
+    sealed_payload = encrypt_payload(template["kRet"], nonce, plaintext, ad)
+
+    payload = {
+        "sealedPayload": sealed_payload,
+        "envelopeLayer": template["envelope"],
+    }
+    return encode_return_frame_payload(payload)
+
+
+def peel_return_envelope_layer(circuit: dict, hop_index: int,
+                               ciphertext: bytes) -> dict:
+    """Peel one return envelope layer at a relay (backward frame, distributed).
+
+    The RELAY calls this. It:
+      1. Decodes the ciphertext as { sealedPayload, envelopeLayer }.
+      2. Peels its returnKey from the envelopeLayer:
+           innerEnv = AEAD_decrypt(returnKey_i, envelopeLayer, AD)
+      3. If the peeled result is exactly 32 bytes, it is K_ret — this is the
+         terminal hop (source). Returns kRet + the (unchanged) sealedPayload
+         so the source can decrypt it.
+      4. Otherwise, it is the next envelope layer — forward
+         { sealedPayload, innerEnvelope } to hop i-1.
+
+    Returns:
+      {"ok": True, "innerPayload": {sealedPayload, envelopeLayer},
+       "isTerminal": bool, "kRet"?: bytes} on success, OR
+      {"ok": False, "reason": str} on AEAD failure / wrong key / decode error.
+    """
+    if hop_index < 0 or hop_index >= len(circuit["hops"]):
+        return {"ok": False, "reason": f"no hop at index {hop_index}"}
+    hop = circuit["hops"][hop_index]
+
+    # Step 1: decode the ciphertext as { sealedPayload, envelopeLayer }.
+    try:
+        payload = decode_return_frame_payload(ciphertext)
+    except Exception as e:
+        return {"ok": False,
+                "reason": f"return payload decode failed: {e}"}
+
+    # Step 2: peel the relay's returnKey from the envelopeLayer.
+    return_key = hop["returnKey"]
+    ad = build_return_envelope_ad(circuit["commitmentRoot"], hop_index)
+    nonce = build_return_envelope_nonce(circuit["noncePrefix"], hop_index)
+
+    try:
+        peeled = decrypt_payload(return_key, nonce,
+                                  payload["envelopeLayer"], ad)
+    except InvalidTag as e:
+        return {"ok": False,
+                "reason": f"AEAD envelope peel failed: {e}"}
+    except Exception as e:
+        return {"ok": False,
+                "reason": f"AEAD envelope peel failed: {e}"}
+
+    # Step 3: if the peeled result is exactly 32 bytes, it IS K_ret — this
+    # is the terminal hop (the source). The sealedPayload is NOT touched by
+    # the relay — only the envelope is peeled (key distribution).
+    is_terminal = (len(peeled) == RETURN_AEAD_KEY_BYTES)
+
+    if is_terminal:
+        # Terminal hop (source): return K_ret so the caller can decrypt the
+        # sealedPayload. innerPayload retains the original {sealedPayload,
+        # envelopeLayer} (the source decrypts sealedPayload separately).
+        return {
+            "ok": True,
+            "innerPayload": payload,
+            "isTerminal": True,
+            "kRet": peeled,
+        }
+
+    # Intermediate hop: forward { sealedPayload, innerEnvelope } to the
+    # next hop. The sealedPayload is preserved unchanged.
+    inner_payload = {
+        "sealedPayload": payload["sealedPayload"],
+        "envelopeLayer": peeled,
+    }
+    return {"ok": True, "innerPayload": inner_payload, "isTerminal": False}
+
+
+def decrypt_return_payload(k_ret: bytes, nonce_prefix: bytes,
+                            commitment_root: bytes, frame_sequence: int,
+                            sealed_payload: bytes) -> dict:
+    """Decrypt the return payload with K_ret (terminal hop = source).
+
+    The SOURCE calls this AFTER peelReturnEnvelopeLayer returns
+    isTerminal=True + kRet. It decrypts the sealedPayload with K_ret to
+    recover the response plaintext.
+
+    Returns {"ok": True, "plaintext": bytes} on success, OR
+    {"ok": False, "reason": str} on AEAD failure.
+    """
+    nonce = build_circuit_nonce(nonce_prefix, frame_sequence)
+    ad = build_return_payload_ad(commitment_root, frame_sequence)
+    try:
+        plaintext = decrypt_payload(k_ret, nonce, sealed_payload, ad)
+        return {"ok": True, "plaintext": plaintext}
+    except InvalidTag as e:
+        return {"ok": False,
+                "reason": f"return payload decrypt failed: {e}"}
+    except Exception as e:
+        return {"ok": False,
+                "reason": f"return payload decrypt failed: {e}"}
+
+
+def verify_circuit_return_template_vector(data: dict) -> dict:
+    """Verify a V-CIRCUIT-RETURN-TEMPLATE-* vector (ReturnOnionTemplate).
+
+    Handles the 6 cases defined in V-CIRCUIT-RETURN-TEMPLATE-001:
+      1. construct-template           — construct the envelope wrapping K_ret.
+      2. seal-return-from-template    — gateway seals payload + attaches envelope.
+      3. peel-envelope-hop1           — relay 1 peels one returnKey layer.
+      4. peel-envelope-hop0-terminal  — source (hop 0) peels final layer → K_ret.
+      5. decrypt-return-payload       — source decrypts sealedPayload with K_ret.
+      6. tampered-envelope-rejected   — tampered envelope → AEAD fails.
+
+    The implementation is fully INDEPENDENT of the TS runner — it reproduces
+    every byte from the spec/08 §5a + ADR-0021 wire format using only the
+    frozen R-008/R-009 crypto substrate (HKDF-SHA256 nonce_prefix,
+    ChaCha20-Poly1305 AEAD, canonical CBOR).
+    """
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    shared = data.get("sharedInputs", {}) or {}
+
+    commitment_root = bytes.fromhex(shared["commitmentRootHex"])
+    ret_key_0 = bytes.fromhex(shared["returnKey0Hex"])
+    ret_key_1 = bytes.fromhex(shared["returnKey1Hex"])
+    # Re-derive the nonce prefix from the circuit instance (root + initiator
+    # ephemeral X25519 public key) per ADR-0020, then assert byte-equality
+    # against the expected prefix committed in the vector file.
+    initiator_x25519_pub = bytes.fromhex(shared["initiatorX25519PubHex"])
+    expected_nonce_prefix = bytes.fromhex(shared["noncePrefixHex"])
+    derived_prefix = derive_circuit_nonce_prefix(
+        commitment_root, initiator_x25519_pub)
+    if derived_prefix != expected_nonce_prefix:
+        return {
+            "id": vid,
+            "passed": False,
+            "expected": f"derived noncePrefix {expected_nonce_prefix.hex()}",
+            "actual": f"derived {derived_prefix.hex()} (mismatch)",
+        }
+    nonce_prefix = derived_prefix
+
+    # CircuitId is derivable but unused by the return-template operations
+    # (the AD/nonce bind only to commitmentRoot + noncePrefix). We compute
+    # it for completeness + cross-check against the vector's claim.
+    circuit_id = derive_circuit_id(commitment_root, initiator_x25519_pub)
+    if "circuitIdHex" in shared and circuit_id.hex() != shared["circuitIdHex"]:
+        return {
+            "id": vid,
+            "passed": False,
+            "expected": f"circuitId {shared['circuitIdHex']}",
+            "actual": f"circuitId {circuit_id.hex()} (mismatch)",
+        }
+
+    # Minimal ActiveCircuit for construct_return_onion_template +
+    # peel_return_envelope_layer. These functions only use: commitmentRoot,
+    # noncePrefix, hops[].returnKey.
+    circuit = {
+        "circuitId": circuit_id,
+        "commitmentRoot": commitment_root,
+        "noncePrefix": nonce_prefix,
+        "hops": [
+            {"hopIndex": 0, "returnKey": ret_key_0},
+            {"hopIndex": 1, "returnKey": ret_key_1},
+        ],
+    }
+
+    k_ret = bytes.fromhex(shared["kRetHex"])
+    plaintext = bytes.fromhex(shared["plaintextHex"])
+
+    # Carry state across cases.
+    template = None      # set by construct-template
+    ciphertext = None    # set by seal-return-from-template
+    inner_ciphertext = None  # set by peel-envelope-hop1
+
+    failures = []
+    for v in vectors:
+        try:
+            name = v["name"]
+            inp = v.get("input", {}) or {}
+            expected = v.get("expected", {}) or {}
+            case_ok = True
+
+            if name == "construct-template":
+                template = construct_return_onion_template(
+                    circuit, k_ret_for_test=k_ret)
+                if template["kRet"].hex() != expected["kRetHex"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: kRet {template['kRet'].hex()} != "
+                        f"{expected['kRetHex']}"
+                    )
+                if template["envelope"].hex() != expected["envelopeHex"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: envelope {template['envelope'].hex()} != "
+                        f"{expected['envelopeHex']}"
+                    )
+                if len(template["envelope"]) != expected["envelopeLen"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: envelopeLen "
+                        f"{len(template['envelope'])} != "
+                        f"{expected['envelopeLen']}"
+                    )
+
+            elif name == "seal-return-from-template":
+                if template is None:
+                    case_ok = False
+                    failures.append(f"{name}: no template")
+                else:
+                    fs = inp["frameSequence"]
+                    pt = bytes.fromhex(inp["plaintextHex"])
+                    ciphertext = seal_return_frame_from_template(
+                        template, fs, pt)
+                    if ciphertext.hex() != expected["ciphertextHex"]:
+                        case_ok = False
+                        failures.append(
+                            f"{name}: ciphertext {ciphertext.hex()} != "
+                            f"{expected['ciphertextHex']}"
+                        )
+                    if len(ciphertext) != expected["ciphertextLen"]:
+                        case_ok = False
+                        failures.append(
+                            f"{name}: ciphertextLen "
+                            f"{len(ciphertext)} != "
+                            f"{expected['ciphertextLen']}"
+                        )
+
+            elif name == "peel-envelope-hop1":
+                if ciphertext is None:
+                    case_ok = False
+                    failures.append(f"{name}: no ciphertext")
+                else:
+                    r = peel_return_envelope_layer(circuit, 1, ciphertext)
+                    if r["ok"] != expected["ok"]:
+                        case_ok = False
+                        failures.append(
+                            f"{name}: ok {r['ok']} != {expected['ok']}"
+                        )
+                    elif r["ok"]:
+                        if r["isTerminal"] != expected["isTerminal"]:
+                            case_ok = False
+                            failures.append(
+                                f"{name}: isTerminal {r['isTerminal']} != "
+                                f"{expected['isTerminal']}"
+                            )
+                        elif not r["isTerminal"]:
+                            # Re-encode the inner payload (the
+                            # {sealedPayload, innerEnvelope} pair) to
+                            # compare against the expected inner ciphertext.
+                            inner_ciphertext = encode_return_frame_payload(
+                                r["innerPayload"])
+                            if inner_ciphertext.hex() != \
+                                    expected["innerCiphertextHex"]:
+                                case_ok = False
+                                failures.append(
+                                    f"{name}: innerCiphertext "
+                                    f"{inner_ciphertext.hex()} != "
+                                    f"{expected['innerCiphertextHex']}"
+                                )
+
+            elif name == "peel-envelope-hop0-terminal":
+                if inner_ciphertext is None:
+                    case_ok = False
+                    failures.append(f"{name}: no innerCiphertext")
+                else:
+                    r = peel_return_envelope_layer(
+                        circuit, 0, inner_ciphertext)
+                    if r["ok"] != expected["ok"]:
+                        case_ok = False
+                        failures.append(
+                            f"{name}: ok {r['ok']} != {expected['ok']}"
+                        )
+                    elif r["ok"] and r.get("isTerminal"):
+                        k = r.get("kRet")
+                        if k is None or k.hex() != expected["kRetHex"]:
+                            case_ok = False
+                            failures.append(
+                                f"{name}: kRet "
+                                f"{k.hex() if k is not None else 'None'} != "
+                                f"{expected['kRetHex']}"
+                            )
+
+            elif name == "decrypt-return-payload":
+                # Full chain: seal → peel1 → peel0 (terminal) → decrypt
+                # with the recovered K_ret. This proves the entire
+                # distributed return path round-trips to the original
+                # plaintext, end-to-end.
+                if template is None:
+                    case_ok = False
+                    failures.append(f"{name}: no template")
+                else:
+                    ct = seal_return_frame_from_template(
+                        template, 1, plaintext)
+                    p1 = peel_return_envelope_layer(circuit, 1, ct)
+                    if not p1["ok"]:
+                        case_ok = False
+                        failures.append(f"{name}: peel1 failed")
+                    else:
+                        inner = encode_return_frame_payload(
+                            p1["innerPayload"])
+                        p0 = peel_return_envelope_layer(
+                            circuit, 0, inner)
+                        if not p0["ok"] or not p0.get("isTerminal") or \
+                                p0.get("kRet") is None:
+                            case_ok = False
+                            failures.append(f"{name}: peel0 failed")
+                        else:
+                            dec = decrypt_return_payload(
+                                p0["kRet"], template["noncePrefix"],
+                                template["commitmentRoot"], 1,
+                                p0["innerPayload"]["sealedPayload"])
+                            if not dec["ok"]:
+                                case_ok = False
+                                failures.append(
+                                    f"{name}: decrypt failed: "
+                                    f"{dec.get('reason')}"
+                                )
+                            elif dec["plaintext"].hex() != \
+                                    expected["plaintextHex"]:
+                                case_ok = False
+                                failures.append(
+                                    f"{name}: plaintext "
+                                    f"{dec['plaintext'].hex()} != "
+                                    f"{expected['plaintextHex']}"
+                                )
+
+            elif name == "tampered-envelope-rejected":
+                tampered = bytes.fromhex(inp["tamperedCiphertextHex"])
+                r = peel_return_envelope_layer(circuit, 1, tampered)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: expected ok={expected['ok']}, "
+                        f"got ok={r['ok']}"
+                    )
+                elif not r["ok"] and \
+                        expected["reasonContains"] not in r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'"
+                    )
+
+            else:
+                case_ok = False
+                failures.append(
+                    f"{name}: unknown return-template case name")
+
+            if not case_ok:
+                # already pushed to failures
+                pass
+
+        except Exception as e:
+            failures.append(f"{v.get('name', '?')}: threw {e}")
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} return-template cases match",
+        "actual": f"{len(vectors)} return-template cases match" if passed
                   else f"FAILED: {'; '.join(failures)}",
     }
 

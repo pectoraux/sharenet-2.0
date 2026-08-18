@@ -1,0 +1,101 @@
+{
+  "id": "V-CIRCUIT-RETURN-TEMPLATE-001",
+  "status": "frozen",
+  "spec": "spec/08-circuits.md §5a, R-009 Stage 2",
+  "adr": "adr/0021-return-onion-template-distribution.md",
+  "description": "ReturnOnionTemplate: the initiator constructs a layered encrypted envelope wrapping K_ret (circuit-scoped return key) during setup. The gateway holds K_ret + the opaque envelope (NOT the per-hop returnKeys). To send a return response, the gateway seals the payload with K_ret and attaches the envelope; each relay peels one returnKey layer; the source recovers K_ret and decrypts. Model A (layered encrypted return template) — the gateway can return traffic without holding raw returnKeys.",
+  "sharedInputs": {
+    "commitmentRootHex": "52416cf6cb97a1edd0a4a2387802e3f677a08723982bf47db5814f380e638ecd",
+    "noncePrefixHex": "4164e958eaf04edb",
+    "circuitIdHex": "3fae5199b58f763e61beb32338f6de27d79f9786b5d7bdb7049399aad4e11c94",
+    "initiatorX25519SecretKeyHex": "0101010101010101010101010101010101010101010101010101010101010101",
+    "initiatorX25519PubHex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+    "relay0X25519SecretKeyHex": "0202020202020202020202020202020202020202020202020202020202020202",
+    "relay0X25519PubHex": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
+    "relay1X25519SecretKeyHex": "0303030303030303030303030303030303030303030303030303030303030303",
+    "relay1X25519PubHex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22",
+    "returnKey0Hex": "fe64775b7664369add95ef58306720c7bd577624d443cc2eb8289214c7b9b17f",
+    "returnKey1Hex": "37f11f254636a715066bef1833f8e0e3cfd256e85dfecc89bbfc88ba49d8de96",
+    "kRetHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "plaintextHex": "485454502f312e3120323030204f4b0d0a436f6e74656e742d4c656e6774683a20300d0a0d0a",
+    "plaintextAscii": "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    "referenceNow": 1786876545
+  },
+  "vectors": [
+    {
+      "name": "construct-template",
+      "description": "constructReturnOnionTemplate: N-layer-deep envelope wrapping K_ret. Envelope = AEAD(returnKey_0, K_ret) then AEAD(returnKey_1, env_0).",
+      "input": {},
+      "expected": {
+        "kRetHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "envelopeHex": "89dbc9d07f8835e6155df8fa69e4fae1851bfe11de82fae5b4a0e7c8e030e6c17f4517cfff5c2c4027b163f452dc5e602b943bd3158ad778560dbecc61400108",
+        "envelopeLen": 64
+      }
+    },
+    {
+      "name": "seal-return-from-template",
+      "description": "sealReturnFrameFromTemplate: gateway seals the response with K_ret + attaches the envelope → backward frame ciphertext (CBOR { sealedPayload, envelope }).",
+      "input": {
+        "frameSequence": 1,
+        "plaintextHex": "485454502f312e3120323030204f4b0d0a436f6e74656e742d4c656e6774683a20300d0a0d0a"
+      },
+      "expected": {
+        "ciphertextHex": "a2015836a78addff0b6bbd90ce74f32afd70dad83ea753140d6a5c19d7fba2acf6c56bee792301dba0fc232a61699b8e4ef0f859d9dc1469329002584089dbc9d07f8835e6155df8fa69e4fae1851bfe11de82fae5b4a0e7c8e030e6c17f4517cfff5c2c4027b163f452dc5e602b943bd3158ad778560dbecc61400108",
+        "ciphertextLen": 125
+      }
+    },
+    {
+      "name": "peel-envelope-hop1",
+      "description": "peelReturnEnvelopeLayer at hop 1: peels returnKey_1 from the envelope → inner { sealedPayload, innerEnvelope }. NOT terminal (terminal is hop 0).",
+      "input": {
+        "ciphertextHex": "a2015836a78addff0b6bbd90ce74f32afd70dad83ea753140d6a5c19d7fba2acf6c56bee792301dba0fc232a61699b8e4ef0f859d9dc1469329002584089dbc9d07f8835e6155df8fa69e4fae1851bfe11de82fae5b4a0e7c8e030e6c17f4517cfff5c2c4027b163f452dc5e602b943bd3158ad778560dbecc61400108"
+      },
+      "expected": {
+        "ok": true,
+        "isTerminal": false,
+        "innerCiphertextHex": "a2015836a78addff0b6bbd90ce74f32afd70dad83ea753140d6a5c19d7fba2acf6c56bee792301dba0fc232a61699b8e4ef0f859d9dc146932900258300b2932690137591cf99d3691017369b8b4c41d563345f71bcaa3ec8b5d9d8d0cfaa50bf3b9ba80b0830fa31c163e8387"
+      }
+    },
+    {
+      "name": "peel-envelope-hop0-terminal",
+      "description": "peelReturnEnvelopeLayer at hop 0 (terminal): peels returnKey_0 → recovers K_ret. K_ret matches the template's.",
+      "input": {
+        "innerCiphertextHex": "a2015836a78addff0b6bbd90ce74f32afd70dad83ea753140d6a5c19d7fba2acf6c56bee792301dba0fc232a61699b8e4ef0f859d9dc146932900258300b2932690137591cf99d3691017369b8b4c41d563345f71bcaa3ec8b5d9d8d0cfaa50bf3b9ba80b0830fa31c163e8387"
+      },
+      "expected": {
+        "ok": true,
+        "isTerminal": true,
+        "kRetHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "decrypt-return-payload",
+      "description": "decryptReturnPayload: source decrypts the sealedPayload with K_ret → original response plaintext.",
+      "input": {
+        "kRetHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "frameSequence": 1,
+        "sealedPayloadHex": "derived-from-peel"
+      },
+      "expected": {
+        "ok": true,
+        "plaintextHex": "485454502f312e3120323030204f4b0d0a436f6e74656e742d4c656e6774683a20300d0a0d0a",
+        "plaintextAscii": "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+      }
+    },
+    {
+      "name": "tampered-envelope-rejected",
+      "description": "peelReturnEnvelopeLayer with a tampered envelope → AEAD fails (ok=false).",
+      "input": {
+        "tamperedCiphertextHex": "a2015836a78addff0b6bbd90ce74f32afd70dad83ea753140d6a5c19d7fba2acf6c56bee792301dba0fc232a61699b8e4ef0f859d9dc1469329002584089dbc9d07f8835e6155df8fa69e4fae1851bfe11de82fae5b4a0e7c8e030e6c17f4517cfff5c2c4027b163f452dc5e602b943bd3158ad778560dbecc61400109"
+      },
+      "expected": {
+        "ok": false,
+        "reasonContains": "AEAD"
+      }
+    }
+  ],
+  "verification": {
+    "runner": "ts-vector-runner.ts:verifyCircuitReturnTemplateVector + py_vector_verifier.py:verify_circuit_return_template_vector",
+    "notes": "Fixed seeds (initSk=0x01*32, relay0Sk=0x02*32, relay1Sk=0x03*32, kRet=0xAA*32) for reproducibility. The envelope is N AEAD layers deep (one per hop's returnKey), wrapping K_ret. The gateway holds K_ret + the opaque envelope — it does NOT hold the per-hop returnKeys."
+  }
+}

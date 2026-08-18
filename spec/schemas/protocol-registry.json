@@ -244,8 +244,15 @@
           "kind": "rule",
           "maturity": "reference-implemented",
           "spec_ref": "spec/08-circuits.md \u00a75 (setup) + \u00a74.6 (frame)",
-          "description": "Per-hop forwarding rule (R-009): a relay receives a wire CircuitFrame, decodes it (canonical CBOR), AEAD-authenticates + decrypts ONE layer (openFrame \u2014 step 1 of the R-008 frozen ordering), then the caller commits the durable sequence floor (step 2), then either forwards the inner frame to the next hop (forwardFrame) or delivers the plaintext (terminal hop). The outgoing frame carries the SAME header (nonce_prefix + frame_sequence + direction) + the inner ciphertext. Only the ciphertext shrinks (by 16 bytes per hop \u2014 the AEAD tag).",
+          "description": "Per-hop forwarding rule (R-009 Stage 1 + Stage 2): a relay receives a wire CircuitFrame, decodes it (strict canonical CBOR), AEAD-authenticates + decrypts ONE layer (openFrame \u2014 step 1 of the R-008 frozen ordering), then processCircuitWireFrame() atomically commits the durable sequence floor at (commitmentRoot, hopIndex, direction) INSIDE the function (step 2 \u2014 not caller-enforced), then forwards/delivers. For backward (return) traffic, the distributed return-onion template (ReturnOnionTemplate) provides the gateway with K_ret + an opaque envelope \u2014 the gateway seals the response with K_ret and each relay peels one returnKey layer from the envelope.",
           "conformance_vector_family": "V-CIRCUIT-FRAME"
+        },
+        "ReturnOnionTemplate": {
+          "kind": "wire",
+          "maturity": "reference-implemented",
+          "spec_ref": "spec/08-circuits.md \u00a75a (return-onion template distribution)",
+          "description": "Distributed return-onion template (R-009 Stage 2): the initiator constructs this during setup and sends it to the gateway. Contains K_ret (circuit-scoped return key) + an N-layer-deep opaque envelope (each layer AEAD under a hop returnKey, wrapping K_ret). The gateway holds K_ret + the envelope but does NOT hold the per-hop returnKeys. To send a return response, the gateway seals the payload with K_ret and attaches the envelope; each relay peels one returnKey layer; the source recovers K_ret and decrypts. Family: V-CIRCUIT-RETURN-TEMPLATE.",
+          "conformance_vector_family": "V-CIRCUIT-RETURN-TEMPLATE"
         }
       }
     },
