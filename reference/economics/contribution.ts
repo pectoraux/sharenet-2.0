@@ -244,11 +244,48 @@ export interface LedgerEntry {
 }
 
 /**
- * Compute the canonical encoding of a LedgerEntry body (excl. entryHash).
- * Keys 1-6 per spec/11 §4. The proof is represented by its hash (proofHash),
- * not the full ContributionProof object — this is the wire representation.
+ * Compute the LedgerEntry **signing payload** (what the verifier signs).
+ *
+ * Per spec/11 §4 (FROZEN): the verifier signature is OVER the entry body
+ * EXCLUDING the verifier_signature itself — otherwise the construction is
+ * circular. The signing payload includes:
+ *   sequence, proof_hash, verified_at, verifier_id, prev_hash
+ *
+ * payload = domain || canonicalEncode({1: sequence, 2: proofHash,
+ *   3: verifiedAt, 4: verifierId, 5: prevHash})
  */
-export function ledgerEntrySigningPayload(entry: Omit<LedgerEntry, "entryHash">): Uint8Array {
+export function ledgerEntrySigningPayload(
+  entry: Pick<LedgerEntry, "sequence" | "proofHash" | "verifiedAt" | "verifierId" | "prevHash">,
+): Uint8Array {
+  const m = new Map<number, unknown>([
+    [1, entry.sequence],
+    [2, entry.proofHash],
+    [3, entry.verifiedAt],
+    [4, entry.verifierId],
+    [5, entry.prevHash],
+  ]);
+  const body = canonicalEncode(m);
+  const domain = new TextEncoder().encode(LEDGER_ENTRY_DOMAIN);
+  const out = new Uint8Array(domain.length + body.length);
+  out.set(domain, 0);
+  out.set(body, domain.length);
+  return out;
+}
+
+/**
+ * Compute the LedgerEntry **hash payload** (what the entryHash is derived from).
+ *
+ * Per spec/11 §4 (FROZEN): the entry_hash INCLUDES the verifier_signature
+ * (so tampering with the signature breaks the hash chain). The hash payload
+ * includes:
+ *   sequence, proof_hash, verified_at, verifier_id, verifier_signature, prev_hash
+ *
+ * payload = domain || canonicalEncode({1: sequence, 2: proofHash,
+ *   3: verifiedAt, 4: verifierId, 5: verifierSignature, 6: prevHash})
+ */
+export function ledgerEntryHashPayload(
+  entry: Omit<LedgerEntry, "entryHash">,
+): Uint8Array {
   const m = new Map<number, unknown>([
     [1, entry.sequence],
     [2, entry.proofHash],
@@ -266,10 +303,11 @@ export function ledgerEntrySigningPayload(entry: Omit<LedgerEntry, "entryHash">)
 }
 
 /**
- * Compute the entry hash: BLAKE3-256 of the signing payload.
+ * Compute the entry hash: BLAKE3-256 of the hash payload (which INCLUDES
+ * the verifier_signature but EXCLUDES entryHash itself).
  */
 export function computeLedgerEntryHash(entry: Omit<LedgerEntry, "entryHash">): string {
-  return toHex(blake3(ledgerEntrySigningPayload(entry), { dkLen: 32 }));
+  return toHex(blake3(ledgerEntryHashPayload(entry), { dkLen: 32 }));
 }
 
 /**
@@ -318,27 +356,28 @@ export class ContributionLedger {
       ? this.entries[this.entries.length - 1]!.entryHash
       : "0".repeat(64); // genesis entry
 
-    // Build the entry (without entryHash) — uses proofHash, not the full proof
-    const entryWithoutHash: Omit<LedgerEntry, "entryHash"> = {
+    // Build the entry body (without verifierSignature or entryHash)
+    // for the signing payload. The signing payload EXCLUDES verifierSignature
+    // to avoid circularity — the verifier signs over the 5 non-signature fields.
+    const signingInput = {
       sequence: seq,
       proofHash: proof.receiptHash,
       verifiedAt: now,
       verifierId: verifierNodeId,
-      verifierSignature: new Uint8Array(0), // placeholder — will be replaced
       prevHash,
     };
 
     // Compute the signing payload and sign it
-    const payload = ledgerEntrySigningPayload(entryWithoutHash);
-    const verifierSignature = signMessage(verifierSecretKey, payload);
+    const signingPayload = ledgerEntrySigningPayload(signingInput);
+    const verifierSignature = signMessage(verifierSecretKey, signingPayload);
 
-    // Build the final entry with the real signature
+    // Build the full entry (with the real signature, without entryHash)
     const entryWithSignature: Omit<LedgerEntry, "entryHash"> = {
-      ...entryWithoutHash,
+      ...signingInput,
       verifierSignature,
     };
 
-    // Compute the entry hash
+    // Compute the entry hash (over the hash payload — INCLUDES verifierSignature)
     const entryHash = computeLedgerEntryHash(entryWithSignature);
 
     const entry: LedgerEntry = {
@@ -372,7 +411,17 @@ export class ContributionLedger {
         return { ok: false, reason: `chain broken at entry ${i}: prevHash ${entry.prevHash.slice(0, 16)}... != expected ${prevHash.slice(0, 16)}...` };
       }
 
-      // Verify verifier signature
+      // Verify verifier signature (over signing payload — EXCLUDES verifierSignature)
+      const signingPayload = ledgerEntrySigningPayload(entry);
+      const pubKey = verifierPublicKeys.get(entry.verifierId);
+      if (!pubKey) {
+        return { ok: false, reason: `entry ${i}: no public key for verifier ${entry.verifierId}` };
+      }
+      if (!verifySignature(pubKey, signingPayload, entry.verifierSignature)) {
+        return { ok: false, reason: `entry ${i}: verifier signature invalid` };
+      }
+
+      // Verify entryHash (over hash payload — INCLUDES verifierSignature)
       const entryWithoutHash: Omit<LedgerEntry, "entryHash"> = {
         sequence: entry.sequence,
         proofHash: entry.proofHash,
@@ -381,16 +430,6 @@ export class ContributionLedger {
         verifierSignature: entry.verifierSignature,
         prevHash: entry.prevHash,
       };
-      const payload = ledgerEntrySigningPayload(entryWithoutHash);
-      const pubKey = verifierPublicKeys.get(entry.verifierId);
-      if (!pubKey) {
-        return { ok: false, reason: `entry ${i}: no public key for verifier ${entry.verifierId}` };
-      }
-      if (!verifySignature(pubKey, payload, entry.verifierSignature)) {
-        return { ok: false, reason: `entry ${i}: verifier signature invalid` };
-      }
-
-      // Verify entryHash
       const recomputedHash = computeLedgerEntryHash(entryWithoutHash);
       if (recomputedHash !== entry.entryHash) {
         return { ok: false, reason: `entry ${i}: entryHash ${entry.entryHash.slice(0, 16)}... != recomputed ${recomputedHash.slice(0, 16)}...` };

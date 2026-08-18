@@ -239,6 +239,13 @@
       "schema_version": "1",
       "expected_result": "canonical CandidateDestination encoding",
       "file": "V-DISCOVERY-001.json"
+    },
+    {
+      "id": "V-LEDGER-ENTRY-001",
+      "protocol": "economics",
+      "schema_version": "1",
+      "expected_result": "LedgerEntry split signing/hash payload construction + mutations",
+      "file": "V-LEDGER-ENTRY-001.json"
     }
   ]
 }

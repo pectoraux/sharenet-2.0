@@ -100,7 +100,7 @@
       "objects": {
         "BilateralReceipt": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-RECEIPT", "description": "Dual-signed receipt: gateway + peer signatures over service session" },
         "ContributionProof": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Derived proof from verified receipt: receiptHash, contributor, bytesForwarded" },
-        "LedgerEntry": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Hash-chained ledger entry with verifier signature per spec/11 §4. Fields: sequence, proof (by hash), verifiedAt, verifierId, verifierSignature, prevHash, entryHash. Implemented in reference/economics/contribution.ts." }
+        "LedgerEntry": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-LEDGER-ENTRY", "description": "Hash-chained ledger entry with verifier signature per spec/11 §4. Fields: sequence, proofHash, verifiedAt, verifierId, verifierSignature, prevHash, entryHash. Split signing payload (excl. verifierSignature) + hash payload (incl. verifierSignature). Implemented in reference/economics/contribution.ts." }
       }
     }
   }

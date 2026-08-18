@@ -427,6 +427,9 @@ def verify_vector(data: dict) -> dict:
     elif vid.startswith("V-DISCOVERY-"):
         return verify_discovery_vector(data)
 
+    elif vid.startswith("V-LEDGER-ENTRY-"):
+        return verify_ledger_entry_vector(data)
+
     return {"id": vid, "passed": False, "expected": "known type", "actual": "unknown type"}
 
 
@@ -2100,6 +2103,102 @@ def verify_discovery_vector(data: dict) -> dict:
         "expected": f"{len(vectors)} discovery vectors match",
         "actual": f"{len(vectors)} discovery vectors match" if passed else f"FAILED: {'; '.join(failures)}",
     }
+
+
+LEDGER_ENTRY_DOMAIN = b"SHARENET/CONTRIBUTION/LEDGER/1"
+
+
+def _ledger_entry_signing_payload(entry: dict) -> bytes:
+    m = {}
+    m[1] = entry["sequence"]
+    m[2] = entry["proofHash"]
+    m[3] = entry["verifiedAt"]
+    m[4] = entry["verifierId"]
+    m[5] = entry["prevHash"]
+    return LEDGER_ENTRY_DOMAIN + cbor2.dumps(m, canonical=True)
+
+
+def _ledger_entry_hash_payload(entry: dict) -> bytes:
+    m = {}
+    m[1] = entry["sequence"]
+    m[2] = entry["proofHash"]
+    m[3] = entry["verifiedAt"]
+    m[4] = entry["verifierId"]
+    sig = entry.get("verifierSignature", b"")
+    if isinstance(sig, str):
+        sig = bytes.fromhex(sig)
+    m[5] = sig
+    m[6] = entry["prevHash"]
+    return LEDGER_ENTRY_DOMAIN + cbor2.dumps(m, canonical=True)
+
+
+def verify_ledger_entry_vector(data: dict) -> dict:
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            sk = v.get("sharedKeys", {})
+            verifier_pub = bytes.fromhex(sk["verifierPublicKeyHex"])
+            signing_input = {
+                "sequence": inp["sequence"], "proofHash": inp["proofHash"],
+                "verifiedAt": inp["verifiedAt"], "verifierId": inp["verifierId"],
+                "prevHash": inp["prevHash"],
+            }
+
+            if v["name"] == "valid-genesis-entry":
+                sp = _ledger_entry_signing_payload(signing_input)
+                if sp.hex() != v["intermediate"]["signingPayloadHex"]:
+                    failures.append(f'{v["name"]}: signingPayload mismatch'); continue
+                sig = bytes.fromhex(v["expected"]["verifierSignatureHex"])
+                hp = _ledger_entry_hash_payload({**signing_input, "verifierSignature": sig})
+                if hp.hex() != v["intermediate"]["hashPayloadHex"]:
+                    failures.append(f'{v["name"]}: hashPayload mismatch'); continue
+                try:
+                    VerifyKey(verifier_pub).verify(sp, sig); sv = True
+                except Exception:
+                    sv = False
+                if sv != v["expected"]["signatureValid"]:
+                    failures.append(f'{v["name"]}: sigValid mismatch'); continue
+                eh = blake3.blake3(hp).digest().hex()
+                if eh != v["expected"]["entryHash"]:
+                    failures.append(f'{v["name"]}: entryHash mismatch'); continue
+
+            elif v["name"] == "tampered-signature":
+                sp = _ledger_entry_signing_payload(signing_input)
+                ts = bytes.fromhex(v["intermediate"]["tamperedSignatureHex"])
+                try:
+                    VerifyKey(verifier_pub).verify(sp, ts); sv = True
+                except Exception:
+                    sv = False
+                if sv != v["expected"]["signatureValid"]:
+                    failures.append(f'{v["name"]}: sigValid mismatch')
+
+            elif v["name"] in ("tampered-proof-hash", "tampered-prev-hash"):
+                mp = _ledger_entry_signing_payload(signing_input)
+                op = sk.get("originalSigningPayloadHex", "")
+                if v["expected"].get("signatureDiffers") and mp.hex() == op:
+                    failures.append(f'{v["name"]}: payload should differ')
+                mhp = _ledger_entry_hash_payload({**signing_input, "verifierSignature": b"\x00" * 64})
+                oh = sk.get("originalEntryHash", "")
+                if v["expected"].get("entryHashDiffers") and blake3.blake3(mhp).digest().hex() == oh:
+                    failures.append(f'{v["name"]}: entry hash should differ')
+
+            elif v["name"] == "tampered-verifier-id":
+                mp = _ledger_entry_signing_payload(signing_input)
+                op = sk.get("originalSigningPayloadHex", "")
+                if v["expected"].get("signatureValid") is False and mp.hex() == op:
+                    failures.append(f'{v["name"]}: payload should differ')
+
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {"id": vid, "passed": passed,
+            "expected": f"{len(vectors)} ledger-entry vectors match",
+            "actual": f"{len(vectors)} ledger-entry vectors match" if passed else f"FAILED: {'; '.join(failures)}"}
 
 
 # -----------------------------------------------------------------------

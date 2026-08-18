@@ -123,9 +123,37 @@ LedgerEntry = {
 ```
 
 Ledger entries are hash-chained: `entry_n.prev_hash = entry_{n-1}.entry_hash`.
-Tampering with any entry breaks the chain. The verifier signature is over
-`"SHARENET/CONTRIBUTION/LEDGER/1" || canonicalEncode({sequence, proof_hash,
-verified_at, verifier_id, verifier_signature, prev_hash})`.
+Tampering with any entry breaks the chain.
+
+**Signing payload** (what the verifier signs — EXCLUDES `verifier_signature`):
+```
+signing_payload = "SHARENET/CONTRIBUTION/LEDGER/1"
+    || canonicalEncode({
+        1: sequence,
+        2: proof_hash,
+        3: verified_at,
+        4: verifier_id,
+        5: prev_hash
+    })
+```
+
+**Entry hash payload** (what `entry_hash` is derived from — INCLUDES `verifier_signature`):
+```
+hash_payload = "SHARENET/CONTRIBUTION/LEDGER/1"
+    || canonicalEncode({
+        1: sequence,
+        2: proof_hash,
+        3: verified_at,
+        4: verifier_id,
+        5: verifier_signature,
+        6: prev_hash
+    })
+entry_hash = BLAKE3-256(hash_payload)
+```
+
+The signing and hash payloads are **separately defined** and non-circular:
+the verifier signs over fields excluding its own signature, then the
+entry hash covers the full entry (including the signature).
 
 ## 5. From Proofs to Civic Points
 

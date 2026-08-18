@@ -1,0 +1,115 @@
+{
+  "id": "V-LEDGER-ENTRY-001",
+  "status": "frozen",
+  "spec": "spec/11-contribution.md §4",
+  "description": "Canonical LedgerEntry construction: split signing payload (excl. verifierSignature) + entry hash payload (incl. verifierSignature). Non-circular.",
+  "statusNote": "reference-implemented — the LedgerEntry split-payload construction is implemented in reference/economics/contribution.ts.",
+  "vectors": [
+    {
+      "name": "valid-genesis-entry",
+      "description": "A valid genesis LedgerEntry (sequence=0, prevHash=0*64) with split signing/hash payloads",
+      "input": {
+        "sequence": 0,
+        "proofHash": "abcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "verifiedAt": 1786876545,
+        "verifierId": "y4dp4nssqbhxtoyvstrzkk6asoqxrjlc2mjzrx7m7lsokiyshdyq",
+        "prevHash": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "intermediate": {
+        "signingPayloadHex": "53484152454e45542f434f4e545249425554494f4e2f4c45444745522f31a5010002784061626364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364031a6a81928104783479346470346e737371626878746f79767374727a6b6b3661736f7178726a6c63326d6a7a7278376d376c736f6b6979736864797105784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030",
+        "hashPayloadHex": "53484152454e45542f434f4e545249425554494f4e2f4c45444745522f31a6010002784061626364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364031a6a81928104783479346470346e737371626878746f79767374727a6b6b3661736f7178726a6c63326d6a7a7278376d376c736f6b697973686479710558402c2af267f07091c32c93809b9f5042b798a263a14e588346cb6aeddce6dc46a47b83f8c49b1a323b8f730042862df76b3c2c9fe136acb6f073bd523dcd08640b06784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030"
+      },
+      "expected": {
+        "verifierSignatureHex": "2c2af267f07091c32c93809b9f5042b798a263a14e588346cb6aeddce6dc46a47b83f8c49b1a323b8f730042862df76b3c2c9fe136acb6f073bd523dcd08640b",
+        "entryHash": "09ef572877aa3d2ec1851ce91813f402cbce63a1392196a1fa8eb4ce952a8b9a",
+        "signatureValid": true
+      },
+      "sharedKeys": {
+        "verifierPublicKeyHex": "44ea3b2d8d686342add05b1e0e602f4069ce44b3472d6b8f8760fb0dd85eaeb2"
+      }
+    },
+    {
+      "name": "tampered-signature",
+      "description": "Flip a byte in the signature — verification MUST fail",
+      "input": {
+        "sequence": 0,
+        "proofHash": "abcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "verifiedAt": 1786876545,
+        "verifierId": "y4dp4nssqbhxtoyvstrzkk6asoqxrjlc2mjzrx7m7lsokiyshdyq",
+        "prevHash": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "intermediate": {
+        "signingPayloadHex": "53484152454e45542f434f4e545249425554494f4e2f4c45444745522f31a5010002784061626364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364031a6a81928104783479346470346e737371626878746f79767374727a6b6b3661736f7178726a6c63326d6a7a7278376d376c736f6b6979736864797105784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030",
+        "tamperedSignatureHex": "2c2af267f07091c32c93819b9f5042b798a263a14e588346cb6aeddce6dc46a47b83f8c49b1a323b8f730042862df76b3c2c9fe136acb6f073bd523dcd08640b"
+      },
+      "expected": {
+        "signatureValid": false
+      },
+      "sharedKeys": {
+        "verifierPublicKeyHex": "44ea3b2d8d686342add05b1e0e602f4069ce44b3472d6b8f8760fb0dd85eaeb2"
+      }
+    },
+    {
+      "name": "tampered-proof-hash",
+      "description": "Change proofHash — both signature and entryHash MUST differ",
+      "input": {
+        "sequence": 0,
+        "proofHash": "ffeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "verifiedAt": 1786876545,
+        "verifierId": "y4dp4nssqbhxtoyvstrzkk6asoqxrjlc2mjzrx7m7lsokiyshdyq",
+        "prevHash": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "intermediate": {},
+      "expected": {
+        "signatureDiffers": true,
+        "entryHashDiffers": true
+      },
+      "sharedKeys": {
+        "verifierPublicKeyHex": "44ea3b2d8d686342add05b1e0e602f4069ce44b3472d6b8f8760fb0dd85eaeb2",
+        "originalSigningPayloadHex": "53484152454e45542f434f4e545249425554494f4e2f4c45444745522f31a5010002784061626364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364031a6a81928104783479346470346e737371626878746f79767374727a6b6b3661736f7178726a6c63326d6a7a7278376d376c736f6b6979736864797105784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030",
+        "originalEntryHash": "09ef572877aa3d2ec1851ce91813f402cbce63a1392196a1fa8eb4ce952a8b9a"
+      }
+    },
+    {
+      "name": "tampered-prev-hash",
+      "description": "Change prevHash — both signature and entryHash MUST differ",
+      "input": {
+        "sequence": 0,
+        "proofHash": "abcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "verifiedAt": 1786876545,
+        "verifierId": "y4dp4nssqbhxtoyvstrzkk6asoqxrjlc2mjzrx7m7lsokiyshdyq",
+        "prevHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "intermediate": {},
+      "expected": {
+        "signatureDiffers": true,
+        "entryHashDiffers": true
+      },
+      "sharedKeys": {
+        "verifierPublicKeyHex": "44ea3b2d8d686342add05b1e0e602f4069ce44b3472d6b8f8760fb0dd85eaeb2",
+        "originalSigningPayloadHex": "53484152454e45542f434f4e545249425554494f4e2f4c45444745522f31a5010002784061626364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364031a6a81928104783479346470346e737371626878746f79767374727a6b6b3661736f7178726a6c63326d6a7a7278376d376c736f6b6979736864797105784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030",
+        "originalEntryHash": "09ef572877aa3d2ec1851ce91813f402cbce63a1392196a1fa8eb4ce952a8b9a"
+      }
+    },
+    {
+      "name": "tampered-verifier-id",
+      "description": "Change verifierId — signature MUST fail (different verifier identity)",
+      "input": {
+        "sequence": 0,
+        "proofHash": "abcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "verifiedAt": 1786876545,
+        "verifierId": "different-verifier-node-id",
+        "prevHash": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "intermediate": {},
+      "expected": {
+        "signatureValid": false
+      },
+      "sharedKeys": {
+        "verifierPublicKeyHex": "44ea3b2d8d686342add05b1e0e602f4069ce44b3472d6b8f8760fb0dd85eaeb2",
+        "originalSigningPayloadHex": "53484152454e45542f434f4e545249425554494f4e2f4c45444745522f31a5010002784061626364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364636463646364031a6a81928104783479346470346e737371626878746f79767374727a6b6b3661736f7178726a6c63326d6a7a7278376d376c736f6b6979736864797105784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030"
+      }
+    }
+  ],
+  "verification": "tests/r007-completeness.test.ts verifies the vector family is in the manifest. TS+Python runners verify the split-payload construction independently."
+}
