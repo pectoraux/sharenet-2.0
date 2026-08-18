@@ -37,8 +37,14 @@ import {
   relayDecrypt,
 } from "@reference/circuit/circuit";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
+import {
+  InMemoryCircuitSequenceFloorStore,
+  InMemoryCircuitAckReplayStore,
+} from "@reference/circuit/replay-stores";
 
 const NOW = 1786876545;
+const testFloorStore = new InMemoryCircuitSequenceFloorStore();
+const testAckStore = new InMemoryCircuitAckReplayStore();
 
 function setupRoute(numHops = 2) {
   const ctx = makeGenuineBrandedRouteHelper(numHops, NOW);
@@ -88,7 +94,7 @@ describe("R-008: Distributed circuit establishment", () => {
     // Initiator establishes the circuit from both acks
     const acks = [relay0Result.ack, relay1Result.ack];
     const estResult = await establishDistributedCircuit(
-      ctx.branded, initSk, initPk, acks, ctx.hpk, NOW,
+      ctx.branded, initSk, initPk, acks, ctx.hpk, NOW, testAckStore, testFloorStore,
     );
     expect(estResult.ok).toBe(true);
     if (!estResult.ok) return;
@@ -124,7 +130,7 @@ describe("R-008: Distributed circuit establishment", () => {
     // processCircuitSetupAck now takes commitmentRoot (not circuitId) as the 8th arg.
     const result = await processCircuitSetupAck(
       tamperedAck, ctx.branded.routeId, commitDigestHex, 0,
-      initPk, ctx.kps[0]!.publicKey, initSk, ctx.branded.commitmentRoot, NOW,
+      initPk, ctx.kps[0]!.publicKey, initSk, ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("routeId mismatch");
@@ -149,7 +155,7 @@ describe("R-008: Distributed circuit establishment", () => {
     const circuitId2 = deriveCircuitId(ctx2.branded.commitmentRoot, initPk);
     const result = await processCircuitSetupAck(
       relayResult.ack, ctx2.branded.routeId, bytesToHex(randomBytes(32)), 0,
-      initPk, ctx1.kps[0]!.publicKey, initSk, ctx2.branded.commitmentRoot, NOW,
+      initPk, ctx1.kps[0]!.publicKey, initSk, ctx2.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("routeId mismatch");
@@ -179,7 +185,7 @@ describe("R-008: Distributed circuit establishment", () => {
     ])), { dkLen: 32 }));
     const result = await processCircuitSetupAck(
       relay0Result.ack, ctx.branded.routeId, commitDigestHex, 0,
-      initPk, wrongKey, initSk, ctx.branded.commitmentRoot, NOW,
+      initPk, wrongKey, initSk, ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("signature invalid");
@@ -216,7 +222,7 @@ describe("R-008: Distributed circuit establishment", () => {
 
     // establishDistributedCircuit must reject the fake route
     const result = await establishDistributedCircuit(
-      fakeRoute as any, randomBytes(32), randomBytes(32), [], new Map(), NOW,
+      fakeRoute as any, randomBytes(32), randomBytes(32), [], new Map(), NOW, testAckStore, testFloorStore,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("not a genuine BrandedCommittedRoute");
@@ -247,7 +253,7 @@ describe("R-008: Distributed circuit establishment", () => {
     // Initiator establishes the circuit
     const acks = [relay0Result.ack, relay1Result.ack];
     const estResult = await establishDistributedCircuit(
-      ctx.branded, initSk, initPk, acks, ctx.hpk, NOW,
+      ctx.branded, initSk, initPk, acks, ctx.hpk, NOW, testAckStore, testFloorStore,
     );
     expect(estResult.ok).toBe(true);
     if (!estResult.ok) return;

@@ -148,9 +148,14 @@ describe("R-008 durable integration: sequence floor survives process restart", (
     expect(circuit2.replayGuard.getSequenceFloor()).toBe(5n);
 
     // Attempt to process seq=4 (≤ floor 5) → must be REJECTED.
-    // Content is irrelevant — the sequence check rejects before decryption.
-    const fakeCiphertext = randomBytes(48);
-    const result = await processCircuitFrame(circuit2, 0, 4, fakeCiphertext);
+    // R-008 final hardening: AEAD authenticates FIRST. So we must send
+    // VALID ciphertext (encrypted with circuit2's own keys) to get past
+    // the AEAD check — then the floor check rejects the stale sequence.
+    // (Invalid ciphertext would be rejected at AEAD before the floor is
+    // even checked — that's the DoS fix.)
+    const pt = new TextEncoder().encode("stale frame after restart");
+    const { encryptedPayload: validStaleFrame } = onionEncrypt(circuit2, 4, pt);
+    const result = await processCircuitFrame(circuit2, 0, 4, validStaleFrame);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toContain("≤ floor");
@@ -463,7 +468,12 @@ describe("R-008 durable integration: establishDistributedCircuit uses both durab
     expect(est.circuit.replayGuard.getSequenceFloor()).toBe(PRE_SET_FLOOR);
 
     // A frame with seq=5 (≤ floor 10) → REJECTED (old frame replay after re-key).
-    const r = await processCircuitFrame(est.circuit, 0, 5, randomBytes(48));
+    // R-008 final hardening: AEAD authenticates FIRST. We must send VALID
+    // ciphertext (encrypted with the new circuit's keys) so the AEAD check
+    // passes — then the floor check rejects the stale sequence.
+    const stalePt = new TextEncoder().encode("stale after re-key");
+    const { encryptedPayload: staleFrame } = onionEncrypt(est.circuit, 5, stalePt);
+    const r = await processCircuitFrame(est.circuit, 0, 5, staleFrame);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("≤ floor");
 
@@ -474,5 +484,182 @@ describe("R-008 durable integration: establishDistributedCircuit uses both durab
     expect(r2.ok).toBe(true);
     if (r2.ok) expect(new TextDecoder().decode(r2.decrypted)).toBe("post-re-key packet");
     expect(await floorStore.getFloor(route.commitmentRoot)).toBe(11n);
+  });
+});
+
+// =====================================================================
+// SCENARIO 5: AEAD-first ordering — tampered frames must NOT advance the floor
+// (R-008 final hardening: the DoS vector flagged in the re-audit)
+// =====================================================================
+
+describe("R-008 final hardening: AEAD authenticates BEFORE durable commit (no floor-burning DoS)", () => {
+  let floorStore: DurableSqliteCircuitSequenceFloorStore;
+
+  beforeAll(async () => {
+    floorStore = new DurableSqliteCircuitSequenceFloorStore();
+    await db.circuitSequenceFloor.deleteMany({});
+  });
+
+  afterAll(async () => {
+    await db.circuitSequenceFloor.deleteMany({});
+  });
+
+  // The DoS vector flagged in the re-audit:
+  //   "sequence floor can be burned before AEAD authentication"
+  //
+  // Under the OLD (buggy) order (commit → decrypt):
+  //   attacker sends seq=100 + invalid ciphertext → floor becomes 100
+  //   legitimate seq=100 → rejected forever (100 ≤ floor 100)
+  //
+  // Under the FROZEN order (AEAD → commit):
+  //   attacker sends seq=100 + invalid ciphertext → AEAD fails → floor UNCHANGED
+  //   legitimate seq=100 → accepted (floor was never burned)
+  test("10. invalid ciphertext at seq=100 → floor UNCHANGED (AEAD fails before commit)", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Floor starts at 0 (fresh route).
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+
+    // Attacker sends seq=100 with INVALID ciphertext (random bytes, not a
+    // valid AEAD ciphertext for this circuit's key). Under the frozen order
+    // (AEAD → commit), the AEAD tag check fails FIRST, and the floor is
+    // NEVER touched.
+    const invalidCiphertext = randomBytes(64); // wrong key, wrong tag
+    const result = await processCircuitFrame(circuit, 0, 100, invalidCiphertext);
+
+    // The frame is rejected (decryption failure).
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("decryption failed");
+
+    // CRITICAL INVARIANT: the floor is STILL 0. The attacker could NOT burn
+    // seq=100 by sending invalid ciphertext. This is the DoS fix.
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+  });
+
+  test("11. valid ciphertext at seq=1 → floor ADVANCES to 1", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Encrypt a GENUINE frame seq=1 (valid AEAD ciphertext for this circuit).
+    const plaintext = new TextEncoder().encode("authenticated frame");
+    const { encryptedPayload } = onionEncrypt(circuit, 1, plaintext);
+
+    const result = await processCircuitFrame(circuit, 0, 1, encryptedPayload);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(new TextDecoder().decode(result.decrypted)).toBe("authenticated frame");
+    }
+
+    // The floor advanced to 1 (genuine authenticated frame).
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+  });
+
+  test("12. after invalid seq=100 rejected: legitimate seq=2 still accepted (floor not burned)", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // First: process a valid seq=1 → floor = 1.
+    const pt1 = new TextEncoder().encode("first");
+    const { encryptedPayload: enc1 } = onionEncrypt(circuit, 1, pt1);
+    const r1 = await processCircuitFrame(circuit, 0, 1, enc1);
+    expect(r1.ok).toBe(true);
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+
+    // Attacker: send seq=100 with INVALID ciphertext → rejected, floor STAYS 1.
+    const attackResult = await processCircuitFrame(circuit, 0, 100, randomBytes(64));
+    expect(attackResult.ok).toBe(false);
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // UNCHANGED
+
+    // Legitimate: seq=2 with VALID ciphertext → accepted (floor was not burned).
+    const pt2 = new TextEncoder().encode("second");
+    const { encryptedPayload: enc2 } = onionEncrypt(circuit, 2, pt2);
+    const r2 = await processCircuitFrame(circuit, 0, 2, enc2);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) expect(new TextDecoder().decode(r2.decrypted)).toBe("second");
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(2n);
+  });
+
+  test("13. replay of valid captured frame at seq=1 → AEAD succeeds but commit rejects (floor unchanged)", async () => {
+    // This proves the AEAD-first order is still replay-safe: even though
+    // AEAD succeeds for a replayed valid ciphertext, the durable commit
+    // catches the replay (seq ≤ floor) and rejects the frame. The floor
+    // does NOT advance for a replay.
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Genuine seq=1 → accepted, floor = 1.
+    const pt = new TextEncoder().encode("genuine");
+    const { encryptedPayload } = onionEncrypt(circuit, 1, pt);
+    const r1 = await processCircuitFrame(circuit, 0, 1, encryptedPayload);
+    expect(r1.ok).toBe(true);
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+
+    // Replay: same ciphertext at seq=1. AEAD succeeds (valid ciphertext,
+    // same key+nonce → same plaintext), but the durable commit rejects
+    // (1 ≤ floor 1). The frame is rejected, floor stays at 1.
+    const replay = await processCircuitFrame(circuit, 0, 1, encryptedPayload);
+    expect(replay.ok).toBe(false);
+    if (!replay.ok) expect(replay.reason).toContain("≤ floor");
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // UNCHANGED
+  });
+});
+
+// =====================================================================
+// SCENARIO 6: Production API without a durable store → TypeScript rejects
+// (R-008 final hardening: mandatory store params, type-level enforcement)
+// =====================================================================
+
+describe("R-008 final hardening: production APIs require a store (type-level enforcement)", () => {
+  // This test documents the type-level enforcement: setupCircuit,
+  // establishDistributedCircuit, and processCircuitSetupAck all require
+  // a store parameter (non-optional, no default). Calling them without
+  // a store is a TypeScript compile error, not a runtime failure.
+  //
+  // The test verifies at runtime that the InMemory*Store implementations
+  // are NOT the default (i.e., the function arity has changed to require
+  // the store argument). This is a guard against accidentally reintroducing
+  // a default in-memory fallback.
+
+  test("14. setupCircuit requires a floorStore (no in-memory default — arity check)", () => {
+    // setupCircuit(route, relayKeys, now, floorStore, initialFloor?)
+    // All params except initialFloor are required (no defaults). The optional
+    // initialFloor still counts in .length (it has no default value). So
+    // .length = 5. The key point: floorStore (4th param) has no default —
+    // a call with only 3 args would be a TypeScript compile error.
+    expect(setupCircuit.length).toBe(5);
+  });
+
+  test("15. processCircuitSetupAck with undefined ackStore → throws (no silent fallback)", async () => {
+    // Simulate a production bug: caller forgot to pass a store (undefined).
+    // The old API would have silently used a fresh InMemoryCircuitAckReplayStore
+    // (the default). The hardened API must NOT silently fall back — calling
+    // ackStore.consume() on undefined throws, which is fail-closed behavior.
+    //
+    // This proves there is no in-memory default: the store MUST be supplied.
+    const route = makeRoute(1);
+    const initSk = randomBytes(32);
+    const initPk = x25519.getPublicKey(initSk);
+    const req: CircuitSetupRequest = {
+      route: route.branded, hopIndex: 0,
+      initiatorX25519PublicKey: initPk, setupNonce: randomBytes(16),
+    };
+    const relayResult = handleCircuitSetup(req, route.kps[0]!.secretKey, route.commitmentRoot, NOW);
+    if (!relayResult.ok) return;
+
+    // Bypass the type system: pass undefined as the ackStore.
+    // The function reaches ackStore.consume() (all crypto checks pass for a
+    // genuine ack), then throws TypeError — NOT a silent in-memory fallback.
+    await expect(
+      processCircuitSetupAck(
+        relayResult.ack, route.branded.routeId, route.commitDigestHex, 0,
+        initPk, route.kps[0]!.publicKey, initSk, route.commitmentRoot, NOW,
+        undefined as unknown as import("@reference/circuit/replay-stores").CircuitAckReplayStore,
+      ),
+    ).rejects.toThrow();
   });
 });

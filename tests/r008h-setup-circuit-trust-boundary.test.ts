@@ -32,10 +32,12 @@ import {
   isBrandedCommittedRoute,
 } from "@reference/transport/validated-types";
 import { setupCircuit } from "@reference/circuit/circuit";
+import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
+const testFloorStore = new InMemoryCircuitSequenceFloorStore();
 
 /** Build a genuine 1-hop BrandedCommittedRoute through the full proof-carrying pipeline. */
 function makeGenuineBrandedRoute() {
@@ -65,7 +67,7 @@ describe("R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute
     const legacy = createCommittedRoute(ctx.commitment);
     expect(isBrandedCommittedRoute(legacy)).toBe(false);
     const relayKeys = makeRelayKeys(ctx.kp.nodeId);
-    expect(() => setupCircuit(legacy as any, relayKeys, NOW)).toThrow(
+    expect(() => setupCircuit(legacy as any, relayKeys, NOW, testFloorStore)).toThrow(
       /not a genuine BrandedCommittedRoute|WeakSet membership check failed/i,
     );
   });
@@ -83,7 +85,7 @@ describe("R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute
     };
     expect(isBrandedCommittedRoute(plainObject)).toBe(false);
     const relayKeys = makeRelayKeys(ctx.kp.nodeId);
-    expect(() => setupCircuit(plainObject as any, relayKeys, NOW)).toThrow(
+    expect(() => setupCircuit(plainObject as any, relayKeys, NOW, testFloorStore)).toThrow(
       /not a genuine BrandedCommittedRoute|WeakSet membership check failed/i,
     );
   });
@@ -93,7 +95,7 @@ describe("R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute
     const ctx = makeGenuineBrandedRoute();
     expect(isBrandedCommittedRoute(ctx.proposal)).toBe(false);
     const relayKeys = makeRelayKeys(ctx.kp.nodeId);
-    expect(() => setupCircuit(ctx.proposal as any, relayKeys, NOW)).toThrow(
+    expect(() => setupCircuit(ctx.proposal as any, relayKeys, NOW, testFloorStore)).toThrow(
       /not a genuine BrandedCommittedRoute|WeakSet membership check failed/i,
     );
   });
@@ -106,7 +108,7 @@ describe("R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute
     expect(isBrandedCommittedRoute(copy)).toBe(false);
     expect(isBrandedCommittedRoute(ctx.branded)).toBe(true);
     const relayKeys = makeRelayKeys(ctx.kp.nodeId);
-    expect(() => setupCircuit(copy as any, relayKeys, NOW)).toThrow(
+    expect(() => setupCircuit(copy as any, relayKeys, NOW, testFloorStore)).toThrow(
       /not a genuine BrandedCommittedRoute|WeakSet membership check failed/i,
     );
   });
@@ -116,7 +118,7 @@ describe("R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute
     const ctx = makeGenuineBrandedRoute();
     expect(isBrandedCommittedRoute(ctx.branded)).toBe(true);
     const relayKeys = makeRelayKeys(ctx.kp.nodeId);
-    const circuit = setupCircuit(ctx.branded, relayKeys, NOW);
+    const circuit = setupCircuit(ctx.branded, relayKeys, NOW, testFloorStore);
     expect(circuit.hops.length).toBe(1);
     expect(circuit.routeId).toBe(ctx.branded.routeId);
     expect(circuit.hops[0]!.forwardingKey.length).toBe(32);
@@ -150,7 +152,7 @@ describe("R-008 hardening: setupCircuit requires a genuine BrandedCommittedRoute
     ];
     for (const { label, route } of nonGenuine) {
       expect(isBrandedCommittedRoute(route)).toBe(false);
-      expect(() => setupCircuit(route, relayKeys, NOW)).toThrow(
+      expect(() => setupCircuit(route, relayKeys, NOW, testFloorStore)).toThrow(
         new RegExp("not a genuine BrandedCommittedRoute|WeakSet membership check failed", "i"),
       );
       // Suppress unused-label lint: label is for diagnostics.

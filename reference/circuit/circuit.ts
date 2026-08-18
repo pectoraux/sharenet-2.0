@@ -375,20 +375,19 @@ export interface ActiveCircuit {
   commitmentRoot: Uint8Array;
   /**
    * The durable sequence-floor store backing this circuit's replay
-   * protection (R-008 integration fix).
+   * protection (R-008 integration fix — final hardening).
    *
-   * Per the R-008 integration audit: the security boundary for replay
-   * protection MUST live inside the protocol engine, with persistence
-   * abstracted behind `CircuitSequenceFloorStore`. When `processCircuitFrame`
-   * is given this store (or when the circuit carries one), frame acceptance
-   * does an atomic check-and-advance through the store — fail-closed,
-   * surviving process restart.
+   * REQUIRED (non-optional): per the R-008 re-audit, production paths
+   * MUST supply a durable store — the type system now enforces this.
+   * Test paths supply `InMemoryCircuitSequenceFloorStore` explicitly.
+   * There is no in-memory fallback in `processCircuitFrame`.
    *
-   * If absent, `processCircuitFrame` falls back to the in-memory
-   * `replayGuard` (single-process / test path only — does NOT survive
-   * restart). Production paths MUST supply a durable store.
+   * The security boundary lives inside the protocol engine: persistence
+   * is abstracted behind `CircuitSequenceFloorStore`. A protocol engineer
+   * in Rust/Kotlin implements the same interface against any durable
+   * substrate (LMDB, RocksDB, SQLite) and the protocol path uses it.
    */
-  floorStore?: CircuitSequenceFloorStore;
+  floorStore: CircuitSequenceFloorStore;
 }
 
 // -----------------------------------------------------------------------
@@ -441,19 +440,17 @@ export function setupCircuit(
   relayX25519PublicKeys: Array<{ hopIndex: number; nodeId: string; x25519PublicKey: Uint8Array }>,
   now: number,
   /**
-   * Optional durable sequence-floor store (R-008 integration fix).
+   * REQUIRED durable sequence-floor store (R-008 final hardening).
    *
-   * If provided, the circuit carries this store and `processCircuitFrame`
-   * will do atomic check-and-advance through it (fail-closed, survives
-   * process restart). If absent, the circuit uses the in-memory
-   * `replayGuard` only (single-process / test path).
+   * Per the R-008 re-audit: production paths MUST supply a durable store
+   * — the type system now enforces this (no optional, no default). Test
+   * paths supply `InMemoryCircuitSequenceFloorStore` explicitly.
    *
-   * Per the R-008 integration audit: production paths MUST supply a durable
-   * store. The protocol core never imports Prisma; the durable SQLite
+   * The protocol core never imports Prisma; the durable SQLite
    * implementation lives in `src/lib/sharenet/` and implements
    * `CircuitSequenceFloorStore`.
    */
-  floorStore?: CircuitSequenceFloorStore,
+  floorStore: CircuitSequenceFloorStore,
   /**
    * Optional initial floor (for re-key continuation per spec/08 §4.5).
    * If `floorStore` is provided, the caller should load the prior floor
@@ -639,50 +636,74 @@ export type ProcessCircuitFrameResult =
  * Per spec/08 §4.5: the floor persists across re-key because it is keyed
  * by `commitment_root` (the route identity), not the circuit ID.
  *
- * @param circuit - the active circuit
+ * @param circuit - the active circuit (MUST carry a `floorStore` — required field)
  * @param hopIndex - which relay hop is processing this frame
  * @param frameSequence - the frame's 32-bit sequence number
  * @param ciphertext - the encrypted frame payload
- * @param floorStore - optional override; if absent, uses `circuit.floorStore`
  */
 export async function processCircuitFrame(
   circuit: ActiveCircuit,
   hopIndex: number,
   frameSequence: number,
   ciphertext: Uint8Array,
-  floorStore?: CircuitSequenceFloorStore,
 ): Promise<ProcessCircuitFrameResult> {
-  const store = floorStore ?? circuit.floorStore;
+  // R-008 FINAL HARDENING — frozen protocol ordering:
+  //
+  //   1. AEAD authenticate + decrypt      (reject if tag fails — floor UNCHANGED)
+  //   2. atomic durable sequence commit   (reject if replay/stale — fail-closed)
+  //   3. frame accepted
+  //
+  // CRITICAL: the durable sequence floor is committed ONLY AFTER the AEAD
+  // tag verifies. This prevents the DoS vector flagged in the R-008 re-audit:
+  //
+  //   "sequence floor can be burned before AEAD authentication"
+  //
+  // Under the OLD (buggy) order (commit → decrypt), an attacker who guesses
+  // a valid future sequence number and sends invalid ciphertext could
+  // permanently advance the floor — causing the legitimate frame at that
+  // sequence to be rejected forever.
+  //
+  // Under this (frozen) order, an unauthenticated/tampered frame is rejected
+  // at step 1 and the floor is NEVER touched. Only cryptographically
+  // authenticated frames advance the floor. This is the invariant R-009
+  // (circuit packet semantics) MUST build on.
+  //
+  // Per the R-008 re-audit: "AEAD authenticate → durable sequence commit →
+  // frame accepted."
 
-  if (store) {
-    // Durable path: atomic check-and-advance through the store.
-    // This single transaction persists the new floor BEFORE the frame
-    // is treated as accepted. Fail-closed: a persistence failure rejects
-    // the frame. Survives process restart.
-    const seq = BigInt(frameSequence);
-    const result = await store.checkAndAdvance(circuit.commitmentRoot, seq);
-    if (!result.ok) {
-      return { ok: false, reason: result.reason };
-    }
-    // Mirror the accepted floor into the in-memory guard cache so
-    // getSequenceFloor() reflects reality for the caller.
-    circuit.replayGuard.checkAndRecord(seq);
-  } else {
-    // In-memory path (single-process / test only — does NOT survive restart).
-    const result = circuit.replayGuard.checkAndRecord(BigInt(frameSequence));
-    if (!result.ok) {
-      return { ok: false, reason: result.reason };
-    }
-  }
-
-  // Decrypt the onion layer. A decryption failure (tampered ciphertext,
-  // wrong key) is also a rejection.
+  // 1. AEAD authenticate + decrypt. If the tag does not verify (tampered
+  //    ciphertext, wrong key), reject IMMEDIATELY — the durable floor is
+  //    not touched. No DoS vector.
+  let decrypted: Uint8Array;
   try {
-    const { decrypted } = relayDecrypt(circuit, hopIndex, frameSequence, ciphertext);
-    return { ok: true, decrypted };
+    const result = relayDecrypt(circuit, hopIndex, frameSequence, ciphertext);
+    decrypted = result.decrypted;
   } catch (e) {
     return { ok: false, reason: `decryption failed: ${(e as Error).message}` };
   }
+
+  // 2. AEAD succeeded — now atomically commit the sequence floor through
+  //    the durable store. This is fail-closed: if the sequence is a replay
+  //    (seq ≤ floor) or the persistence operation cannot complete, the
+  //    frame is rejected. The floor only advances for authenticated frames.
+  //
+  //    `circuit.floorStore` is guaranteed set (ActiveCircuit.floorStore is
+  //    non-optional — construction APIs require it). The in-memory
+  //    `replayGuard` is only a fast-path cache mirror, not the source of
+  //    truth.
+  const seq = BigInt(frameSequence);
+  const commitResult = await circuit.floorStore.checkAndAdvance(
+    circuit.commitmentRoot, seq,
+  );
+  if (!commitResult.ok) {
+    return { ok: false, reason: commitResult.reason };
+  }
+
+  // Mirror the accepted floor into the in-memory guard cache so
+  // getSequenceFloor() reflects reality for the caller.
+  circuit.replayGuard.checkAndRecord(seq);
+
+  return { ok: true, decrypted };
 }
 
 /**

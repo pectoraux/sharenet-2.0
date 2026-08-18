@@ -42,8 +42,10 @@ import {
 import { deriveCircuitId } from "@reference/circuit/circuit";
 import { toHex } from "@reference/encoding/cbor";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
+import { InMemoryCircuitAckReplayStore } from "@reference/circuit/replay-stores";
 
 const NOW = 1786876545;
+const testAckStore = new InMemoryCircuitAckReplayStore();
 
 function setupRoute(numHops = 1) {
   const ctx = makeGenuineBrandedRouteHelper(numHops, NOW);
@@ -96,7 +98,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // processCircuitSetupAck now takes commitmentRoot (not circuitId) as the 8th arg.
     const r = await processCircuitSetupAck(
       expiredAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("expired");
@@ -112,7 +114,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     };
     const r = await processCircuitSetupAck(
       malformedAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("malformed");
@@ -126,7 +128,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     };
     const r = await processCircuitSetupAck(
       skewedAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("future-skewed");
@@ -140,7 +142,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     };
     const r = await processCircuitSetupAck(
       staleAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("stale");
@@ -152,7 +154,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // ackTimestamp === NOW, ackExpiry === NOW + 3600 → all freshness bounds pass.
     const r = await processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(r.ok).toBe(true);
   });
@@ -167,7 +169,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // age === ACK_MAX_AGE_SECONDS → `now - ackTimestamp > AGE` is false → accept.
     const r = await processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(r.ok).toBe(true);
   });
@@ -179,7 +181,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // ackTimestamp === NOW + SKEW → `ackTimestamp > now + SKEW` is false → accept.
     const r = await processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
-      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
+      f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(r.ok).toBe(true);
   });
@@ -193,7 +195,7 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
     // Try to use ack1's data in circuit 2's context.
     const r = await processCircuitSetupAck(
       f1.ack, f2.ctx.branded.routeId, f2.commitDigestHex, 0,
-      f2.initPk, f1.ctx.kps[0]!.publicKey, f2.initSk, f2.ctx.branded.commitmentRoot, NOW,
+      f2.initPk, f1.ctx.kps[0]!.publicKey, f2.initSk, f2.ctx.branded.commitmentRoot, NOW, testAckStore,
     );
     expect(r.ok).toBe(false);
     if (!r.ok) {

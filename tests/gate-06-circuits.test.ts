@@ -31,9 +31,11 @@ import {
   isBrandedCommittedRoute,
   type BrandedCommittedRoute,
 } from "@reference/transport/validated-types";
+import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const REFERENCE_NOW = 1786876545;
+const testFloorStore = new InMemoryCircuitSequenceFloorStore();
 
 function makeBrandedRoute(numHops = 2) {
   const ctx = makeGenuineBrandedRouteHelper(numHops, REFERENCE_NOW);
@@ -54,7 +56,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
     const { route } = makeBrandedRoute(2);
     expect(isBrandedCommittedRoute(route)).toBe(true);
     const relayKeys = makeRelayX25519Keys(route);
-    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
+    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW, testFloorStore);
     expect(circuit.circuitIdHex.length).toBe(64); // 32 bytes hex
     expect(circuit.hops.length).toBe(2);
     expect(circuit.hops[0]!.forwardingKey.length).toBe(32);
@@ -65,7 +67,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   test("circuit ID is deterministic", () => {
     const { route } = makeBrandedRoute(1);
     const relayKeys = makeRelayX25519Keys(route);
-    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
+    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW, testFloorStore);
     // Per spec/08 §3 (new API): circuit_id derives from commitment_root, NOT routeId string.
     const circuitId2 = deriveCircuitId(route.commitmentRoot, circuit.initiatorX25519PublicKey);
     expect(circuit.circuitIdHex).toBe(bytesToHex(circuitId2));
@@ -75,7 +77,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   test("onion encrypt/decrypt: each relay peels one layer", () => {
     const { route } = makeBrandedRoute(2);
     const relayKeys = makeRelayX25519Keys(route);
-    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
+    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW, testFloorStore);
 
     const plaintext = new TextEncoder().encode("Hello, real Internet!");
     const seq = 1; // frame sequence is a 32-bit number per spec/08 §4.3 (new API)
@@ -170,14 +172,14 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   test("circuit expiry is propagated from the branded committed route; copy rejected", () => {
     const { route } = makeBrandedRoute(1);
     const relayKeys = makeRelayX25519Keys(route);
-    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
+    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW, testFloorStore);
     expect(circuit.expiry).toBe(route.expiry);
     expect(circuit.expiry).toBeGreaterThan(REFERENCE_NOW);
 
     // A property-copy is NOT a genuine branded route (WeakSet identity check).
     const copiedRoute = { ...route, expiry: REFERENCE_NOW - 100 };
     expect(isBrandedCommittedRoute(copiedRoute)).toBe(false);
-    expect(() => setupCircuit(copiedRoute as any, relayKeys, REFERENCE_NOW)).toThrow();
+    expect(() => setupCircuit(copiedRoute as any, relayKeys, REFERENCE_NOW, testFloorStore)).toThrow();
   });
 
   // --- 11. Uncommitted route → circuit FORBIDDEN ---
@@ -223,7 +225,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   test("full chain: A → Relay → Gateway encrypted test payload", () => {
     const { route } = makeBrandedRoute(2);
     const relayKeys = makeRelayX25519Keys(route);
-    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
+    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW, testFloorStore);
 
     const plaintext = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
     const seq = 1; // frame sequence is a 32-bit number per spec/08 §4.3 (new API)
@@ -248,7 +250,7 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
   test("circuit setup fails with mismatched relay key count", () => {
     const { route } = makeBrandedRoute(2);
     const relayKeys = makeRelayX25519Keys(route).slice(0, 1); // only 1 key for 2 hops
-    expect(() => setupCircuit(route, relayKeys, REFERENCE_NOW)).toThrow();
+    expect(() => setupCircuit(route, relayKeys, REFERENCE_NOW, testFloorStore)).toThrow();
   });
 
   // --- 17. Circuit setup fails with mismatched node IDs ---
@@ -263,14 +265,14 @@ describe("GATE-06: Circuits and encrypted forwarding", () => {
         x25519PublicKey: pk,
       };
     });
-    expect(() => setupCircuit(route, wrongKeys, REFERENCE_NOW)).toThrow();
+    expect(() => setupCircuit(route, wrongKeys, REFERENCE_NOW, testFloorStore)).toThrow();
   });
 
   // --- 18. Multiple sequential packets with increasing sequence ---
   test("multiple packets: sequential sequence numbers accepted", () => {
     const { route } = makeBrandedRoute(1);
     const relayKeys = makeRelayX25519Keys(route);
-    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW);
+    const circuit = setupCircuit(route, relayKeys, REFERENCE_NOW, testFloorStore);
 
     for (let i = 1; i <= 10; i++) {
       const plaintext = new TextEncoder().encode(`packet ${i}`);

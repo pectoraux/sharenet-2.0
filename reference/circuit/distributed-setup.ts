@@ -58,7 +58,6 @@ import {
   AEAD_KEY_BYTES,
 } from "./circuit";
 import type { CircuitAckReplayStore, CircuitSequenceFloorStore } from "./replay-stores";
-import { InMemoryCircuitAckReplayStore } from "./replay-stores";
 
 // -----------------------------------------------------------------------
 // Constants (FROZEN per spec/14 §4 + ADR-0017)
@@ -493,19 +492,17 @@ export async function processCircuitSetupAck(
   commitmentRoot: Uint8Array,
   now: number = Math.floor(Date.now() / 1000),
   /**
-   * Optional ack replay store (R-008 integration fix).
+   * REQUIRED ack replay store (R-008 final hardening).
    *
-   * If provided, the ack is atomically consumed through the store before
-   * success is returned. A replayed ack (same commitmentRoot + hopIndex +
-   * ackNonce) is rejected. If absent, a fresh in-memory store is used
-   * (single-process / test path — does NOT survive restart).
+   * Per the R-008 re-audit: production paths MUST supply a durable store
+   * — the type system now enforces this (no default). Test paths supply
+   * `InMemoryCircuitAckReplayStore` explicitly.
    *
-   * Per the R-008 integration audit: production paths MUST supply a durable
-   * store. The protocol core never imports Prisma; the durable SQLite
-   * implementation lives in `src/lib/sharenet/` and implements
-   * `CircuitAckReplayStore`.
+   * The ack is atomically consumed through this store BEFORE success is
+   * returned. A replayed ack (same commitmentRoot + hopIndex + ackNonce)
+   * is rejected. Fail-closed.
    */
-  ackStore: CircuitAckReplayStore = new InMemoryCircuitAckReplayStore(),
+  ackStore: CircuitAckReplayStore,
 ): Promise<{ ok: true; hopKey: HopKeyMaterial } | { ok: false; reason: string }> {
   // 1. Verify routeId matches
   if (ack.routeId !== expectedRouteId) {
@@ -639,20 +636,20 @@ export async function establishDistributedCircuit(
   relayPublicKeys: Map<string, Uint8Array>, // nodeId → Ed25519 public key
   now: number,
   /**
-   * Optional ack replay store (R-008 integration fix).
-   * If absent, a fresh in-memory store is used (single-process / test path).
-   * Production paths MUST supply a durable store so ack replay protection
-   * survives process restart.
+   * REQUIRED ack replay store (R-008 final hardening). No default — the
+   * type system enforces that a store is supplied. Test paths pass
+   * `InMemoryCircuitAckReplayStore`; production paths pass
+   * `DurableSqliteCircuitAckReplayStore`.
    */
-  ackStore: CircuitAckReplayStore = new InMemoryCircuitAckReplayStore(),
+  ackStore: CircuitAckReplayStore,
   /**
-   * Optional durable sequence-floor store (R-008 integration fix).
-   * If supplied, the prior floor for this route is loaded (re-key continuation,
-   * spec/08 §4.5) and the store is attached to the ActiveCircuit so
-   * `processCircuitFrame` does atomic durable check+persist. If absent,
-   * the circuit uses an in-memory guard only (does NOT survive restart).
+   * REQUIRED durable sequence-floor store (R-008 final hardening). No
+   * optional — the type system enforces that a store is supplied. The
+   * prior floor for this route is loaded (re-key continuation, spec/08
+   * §4.5) and the store is attached to the ActiveCircuit so
+   * `processCircuitFrame` does atomic durable AEAD→commit ordering.
    */
-  floorStore?: CircuitSequenceFloorStore,
+  floorStore: CircuitSequenceFloorStore,
 ): Promise<{ ok: true; circuit: ActiveCircuit } | { ok: false; reason: string }> {
   // 1. Verify the route is genuine
   if (!isBrandedCommittedRoute(route)) {

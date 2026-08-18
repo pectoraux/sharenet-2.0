@@ -1443,3 +1443,91 @@ Stage Summary:
 - Fail-closed semantics verified: processCircuitFrame rejects on persistence failure; processCircuitSetupAck rejects on duplicate/failed consumption.
 - Process-restart protection proven end-to-end through the actual protocol path (not just the helpers): old sequences rejected after restart; replayed acks rejected after restart; hop isolation holds.
 - All existing tests, conformance vectors (TS + Python), and architecture tests preserved.
+
+---
+Task ID: 2-test-updates
+Agent: general-purpose (subagent)
+Task: Update 5 test/architecture files after the protocol APIs `setupCircuit`, `processCircuitSetupAck`, and `establishDistributedCircuit` were changed to make their `floorStore` / `ackStore` parameters REQUIRED (previously optional with in-memory defaults). Mechanical change only — add the store imports + pass `InMemory*Store` instances to every call site. Do NOT alter test logic, assertions, or test names.
+
+Work Log:
+- File 1 — tests/gate-06-circuits.test.ts:
+  * Added `import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";`
+  * Added module-level `const testFloorStore = new InMemoryCircuitSequenceFloorStore();`
+  * Updated all 9 `setupCircuit(...)` call sites (incl. the 3 `.toThrow()` cases at the property-copy / mismatched-relay-keys / mismatched-node-ID paths — the brand check throws before the store is touched, so passing it is safe).
+- File 2 — tests/r008h-setup-circuit-trust-boundary.test.ts:
+  * Same import + module-level constant added.
+  * Updated all 6 `setupCircuit(...)` call sites. Five are `.toThrow()` cases (legacy CommittedRoute, plain object, RouteProposal, property-copy, exhaustive loop) — all rejected at the WeakSet brand check before the store param is accessed.
+- File 3 — tests/r008-distributed-circuit.test.ts:
+  * Added both store imports (`InMemoryCircuitSequenceFloorStore` + `InMemoryCircuitAckReplayStore`) + two module-level constants (`testFloorStore`, `testAckStore`).
+  * Added `, testAckStore` (10th arg, after NOW) to all 3 `processCircuitSetupAck(...)` calls.
+  * Added `, testAckStore, testFloorStore` (7th + 8th args, after NOW) to all 3 `establishDistributedCircuit(...)` calls.
+- File 4 — tests/r008h-ack-freshness.test.ts:
+  * Added `import { InMemoryCircuitAckReplayStore } from "@reference/circuit/replay-stores";` + module-level `const testAckStore = new InMemoryCircuitAckReplayStore();`.
+  * Added `, testAckStore` as the trailing arg after NOW on all 8 `processCircuitSetupAck(...)` calls (7 share the `f.ctx.*` pattern; 1 uses `f1.`/`f2.` for the cross-circuit replay test).
+  * Per task guidance: a single shared `testAckStore` per file is safe — each `makeFreshAck()` generates a distinct route (different commitmentRoot), so the ack-store keys `(commitmentRoot, hopIndex, ackNonce)` are naturally distinct across tests. No cross-test contamination.
+- File 5 — src/lib/sharenet/architecture-tests.ts:
+  * Added `import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";` directly under the existing `@reference/circuit/circuit` import block.
+  * Added `new InMemoryCircuitSequenceFloorStore()` as the 4th arg to the two `setupCircuit(...)` calls inside the try/catch negative-path probes at lines ~487 (legacy CommittedRoute) and ~492 (copied branded route). Both are wrapped in try/catch — the brand check throws before the store is used.
+
+Verification:
+- `bun test tests/gate-06-circuits.test.ts tests/r008h-setup-circuit-trust-boundary.test.ts tests/r008-distributed-circuit.test.ts tests/r008h-ack-freshness.test.ts`:
+  **54 pass / 0 fail (136 expect() calls) across 4 files.**
+- `bun run test:arch`:
+  **Total 24, Passed 24, Failed 0, Skipped 0.**
+
+Stage Summary:
+- All 5 files now pass the required store instances explicitly — no call site relies on the removed in-memory defaults.
+- Test intent, assertions, and test names are fully preserved; only store args + imports were added.
+- Both the 4 targeted unit-test files and the architecture-regression suite (24/24) remain green.
+
+---
+Task ID: R008-final-hardening
+Agent: Z.ai Code (main)
+Task: Close the two remaining R-008 issues flagged in the re-audit of ffc4e35: (1) durable stores are optional (production can accidentally use in-memory fallback), (2) sequence floor is persisted before AEAD authentication (DoS vector — invalid ciphertext at seq=N permanently burns the floor).
+
+Work Log:
+- Verified both findings against the pushed code at ffc4e35:
+  * setupCircuit/establishDistributedCircuit/processCircuitSetupAck all had optional/default store params (floorStore?, ackStore = new InMemoryCircuitAckReplayStore()).
+  * processCircuitFrame did checkAndAdvance() (persist floor) BEFORE relayDecrypt() (AEAD auth) — the floor was burned for unauthenticated frames.
+- Fix #1 (mandatory stores):
+  * Made ActiveCircuit.floorStore a required field (non-optional type CircuitSequenceFloorStore).
+  * Made setupCircuit's floorStore param required (4th arg, no optional, no default).
+  * Made establishDistributedCircuit's ackStore + floorStore params required (7th + 8th args).
+  * Made processCircuitSetupAck's ackStore param required (no default InMemoryCircuitAckReplayStore).
+  * Removed the floorStore param from processCircuitFrame — uses circuit.floorStore (guaranteed set).
+  * Removed the unused InMemoryCircuitAckReplayStore import from distributed-setup.ts.
+  * Updated all existing tests (gate-06, r008h-setup-circuit-trust-boundary, r008-distributed-circuit, r008h-ack-freshness, architecture-tests) to pass InMemory*Store explicitly.
+- Fix #2 (AEAD-before-commit ordering):
+  * Reordered processCircuitFrame: AEAD authenticate+decrypt FIRST, then durable checkAndAdvance, then accept.
+  * If AEAD fails (tampered ciphertext, wrong key): reject immediately, floor UNCHANGED.
+  * If AEAD succeeds but seq ≤ floor (replay): reject at commit, floor UNCHANGED.
+  * If AEAD succeeds and seq > floor: accept, floor advances.
+  * This closes the DoS vector: an attacker sending invalid ciphertext at seq=100 can no longer burn seq=100.
+- Added 6 adversarial tests (tests/r008-durable-integration.test.ts, total 15):
+  * Test 10: invalid ciphertext at seq=100 → floor UNCHANGED (AEAD fails before commit)
+  * Test 11: valid ciphertext at seq=1 → floor ADVANCES (authenticated frame)
+  * Test 12: after invalid seq=100 rejected → legitimate seq=2 still accepted (floor not burned)
+  * Test 13: replay of valid captured frame → AEAD succeeds but durable commit rejects (replay-safe)
+  * Test 14: setupCircuit arity check (floorStore required, .length = 5)
+  * Test 15: processCircuitSetupAck with undefined ackStore → throws (no silent fallback)
+- Updated existing tests 2 and 9 for AEAD-first ordering: they now use VALID ciphertext (encrypted with the processing circuit's own keys) so AEAD succeeds and the floor check is what rejects stale sequences.
+
+Verification:
+- Unit tests: 365 pass / 0 fail (was 359; +6 new adversarial tests)
+- Architecture tests: 24/24 pass (incl. #23: reference/ still DB-free)
+- TS conformance vectors: 35/35 pass (frozen vectors unchanged)
+- Python conformance vectors: 35/35 pass
+- Lint: clean (exit 0)
+
+Stage Summary:
+- R-008 is now FULLY CLOSED. Both remaining issues are resolved:
+  1. Durable stores are mandatory at the production API boundary (type-system enforced).
+  2. AEAD authenticates before the durable sequence commit (DoS vector closed).
+- Frozen protocol ordering (R-009 MUST build on this):
+    1. AEAD authenticate + decrypt      (reject if tag fails — floor UNCHANGED)
+    2. atomic durable sequence commit   (reject if replay/stale — fail-closed)
+    3. frame accepted
+- The InMemory*Store implementations are now only available behind explicit test
+  constructors — no production path can accidentally fall back to in-memory replay
+  protection.
+- Pushed to origin/main at 0135fa2 (ffc4e35..0135fa2 main -> main).

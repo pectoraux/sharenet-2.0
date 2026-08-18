@@ -55,6 +55,7 @@ import {
   setupCircuit,
   UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN,
 } from "@reference/circuit/circuit";
+import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import {
   evaluateGatewayRequest,
   defaultGatewayPolicy,
@@ -483,12 +484,12 @@ export async function runArchitectureTests(): Promise<ArchTestSuiteResult> {
       const legacyRoute = createCommittedRoute(brandedCtx.commitment);
       const legacyNotBranded = !isBrandedCommittedRoute(legacyRoute);
       let legacySetupThrew = false;
-      try { setupCircuit(legacyRoute as unknown as Parameters<typeof setupCircuit>[0], [], Math.floor(Date.now() / 1000)); } catch { legacySetupThrew = true; }
+      try { setupCircuit(legacyRoute as unknown as Parameters<typeof setupCircuit>[0], [], Math.floor(Date.now() / 1000), new InMemoryCircuitSequenceFloorStore()); } catch { legacySetupThrew = true; }
 
       const copiedBranded = { ...brandedRoute };
       const copiedNotBranded = !isBrandedCommittedRoute(copiedBranded);
       let copiedSetupThrew = false;
-      try { setupCircuit(copiedBranded as unknown as Parameters<typeof setupCircuit>[0], [], Math.floor(Date.now() / 1000)); } catch { copiedSetupThrew = true; }
+      try { setupCircuit(copiedBranded as unknown as Parameters<typeof setupCircuit>[0], [], Math.floor(Date.now() / 1000), new InMemoryCircuitSequenceFloorStore()); } catch { copiedSetupThrew = true; }
 
       return {
         passed: plainNotBranded && proposalNotBranded && unbrandedThrew && proposalGuardThrew && brandedRecognized && legacyNotBranded && legacySetupThrew && copiedNotBranded && copiedSetupThrew,
