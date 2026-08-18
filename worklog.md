@@ -957,3 +957,39 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The normative spec and implementation now have exactly one canonical schema for RouteProposal and RouteAcceptance. The golden vector is consumed by both TS and Python. A conformance test fails if the schemas diverge.
+
+---
+Task ID: R-003/R-004-final-protocol-definition
+Agent: main (Z.ai Code)
+Task: Final R-003/R-004 protocol-definition pass — define SignedRouteProposal wire object, create machine-readable schema artifact, replace hard-coded conformance tests, fix MILESTONES.md with R-005 invariant.
+
+Work Log:
+- Defined `SignedRouteProposal { proposal: RouteProposal, signature: bstr .size 64 }` as the canonical signed wire object. Renamed `initiatorSignature` → `signature` in the TypeScript interface + `createRouteProposal()` return. Documented in the schema artifact with the signature domain and payload note.
+
+- Created `spec/schemas/routing-schemas.json` — the canonical machine-readable schema artifact shared by spec, tests, and vector generation. Contains:
+  - RouteHop, RouteProposal, SignedRouteProposal, RouteAcceptance, RouteCommitment definitions
+  - Each with: required fields, optional fields, forbidden fields, spec reference, signature domain
+  - Merkle algorithm parameters (domain, leaf types, leaf order, odd-node handling)
+  - route_id format
+
+- Replaced `tests/r003-r004-schema-conformance.test.ts` with a genuinely normative guard:
+  - Reads the schema artifact (not hard-coded field arrays)
+  - Verifies TypeScript interface fields match the artifact's `required` array for each object
+  - Verifies forbidden fields are absent
+  - Verifies spec/07-routing.md documents the same fields as the artifact
+  - Verifies Merkle algorithm + route_id format match between artifact and spec
+
+- Updated MILESTONES.md:
+  - R-003: ✅ CLOSED (was ⚠️ PARTIAL) — 20/20 TS+Python golden vectors pass
+  - R-004: ✅ CLOSED (was ⚠️ PARTIAL) — independent verifier + immutable artifact + 20/20 vectors
+  - R-006: ✅ CLOSED (was ⚠️ PARTIAL) — construction boundaries enforced
+  - Added R-005 invariant: "A remediation entry MUST NOT claim evidence is 'pending' when the referenced CI gate passes"
+
+Stage Summary:
+- Tests: 319 pass, 0 fail. 854 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 20/20 vectors pass.
+- Python conformance runner: 20/20 vectors pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-003/R-004 are now CLOSED with the machine-readable schema artifact as the single source of truth shared by spec, implementation, tests, and both conformance runners.

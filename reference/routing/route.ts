@@ -96,12 +96,22 @@ export function createRouteProposal(
 ): SignedRouteProposal {
   const payload = routeProposalSigningPayload(proposal);
   const signature = signMessage(initiatorSecretKey, payload);
-  return { proposal, initiatorSignature: signature };
+  return { proposal, signature };
 }
 
+/**
+ * The canonical signed wire object carrying a RouteProposal and its source
+ * signature.
+ *
+ * Per spec/schemas/routing-schemas.json (FROZEN):
+ *   SignedRouteProposal = { proposal: RouteProposal, signature: bstr .size 64 }
+ *
+ * The signature is over the proposal signing payload (domain ||
+ * canonicalEncode(proposal_fields)), NOT over a routeId.
+ */
 export interface SignedRouteProposal {
   proposal: RouteProposal;
-  initiatorSignature: Uint8Array;
+  signature: Uint8Array;
 }
 
 // -----------------------------------------------------------------------

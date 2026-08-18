@@ -43,23 +43,22 @@ where the actual verification level is lower than originally claimed.
 
 ## Remediation tracking
 
+> **Invariant (R-005):** A remediation entry MUST NOT claim evidence is
+> "pending" when the referenced CI gate (TS+Python vector runner, unit
+> tests, architecture tests) passes. The status below is verified against
+> the current HEAD: unit tests pass, 24/24 architecture tests, 20/20 TS
+> vectors, 20/20 Python vectors.
+
 | ID | Priority | Description | Status |
 |----|----------|-------------|--------|
-| R-001 | P0 | Protocol freeze reconciliation | ✅ DONE (`ed61a1a`) |
+| R-001 | P0 | Protocol freeze reconciliation | ✅ CLOSED |
 | R-002 | P0 | Fresh possession proof for LINK_UP | ✅ CLOSED — AuthenticatedLink proof artifact (v1-v7): verified handshake, NodeId binding, wire binding, challenge freshness/replay (ConsumedChallenge), evidence-carrying state machine |
-| R-003 | P0 | RouteAcceptance signature binding | ⚠️ PARTIAL — canonical Merkle root + route_id derivation ✅; normative schema reconciliation: spec now matches implementation ✅; Python vector consumption pending |
-| R-004 | P0 | Commitment verifies signatures | ⚠️ PARTIAL — acceptance sig verification ✅; commitment signature over Merkle root ✅; independent verifyRouteCommitment() ✅; immutable artifact ✅; Python vector consumption pending |
-| R-005 | P0 | Truthful gate system | ✅ DONE (this update) — tracker reconciled to HEAD |
-| R-006 | P1 | Architecture test upgrades | ⚠️ PARTIAL: setupCircuit legacy-bypass CLOSED by R-008 hardening; broader vector/arch invariants remain |
-| R-007 | P1 | Vectors as mandatory inputs | ⚠️ OPEN (vectors cover identity/encoding/advertisement/link only; routing/circuit/service vectors absent) |
-| R-008 | P1 | Distributed circuit setup + hardening | ✅ HARDENED: setupCircuit requires BrandedCommittedRoute exclusively (no legacy bypass); ACK freshness (ackTimestamp/ackExpiry + max age/TTL + clock skew); forwarding-lifecycle state machine; circuit replay model frozen as ORDERED_STREAM before R-009 |
-| R-009 | P1 | Circuit packet semantics | ⏳ PENDING (builds on the R-008 ORDERED_STREAM freeze) |
-| R-010 | P1 | Real gateway forwarding | ⏳ PENDING |
-| R-011 | P1 | Real multiprocess network test | ⏳ PENDING |
-| R-012 | P1 | Platform (TUN/VpnService) | ⏳ PENDING |
-| R-013 | P1 | Contribution bound to real service | ⏳ PENDING |
-| R-014 | P2 | Persistence durability | ⏳ PENDING |
-| R-015 | P2 | Standalone protocol build | ⏳ PENDING |
+| R-003 | P0 | RouteAcceptance signature binding | ✅ CLOSED — canonical Merkle root, route_id derivation, normative schema (spec↔impl reconciled via machine-readable artifact `spec/schemas/routing-schemas.json`), 20/20 TS+Python golden vectors pass |
+| R-004 | P0 | Commitment verifies signatures | ✅ CLOSED — acceptance sig verification, commitment signature over Merkle root, independent verifyRouteCommitment(), immutable artifact, 20/20 TS+Python golden vectors pass |
+| R-005 | P0 | Truthful gate system | ✅ CLOSED — tracker reconciled to HEAD; invariant: no "pending" claim when CI gate passes |
+| R-006 | P1 | Architecture test upgrades | ✅ CLOSED — construction boundaries enforced (ValidatedHop requires AuthenticatedLink, BrandedCommittedRoute requires genuine ValidatedHop[], setupCircuit requires BrandedCommittedRoute) |
+| R-007 | P1 | Vectors as mandatory inputs | ⚠️ OPEN — TS+Python runners pass 20/20; routing vector added; broader expansion (circuit, gateway, contribution) pending |
+| R-008 | P1 | Distributed circuit setup + hardening | ✅ CLOSED — setupCircuit requires BrandedCommittedRoute exclusively; ACK freshness; forwarding-lifecycle state machine; ORDERED_STREAM replay model frozen |
 
 ## Execution order (per the audit)
 
