@@ -45,6 +45,7 @@ import {
   encodeCircuitFrame,
   decodeCircuitFrame,
   openFrame,
+  DIRECTION_FORWARD,
   type CircuitFrame,
   type OpenFrameResult,
 } from "./frame";
@@ -161,53 +162,62 @@ export function forwardFrame(
  * Process a raw wire CircuitFrame at a relay: the CANONICAL PRODUCTION
  * entry point that owns the ENTIRE R-008 frozen ordering invariant.
  *
- * Per the R-009 Stage 1 audit: the production wire entry point MUST own
- * the durable commit, so an implementation cannot accidentally use a
- * "decode + AEAD" path and forget step 2. This function is that single
- * canonical executable path.
+ * Per the R-009 Stage 1 final hardening: the production wire entry point
+ * MUST own the durable commit, AND commit ownership MUST be DERIVED FROM
+ * PROTOCOL STATE — not supplied as a caller-controlled boolean.
  *
- * Pipeline (R-008 frozen ordering):
+ * COMMIT OWNERSHIP (R-009 Stage 1 — frozen, single ingress replay checkpoint):
+ *
+ *   The durable sequence floor is committed exactly ONCE per frame per route,
+ *   at the single ingress replay checkpoint. For Stage 1 (forward traffic),
+ *   this is derived from protocol semantics:
+ *
+ *     direction == FORWARD && hopIndex == 0
+ *         → COMMIT the durable sequence floor (ingress checkpoint)
+ *
+ *     direction == FORWARD && hopIndex > 0
+ *         → forward only (the floor was already committed at hop 0)
+ *
+ *   This is NOT caller-controlled. There is no `commitFloor` boolean. The
+ *   protocol itself determines commit ownership — a bad integration cannot
+ *   accidentally disable the commit (hop 0 always commits) or claim it
+ *   at the wrong hop (hop 1 never commits). See ADR-0019.
+ *
+ * BACKWARD DIRECTION REJECTION (Stage 1):
+ *
+ *   Stage 1 implements FORWARD traffic only. The backward/return-onion
+ *   protocol is Stage 2 work. Until Stage 2 freezes the return-onion
+ *   semantics (including the replay-floor keying question: per-route vs
+ *   per-(route, direction)), the Stage 1 production path REJECTS backward
+ *   frames. The generic CircuitFrame decoder still accepts both enum
+ *   values (0x01 + 0x02) so the wire schema stays compatible with Stage 2,
+ *   but processCircuitWireFrame() fails closed on BACKWARD.
+ *
+ * Pipeline (R-008 frozen ordering, Stage 1):
  *   1. decode (strict canonical CBOR — rejects non-canonical encodings)
- *   2. AEAD authenticate + decrypt one layer (openFrame)
+ *   2. reject BACKWARD direction (Stage 1 — fail closed until Stage 2)
+ *   3. AEAD authenticate + decrypt one layer (openFrame)
  *      → reject if tag fails (floor UNCHANGED — DoS fix from R-008)
- *   3. atomic durable sequence commit (circuit.floorStore.checkAndAdvance)
+ *   4. atomic durable sequence commit (circuit.floorStore.checkAndAdvance)
+ *      → ONLY at the ingress checkpoint (direction==FORWARD && hopIndex==0)
  *      → reject if replay/stale (seq ≤ floor) or persistence fails (fail-closed)
- *   4. forward / deliver
+ *   5. forward / deliver
  *      → terminal hop: deliver plaintext
  *      → intermediate hop: encode nextFrame → forward bytes to next hop
  *
- * CRITICAL: the durable commit (step 3) happens ONLY after AEAD succeeds
- * (step 2). An unauthenticated/tampered frame is rejected at step 2 and the
+ * CRITICAL: the durable commit (step 4) happens ONLY after AEAD succeeds
+ * (step 3). An unauthenticated/tampered frame is rejected at step 3 and the
  * floor is NEVER touched. This is the DoS fix from R-008 (AEAD-before-commit).
  *
- * DURABLE COMMIT SEMANTICS (multi-hop):
- *   The durable sequence floor is keyed by `commitmentRoot` (the route), NOT
- *   by hop. A frame with `frameSequence=N` is processed by EVERY hop on the
- *   route, but the floor should be committed ONCE — at the entry hop (the
- *   first relay that sees this frameSequence for this route). Subsequent
- *   hops process the SAME frameSequence; they MUST NOT re-commit the floor
- *   (that would be a self-replay).
- *
- *   The `commitFloor` parameter controls this:
- *     - `commitFloor = true` (default, entry hop): commit the floor, then forward.
- *     - `commitFloor = false` (intermediate hops, gateway): AEAD only, no commit.
- *
- *   In a real deployment, the entry relay (hop 0) calls with `commitFloor=true`;
- *   every subsequent hop calls with `commitFloor=false`. This commits the floor
- *   exactly once per frame per route, at the point of ingress.
- *
  * @param circuit - the active circuit (carries floorStore + per-hop keys)
- * @param hopIndex - which relay hop is processing
+ * @param hopIndex - which relay hop is processing (0-based)
  * @param wireBytes - the raw canonical-CBOR-encoded CircuitFrame from the previous hop
- * @param commitFloor - whether to perform the durable sequence commit (entry hop: true;
- *                      intermediate hops: false). Defaults to true (entry-hop semantics).
  * @returns the processing result (see ProcessCircuitWireFrameResult)
  */
 export async function processCircuitWireFrame(
   circuit: ActiveCircuit,
   hopIndex: number,
   wireBytes: Uint8Array,
-  commitFloor: boolean = true,
 ): Promise<ProcessCircuitWireFrameResult> {
   // Step 1: decode (strict canonical CBOR).
   const decoded = decodeCircuitFrame(wireBytes);
@@ -216,19 +226,38 @@ export async function processCircuitWireFrame(
   }
   const frame = decoded.frame;
 
-  // Step 2 (R-008 frozen ordering): AEAD authenticate + decrypt one layer.
+  // Step 2 (R-009 Stage 1): reject BACKWARD direction.
+  // Stage 1 implements FORWARD traffic only. The return-onion protocol
+  // (including the replay-floor keying question) is Stage 2 work. The
+  // production path fails closed on BACKWARD until Stage 2 freezes it.
+  if (frame.direction !== DIRECTION_FORWARD) {
+    return {
+      ok: false,
+      reason: "R-009 Stage 1 production path rejects BACKWARD direction (return-onion is Stage 2 work — not yet frozen)",
+    };
+  }
+
+  // Step 3 (R-008 frozen ordering): AEAD authenticate + decrypt one layer.
   const forward = forwardFrame(circuit, hopIndex, frame);
   if (!forward.ok) {
     // AEAD failed — the floor MUST NOT advance. Do NOT call floorStore.
     return { ok: false, reason: forward.reason };
   }
 
-  // Step 3 (R-008 frozen ordering): atomic durable sequence commit.
-  // This happens ONLY after AEAD succeeds AND only at the entry hop
-  // (commitFloor=true). Intermediate hops (commitFloor=false) skip the
-  // commit — the floor was already committed at the entry hop.
+  // Step 4 (R-009 Stage 1 — frozen ingress replay checkpoint):
+  // Commit ownership is DERIVED FROM PROTOCOL STATE, not caller-supplied.
+  //   direction == FORWARD && hopIndex == 0  → COMMIT (ingress checkpoint)
+  //   direction == FORWARD && hopIndex > 0   → forward only (no commit)
+  //
+  // This is the single ingress replay checkpoint per route. A frame with
+  // frameSequence=N is processed by every hop, but the floor is committed
+  // exactly once — at hop 0 (the entry relay). Subsequent hops forward
+  // without re-committing (which would be a self-replay).
+  //
+  // Per ADR-0019: this invariant is protocol-enforced, not caller-enforced.
   const seq = BigInt(frame.frameSequence);
-  if (commitFloor) {
+  const isIngressCheckpoint = (hopIndex === 0);
+  if (isIngressCheckpoint) {
     const commitResult = await circuit.floorStore.checkAndAdvance(
       circuit.commitmentRoot,
       seq,
@@ -239,7 +268,7 @@ export async function processCircuitWireFrame(
     }
   }
 
-  // Step 4: forward / deliver. The frame is accepted.
+  // Step 5: forward / deliver. The frame is accepted.
   if (forward.terminal) {
     return { ok: true, terminal: true, plaintext: forward.plaintext, committedSequence: seq };
   }
