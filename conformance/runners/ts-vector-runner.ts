@@ -541,11 +541,28 @@ function verifyCircuitVector(data: any): VectorResult {
         }
       } else if (v.name === "nonce-prefix-deterministic") {
         const commitmentRoot = hexToBytes(input.commitmentRootHex);
-        const noncePrefix = deriveNoncePrefix(commitmentRoot);
+        // R-009 Stage 1 final reconciliation (ADR-0020): nonce prefix is bound
+        // to the circuit instance (root + initiator ephemeral public key).
+        const initiatorPub = hexToBytes(input.initiatorX25519PubHex);
+        const noncePrefix = deriveNoncePrefix(commitmentRoot, initiatorPub);
         const noncePrefixHex = toHex(noncePrefix);
         caseOk = noncePrefixHex === expected.noncePrefixHex;
         if (!caseOk) {
           failures.push(`${v.name}: noncePrefix ${noncePrefixHex} != ${expected.noncePrefixHex}`);
+        }
+      } else if (v.name === "nonce-prefix-re-key-freshness") {
+        // R-009 Stage 1 final reconciliation (ADR-0020): two circuits on the
+        // same route with different ephemeral keys MUST get different nonce prefixes.
+        const commitmentRoot = hexToBytes(input.commitmentRootHex);
+        const pubA = hexToBytes(input.initiatorX25519PubHexA);
+        const pubB = hexToBytes(input.initiatorX25519PubHexB);
+        const npA = toHex(deriveNoncePrefix(commitmentRoot, pubA));
+        const npB = toHex(deriveNoncePrefix(commitmentRoot, pubB));
+        caseOk = (npA === expected.noncePrefixHexA) &&
+                 (npB === expected.noncePrefixHexB) &&
+                 (npA !== npB === expected.different);
+        if (!caseOk) {
+          failures.push(`${v.name}: npA=${npA} (exp ${expected.noncePrefixHexA}), npB=${npB} (exp ${expected.noncePrefixHexB}), different=${npA !== npB} (exp ${expected.different})`);
         }
       } else if (v.name === "nonce-layout") {
         const noncePrefix = hexToBytes(input.noncePrefixHex);
@@ -986,8 +1003,11 @@ function verifyCircuitFrameVector(data: any): VectorResult {
 
   // Reconstruct a minimal ActiveCircuit from the shared inputs.
   // The forwardingKeys are carried directly (deterministic from fixed ECDH seeds).
+  // R-009 Stage 1 final reconciliation (ADR-0020): nonce prefix is bound to
+  // the circuit instance (root + initiator ephemeral public key).
   const commitmentRoot = hexToBytes(shared.commitmentRootHex);
-  const noncePrefix = deriveNoncePrefix(commitmentRoot);
+  const initiatorPub = hexToBytes(shared.initiatorX25519PubHex);
+  const noncePrefix = deriveNoncePrefix(commitmentRoot, initiatorPub);
   const fwdKey0 = hexToBytes(shared.forwardingKey0Hex);
   const fwdKey1 = hexToBytes(shared.forwardingKey1Hex);
   const retKey0 = hexToBytes(shared.returnKey0Hex);

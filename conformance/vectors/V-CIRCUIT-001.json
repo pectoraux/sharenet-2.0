@@ -1,9 +1,9 @@
 {
   "id": "V-CIRCUIT-001",
   "status": "frozen",
-  "spec": "spec/08-circuits.md §3-4",
+  "spec": "spec/08-circuits.md \u00a73-4",
   "description": "Canonical circuit cryptographic constructions: CircuitId derivation (from commitment_root), HKDF hop key derivation (salt=commitment_root), nonce prefix derivation, nonce layout, and replay guard. All inputs use the reconciled spec/08 model.",
-  "statusNote": "reference-implemented — all constructions use the reconciled spec/08 model: BLAKE3, commitment_root as input/salt, 64-bit nonce prefix + 32-bit frame_sequence.",
+  "statusNote": "reference-implemented \u2014 all constructions use the reconciled spec/08 model: BLAKE3, commitment_root as input/salt, 64-bit nonce prefix + 32-bit frame_sequence.",
   "vectors": [
     {
       "name": "circuit-id-deterministic",
@@ -18,7 +18,7 @@
     },
     {
       "name": "hop-keys-deterministic",
-      "description": "HKDF-SHA256(salt=commitment_root, ikm=sharedSecret, info=SHARENET/CIRCUIT/KEY/1 || u8(hopIndex)) → 64 bytes split 32/32",
+      "description": "HKDF-SHA256(salt=commitment_root, ikm=sharedSecret, info=SHARENET/CIRCUIT/KEY/1 || u8(hopIndex)) \u2192 64 bytes split 32/32",
       "input": {
         "commitmentRootHex": "5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9",
         "sharedSecretHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -31,12 +31,13 @@
     },
     {
       "name": "nonce-prefix-deterministic",
-      "description": "Nonce prefix = first 8 bytes of HKDF-SHA256(salt=commitment_root, ikm='nonce-prefix', info='SHARENET/CIRCUIT/NONCE/1')",
+      "description": "Nonce prefix = first 8 bytes of HKDF-SHA256(salt=commitment_root, ikm=initiator_x25519_pub, info='SHARENET/CIRCUIT/NONCE/1'). Per ADR-0020: the nonce prefix is bound to the CIRCUIT INSTANCE (root + initiator ephemeral public key), so a re-key on the same route produces a fresh nonce prefix.",
       "input": {
-        "commitmentRootHex": "5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9"
+        "commitmentRootHex": "5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9",
+        "initiatorX25519PubHex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209"
       },
       "expected": {
-        "noncePrefixHex": "c8f1c8dcc408f588"
+        "noncePrefixHex": "dfd987eee353ac6d"
       }
     },
     {
@@ -74,6 +75,20 @@
       },
       "expected": {
         "secondCallOk": false
+      }
+    },
+    {
+      "name": "nonce-prefix-re-key-freshness",
+      "description": "Two circuits on the SAME route (same commitment_root) with DIFFERENT initiator ephemeral keys produce DIFFERENT nonce prefixes. Per spec/08 \u00a74.7 + ADR-0020: a re-key MUST produce a fresh circuit_nonce_prefix. Under the old derivation (pre-980ced6, bound to root only), both would be the same \u2014 contradicting \u00a74.7. Under the corrected derivation (bound to root + initiator eph pub), they differ.",
+      "input": {
+        "commitmentRootHex": "5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9",
+        "initiatorX25519PubHexA": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+        "initiatorX25519PubHexB": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59"
+      },
+      "expected": {
+        "noncePrefixHexA": "dfd987eee353ac6d",
+        "noncePrefixHexB": "bffb0c6c680b2fd3",
+        "different": true
       }
     }
   ],

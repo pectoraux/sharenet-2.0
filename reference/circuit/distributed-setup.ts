@@ -399,8 +399,11 @@ export function handleCircuitSetup(
   // 5. Derive forwarding + return keys (commitment_root used as HKDF salt per spec/08 §4.1)
   const keys = deriveHopKeys(sharedSecret, req.hopIndex, commitmentRoot);
 
-  // 6. Derive nonce prefix for AEAD operations
-  const noncePrefix = deriveNoncePrefix(commitmentRoot);
+  // 6. Derive nonce prefix for AEAD operations — bound to the circuit INSTANCE
+  //    (commitment_root + initiator ephemeral public key) per spec/08 §4.3 +
+  //    ADR-0020. The relay uses the initiator's ephemeral public key (from the
+  //    setup request) so it derives the SAME nonce prefix as the initiator.
+  const noncePrefix = deriveNoncePrefix(commitmentRoot, req.initiatorX25519PublicKey);
 
   // 7. Generate AEAD possession proof — proves the relay holds the forwardingKey
   const possession = generatePossessionProof(
@@ -558,7 +561,9 @@ export async function processCircuitSetupAck(
   // 9. Verify AEAD possession proof — proves the relay holds the derived forwardingKey.
   //    This is NOT just an identity signature. The relay encrypted a challenge
   //    using the derived key; the initiator decrypts it to verify key possession.
-  const noncePrefix = deriveNoncePrefix(commitmentRoot);
+  //    The nonce prefix is bound to the circuit instance (root + initiator eph
+  //    pub) per ADR-0020 — the initiator uses its own ephemeral public key.
+  const noncePrefix = deriveNoncePrefix(commitmentRoot, expectedInitiatorX25519PublicKey);
   const possessionValid = verifyPossessionProof(
     keys.forwardingKey, noncePrefix, commitmentRoot,
     ack.possessionProofCiphertext, ack.possessionChallenge,
@@ -662,11 +667,13 @@ export async function establishDistributedCircuit(
   }
 
   // 3. Compute circuit ID + nonce prefix from commitment_root
-  //    Per spec/08 §3 + §4.3: circuit_id and nonce_prefix both bind to the
-  //    raw 32-byte commitment_root (NOT the routeId string).
+  //    Per spec/08 §3 + §4.3: circuit_id binds to commitment_root + initiator
+  //    ephemeral public key. Per ADR-0020 (R-009 Stage 1 final reconciliation),
+  //    nonce_prefix is ALSO bound to the initiator ephemeral public key, so a
+  //    re-key on the same route produces a fresh nonce prefix.
   const circuitId = deriveCircuitId(route.commitmentRoot, initiatorX25519PublicKey);
   const circuitIdHex = toHex(circuitId);
-  const noncePrefix = deriveNoncePrefix(route.commitmentRoot);
+  const noncePrefix = deriveNoncePrefix(route.commitmentRoot, initiatorX25519PublicKey);
   const commitDigestHex = toHex(routeCommitmentDigest(route));
 
   // 3b. R-009 Stage 1 final replay-model correction: the durable floor is now

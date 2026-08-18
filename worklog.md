@@ -1711,3 +1711,55 @@ Stage Summary:
 - The single semantic assertion fix (test 9: `replayGuard.getSequenceFloor() === PRE_SET_FLOOR` → `floorStore.getFloor(root, 0, FORWARD) === PRE_SET_FLOOR`) preserves the original test intent (prove the durable floor survived the re-key) while reflecting the new model (the durable floorStore is the source of truth, the in-memory replayGuard is just a fast-path cache mirror seeded at 0 by `establishDistributedCircuit`).
 - All 5 target test files pass: 76 / 76 tests, 207 expect() calls. Full unit suite: 390 pass / 8 fail (all 8 in the parent's separate r009-circuit-frame.test.ts).
 - Lint: clean (exit 0).
+
+
+---
+Task ID: 5c-python-nonce-binding
+Agent: general-purpose (subagent)
+Task: Update the Python conformance verifier (`conformance/runners/py_vector_verifier.py`) for the R-009 Stage 1 final reconciliation (ADR-0020): `deriveNoncePrefix` now takes `initiatorX25519PublicKey` as a second argument and uses it as the HKDF `ikm` (instead of the literal string `b"nonce-prefix"`). This binds the nonce prefix to the CIRCUIT INSTANCE (root + initiator eph pub) so a re-key on the same route produces a fresh nonce prefix (spec/08 §4.7 + ADR-0020). Also add the new `nonce-prefix-re-key-freshness` dispatch case (added to V-CIRCUIT-001.json) and update the V-CIRCUIT-FRAME-001 verifier's prefix reconstruction to use `sharedInputs.initiatorX25519PubHex`. The TS conformance runner already passes 36/36 with the updated vectors; this closes the cross-implementation conformance gap by mirroring the same change in the independent Python verifier.
+
+Work Log:
+- Read context: worklog.md last 5 sections (R008-integration-fix, 5-python-verifier, 5b-python-negative-vectors, 8-test-updates) — confirmed the FROZEN R-008 crypto substrate (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload, deriveNoncePrefix) that R-009 Stage 1 builds on top of, plus the prior Python verifier tasks (5 + 5b) that established the independent Python V-CIRCUIT-FRAME-001 verifier.
+
+- Confirmed the new signatures (spec↔TS↔vector axis):
+  * `reference/circuit/circuit.ts:deriveNoncePrefix` (lines 190-198): `deriveNoncePrefix(commitmentRoot, initiatorX25519PublicKey)`; `ikm=initiatorX25519PublicKey`, `salt=commitmentRoot`; info=`"SHARENET/CIRCUIT/NONCE/1"`; output first 8 bytes.
+  * `conformance/vectors/V-CIRCUIT-001.json` `nonce-prefix-deterministic` case (lines 33-42): input now carries `commitmentRootHex` + `initiatorX25519PubHex`; expected `noncePrefixHex: "dfd987eee353ac6d"`.
+  * `conformance/vectors/V-CIRCUIT-001.json` `nonce-prefix-re-key-freshness` case (lines 80-93): input carries `commitmentRootHex` + `initiatorX25519PubHexA` + `initiatorX25519PubHexB`; expected `noncePrefixHexA`, `noncePrefixHexB`, `different: true`.
+  * `conformance/vectors/V-CIRCUIT-FRAME-001.json` sharedInputs (line 11): now carries `initiatorX25519PubHex`; the `noncePrefixHex` was regenerated (`0bff2b87cab7e390`) under the new derivation.
+  * `conformance/runners/ts-vector-runner.ts` (lines 542-566): the TS runner already calls `deriveNoncePrefix(commitmentRoot, initiatorPub)` for both `nonce-prefix-deterministic` AND the new `nonce-prefix-re-key-freshness` case; and (line 1010) reconstructs the prefix in V-CIRCUIT-FRAME-001 via `deriveNoncePrefix(commitmentRoot, initiatorPub)`.
+
+- Searched the Python verifier for all call sites of `derive_circuit_nonce_prefix` — exactly 3:
+  1. Definition at line 1005 (old form: `derive_circuit_nonce_prefix(commitment_root: bytes) -> bytes`).
+  2. Call site in `verify_circuit_vector` (line 1086, `nonce-prefix-deterministic` case): `prefix = derive_circuit_nonce_prefix(commitment_root)`.
+  3. Call site in `verify_circuit_frame_vector` (line 1596, V-CIRCUIT-FRAME-001 prefix reconstruction): `derived_prefix = derive_circuit_nonce_prefix(commitment_root)`.
+
+- Edit 1 (definition, lines 1005-1014): rewrote `derive_circuit_nonce_prefix` to take `initiator_x25519_pub: bytes` as a second argument, use it as the HKDF `ikm`, and updated the docstring to explain the ADR-0020 binding (root + initiator eph pub → fresh nonce prefix on re-key). Also added a comment above the now-LEGACY `CIRCUIT_NONCE_PREFIX_IKM = b"nonce-prefix"` constant (line 961-966) clarifying that it is kept for historical reference but no longer used by `derive_circuit_nonce_prefix`. The salt (`commitment_root`) and info (`SHARENET/CIRCUIT/NONCE/1`) and length (8 bytes) are all UNCHANGED — only the `ikm` changed, exactly mirroring the TS reference (`reference/circuit/circuit.ts:190-198`).
+
+- Edit 2 (`nonce-prefix-deterministic` dispatch, lines 1097-1108): updated to read `initiatorX25519PubHex` from the vector's `input` and pass it to `derive_circuit_nonce_prefix(commitment_root, initiator_x25519_pub)`. The expected assertion (byte-equal to `exp["noncePrefixHex"]`) is unchanged.
+
+- Edit 3 (NEW `nonce-prefix-re-key-freshness` dispatch, lines 1110-1137): added a new `elif` branch AFTER `nonce-prefix-deterministic` and BEFORE `nonce-layout` (mirroring the TS dispatch ordering at ts-vector-runner.ts:553-566). The branch:
+  * Reads `commitmentRootHex`, `initiatorX25519PubHexA`, `initiatorX25519PubHexB` from the vector's `input`.
+  * Derives `np_a = derive_circuit_nonce_prefix(commitment_root, pub_a)` and `np_b = derive_circuit_nonce_prefix(commitment_root, pub_b)`.
+  * Asserts `np_a.hex() == exp["noncePrefixHexA"]`, `np_b.hex() == exp["noncePrefixHexB"]`, and `(np_a != np_b) == exp["different"]`.
+  * Three separate `failures.append(...)` calls for granular diagnostic on mismatch (same pattern as the TS runner's combined check + single failure string, but the Python runner prefers per-field diagnostics).
+
+- Edit 4 (V-CIRCUIT-FRAME-001 prefix reconstruction, lines 1621-1662): rewrote the block to read `initiatorX25519PubHex` from `sharedInputs` and use it to re-derive the nonce prefix via `derive_circuit_nonce_prefix(commitment_root, initiator_x25519_pub)`. The byte-equality assertion against `shared["noncePrefixHex"]` (the regenerated expected value) is preserved. The re-derived prefix is then aliased to `nonce_prefix` and used to populate the minimal `ActiveCircuit` (so all downstream cases — seal_forward_frame / open_frame / forward_frame / tampered-ciphertext-rejected / wrong-circuit-rejected — use the NEW derivation's bytes, which matches the regenerated sealed-frame hex values in the vector file). The `circuit` dict construction is unchanged in structure.
+
+- Verification:
+  * `python3 conformance/runners/py_vector_verifier.py 2>&1 | tail -5` → `Passed: 36/36, Failed: 0` (exit 0).
+  * All 4 V-CIRCUIT-* vectors pass: V-CIRCUIT-001, V-CIRCUIT-ACK-001, V-CIRCUIT-FRAME-001, V-CIRCUIT-SETUP-001.
+  * All 36 vectors pass — zero regressions.
+  * Manually called `derive_circuit_nonce_prefix` against each of the 3 expected outputs to confirm exact byte-equality:
+    - `nonce-prefix-deterministic`: derived `dfd987eee353ac6d` == expected `dfd987eee353ac6d` ✓
+    - `nonce-prefix-re-key-freshness`: npA `dfd987eee353ac6d` ✓, npB `bffb0c6c680b2fd3` ✓, different=True ✓
+    - `V-CIRCUIT-FRAME-001` sharedInputs: derived `0bff2b87cab7e390` == expected `0bff2b87cab7e390` ✓ (confirms the regenerated sealed-frame bytes match the new derivation).
+
+- Independence preserved: AST-walked the file imports — only stdlib (`hashlib`, `hmac`, `json`, `os`, `re`, `sys`, `struct`, `io`, `pathlib`, `typing`) + `blake3`, `cbor2`, `nacl.signing`/`nacl.exceptions`, `cryptography.hazmat...ChaCha20Poly1305`/`cryptography.exceptions.InvalidTag`. ZERO imports from `reference/` or any TS-side module — the Python verifier remains a fully independent cross-implementation check.
+
+Stage Summary:
+- Python conformance runner: 36/36 vectors pass (was 36/36 pre-edit — the prior count was achieved with the OLD derivation, which is no longer correct under ADR-0020; this task updates the derivation to match the regenerated vectors, restoring the 36/36 count under the corrected derivation).
+- `derive_circuit_nonce_prefix` now mirrors `reference/circuit/circuit.ts:deriveNoncePrefix` exactly: `HKDF-SHA256(salt=commitment_root, ikm=initiator_x25519_pub, info="SHARENET/CIRCUIT/NONCE/1")[0:8]`. The literal `b"nonce-prefix"` ikm is no longer used.
+- The new `nonce-prefix-re-key-freshness` dispatch case independently verifies ADR-0020's binding claim: two circuits on the SAME route with DIFFERENT initiator ephemeral keys produce DIFFERENT nonce prefixes (npA=`dfd987eee353ac6d`, npB=`bffb0c6c680b2fd3`).
+- The V-CIRCUIT-FRAME-001 verifier now re-derives the nonce prefix from `sharedInputs.initiatorX25519PubHex` (matching the TS runner at line 1010) — the regenerated sealed-frame hex values pass under the new derivation.
+- No regressions: all 36 vectors pass; the V-CIRCUIT-FRAME-001's 14 cases (9 original + 5 R-009 Stage 1 hardening) all still pass under the new prefix derivation. The frozen R-008 protocol ordering (AEAD → durable commit → accept) is untouched — only the nonce-prefix INPUT changed.
+- Cross-implementation conformance (TS ↔ Python) is preserved: both runners independently reproduce the exact bytes from the regenerated vector files.

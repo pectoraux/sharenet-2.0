@@ -116,14 +116,19 @@ setup phase and (b) encrypt/decrypt relayed frames in the data phase.
 Each frame carries a 96-bit AEAD nonce composed of:
 
 ```
-nonce = circuit_nonce_prefix (64 bits, fixed per circuit)
+nonce = circuit_nonce_prefix (64 bits, fixed per circuit instance)
      || frame_sequence (32 bits, big-endian, starts at 1)
 ```
 
 - `circuit_nonce_prefix` is the first 8 bytes of:
-  `HKDF-SHA256(salt = commitment_root, ikm = "nonce-prefix",
+  `HKDF-SHA256(salt = commitment_root, ikm = initiator_x25519_pub,
               info = "SHARENET/CIRCUIT/NONCE/1")`
-  (32-byte output, first 8 bytes used as prefix).
+  (32-byte output, first 8 bytes used as prefix). The `ikm` is the raw
+  32-byte initiator ephemeral X25519 public key — the same key used in
+  `CircuitId` derivation (§3). This binds the nonce space to the **circuit
+  instance** (commitment_root + initiator ephemeral key), not just the
+  route, so a re-key on the same route produces a FRESH nonce prefix (§4.7).
+  See ADR-0020.
 - `frame_sequence` is a 32-bit per-circuit counter starting at 1.
   The circuit MUST terminate with an error if `frame_sequence` would
   overflow.
@@ -225,6 +230,13 @@ A circuit carries `valid_until = min(hop.accepted_expiry for hop in
 route)`. Once `now > valid_until`, the circuit MUST be torn down.
 Expiry does NOT lower the sequence floor; a new circuit MUST start
 from a fresh `(eph_priv, eph_pub)` and a new `circuit_nonce_prefix`.
+
+Per §4.3 (as amended by ADR-0020), the `circuit_nonce_prefix` is derived
+from `(commitment_root, initiator_x25519_pub)`, so a fresh ephemeral
+keypair produces a fresh nonce prefix by construction — satisfying the
+"new circuit_nonce_prefix" requirement. The persistent receiver-local
+sequence floor `(commitmentRoot, hopIndex, direction)` (per ADR-0019)
+provides cross-re-key replay protection independently.
 
 ## 5. Circuit Setup Protocol
 

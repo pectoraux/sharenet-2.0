@@ -958,7 +958,12 @@ CIRCUIT_NONCE_DOMAIN = b"SHARENET/CIRCUIT/NONCE/1"
 CIRCUIT_AEAD_NONCE_BYTES = 12
 CIRCUIT_HKDF_EXPAND_LEN = 64
 CIRCUIT_NONCE_PREFIX_BYTES = 8
-CIRCUIT_NONCE_PREFIX_IKM = b"nonce-prefix"
+# R-009 Stage 1 final reconciliation (ADR-0020): the `ikm` is the raw 32-byte
+# initiator X25519 ephemeral public key (the same key used in CircuitId
+# derivation), NOT the literal string b"nonce-prefix". This binds the nonce
+# prefix to the circuit instance (root + initiator eph pub) so a re-key on
+# the same route produces a fresh nonce prefix (spec/08 §4.7 + ADR-0020).
+CIRCUIT_NONCE_PREFIX_IKM = b"nonce-prefix"  # LEGACY — kept for historical reference; NOT used by derive_circuit_nonce_prefix.
 
 
 def derive_circuit_id(commitment_root: bytes, initiator_x25519_pub: bytes) -> bytes:
@@ -1002,14 +1007,22 @@ def derive_hop_keys(shared_secret: bytes, hop_index: int, commitment_root: bytes
     return expanded[:32], expanded[32:64]
 
 
-def derive_circuit_nonce_prefix(commitment_root: bytes) -> bytes:
+def derive_circuit_nonce_prefix(commitment_root: bytes,
+                                initiator_x25519_pub: bytes) -> bytes:
     """Derive the 8-byte per-circuit AEAD nonce prefix.
 
+    Per ADR-0020 (R-009 Stage 1 final reconciliation) + spec/08 §4.7: the
+    nonce prefix is bound to the CIRCUIT INSTANCE (root + initiator ephemeral
+    X25519 public key), so a re-key on the same route produces a fresh nonce
+    prefix. The `ikm` is the raw 32-byte initiator X25519 public key (the
+    same key used in CircuitId derivation), NOT the literal string
+    b"nonce-prefix" used pre-980ced6.
+
     Nonce prefix = first 8 bytes of
-      HKDF-SHA256(salt=commitment_root, ikm=b"nonce-prefix",
+      HKDF-SHA256(salt=commitment_root, ikm=initiator_x25519_pub,
                   info=SHARENET/CIRCUIT/NONCE/1)
     """
-    prk = _hkdf_extract(commitment_root, CIRCUIT_NONCE_PREFIX_IKM)
+    prk = _hkdf_extract(commitment_root, initiator_x25519_pub)
     expanded = _hkdf_expand(prk, CIRCUIT_NONCE_DOMAIN, CIRCUIT_NONCE_PREFIX_BYTES)
     return expanded[:CIRCUIT_NONCE_PREFIX_BYTES]
 
@@ -1083,11 +1096,44 @@ def verify_circuit_vector(data: dict) -> dict:
 
             elif name == "nonce-prefix-deterministic":
                 commitment_root = bytes.fromhex(inp["commitmentRootHex"])
-                prefix = derive_circuit_nonce_prefix(commitment_root)
+                # R-009 Stage 1 (ADR-0020): ikm = initiator X25519 pub.
+                initiator_x25519_pub = bytes.fromhex(
+                    inp["initiatorX25519PubHex"])
+                prefix = derive_circuit_nonce_prefix(
+                    commitment_root, initiator_x25519_pub)
                 if prefix.hex() != exp["noncePrefixHex"]:
                     failures.append(
                         f'{name}: noncePrefix {prefix.hex()} '
                         f'!= {exp["noncePrefixHex"]}'
+                    )
+
+            elif name == "nonce-prefix-re-key-freshness":
+                # R-009 Stage 1 (ADR-0020 + spec/08 §4.7): two circuits on
+                # the SAME route (same commitment_root) with DIFFERENT
+                # initiator ephemeral keys MUST get different nonce prefixes.
+                commitment_root = bytes.fromhex(inp["commitmentRootHex"])
+                pub_a = bytes.fromhex(inp["initiatorX25519PubHexA"])
+                pub_b = bytes.fromhex(inp["initiatorX25519PubHexB"])
+                np_a = derive_circuit_nonce_prefix(commitment_root, pub_a)
+                np_b = derive_circuit_nonce_prefix(commitment_root, pub_b)
+                np_a_hex = np_a.hex()
+                np_b_hex = np_b.hex()
+                if np_a_hex != exp["noncePrefixHexA"]:
+                    failures.append(
+                        f"{name}: noncePrefixA {np_a_hex} "
+                        f"!= {exp['noncePrefixHexA']}"
+                    )
+                if np_b_hex != exp["noncePrefixHexB"]:
+                    failures.append(
+                        f"{name}: noncePrefixB {np_b_hex} "
+                        f"!= {exp['noncePrefixHexB']}"
+                    )
+                # (npA != npB) must equal expected.different.
+                different = (np_a != np_b)
+                if different != exp["different"]:
+                    failures.append(
+                        f"{name}: different={different} "
+                        f"!= {exp['different']}"
                     )
 
             elif name == "nonce-layout":
@@ -1573,11 +1619,36 @@ def verify_circuit_frame_vector(data: dict) -> dict:
     shared = data.get("sharedInputs", {}) or {}
 
     commitment_root = bytes.fromhex(shared["commitmentRootHex"])
-    nonce_prefix = bytes.fromhex(shared["noncePrefixHex"])
     fwd_key_0 = bytes.fromhex(shared["forwardingKey0Hex"])
     fwd_key_1 = bytes.fromhex(shared["forwardingKey1Hex"])
     ret_key_0 = bytes.fromhex(shared["returnKey0Hex"])
     ret_key_1 = bytes.fromhex(shared["returnKey1Hex"])
+
+    # R-009 Stage 1 final reconciliation (ADR-0020): the nonce prefix is now
+    # bound to the circuit INSTANCE (root + initiator ephemeral X25519 public
+    # key), NOT just the commitment_root. The sharedInputs carry both the
+    # initiatorX25519PubHex (used to re-derive) and the noncePrefixHex (the
+    # expected bytes for byte-equality assertion below).
+    initiator_x25519_pub = bytes.fromhex(shared["initiatorX25519PubHex"])
+    expected_nonce_prefix = bytes.fromhex(shared["noncePrefixHex"])
+
+    # Independent re-derivation proves the frozen substrate is consistent
+    # across the spec↔Python axis (and that ADR-0020's ikm change matches the
+    # expected bytes the TS runner regenerated).
+    derived_prefix = derive_circuit_nonce_prefix(
+        commitment_root, initiator_x25519_pub)
+    if derived_prefix != expected_nonce_prefix:
+        return {
+            "id": vid,
+            "passed": False,
+            "expected": f"derived noncePrefix {expected_nonce_prefix.hex()}",
+            "actual": f"derived {derived_prefix.hex()} (mismatch)",
+        }
+
+    # Use the re-derived prefix (== expected) for all downstream cases —
+    # the sealed-frame hex values were regenerated under the new derivation,
+    # so this MUST match.
+    nonce_prefix = derived_prefix
 
     # Minimal ActiveCircuit for seal_forward_frame / open_frame / forward_frame.
     # (These functions only use: commitmentRoot, noncePrefix, hops[].)
@@ -1589,18 +1660,6 @@ def verify_circuit_frame_vector(data: dict) -> dict:
             {"hopIndex": 1, "forwardingKey": fwd_key_1, "returnKey": ret_key_1},
         ],
     }
-
-    # Sanity-check that the shared noncePrefix is what the R-008 HKDF
-    # derivation produces from the commitment_root. (Independent re-derivation
-    # proves the frozen substrate is consistent.)
-    derived_prefix = derive_circuit_nonce_prefix(commitment_root)
-    if derived_prefix != nonce_prefix:
-        return {
-            "id": vid,
-            "passed": False,
-            "expected": f"derived noncePrefix {nonce_prefix.hex()}",
-            "actual": f"derived {derived_prefix.hex()} (mismatch)",
-        }
 
     # Carry state across cases (some vectors reference prior outputs).
     sealed_forward_frame = None  # set by seal-forward-frame

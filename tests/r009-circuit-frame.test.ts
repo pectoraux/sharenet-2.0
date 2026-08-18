@@ -30,6 +30,7 @@ import { toHex, canonicalEncode } from "@reference/encoding/cbor";
 import {
   setupCircuit,
   onionEncrypt,
+  deriveNoncePrefix,
 } from "@reference/circuit/circuit";
 import {
   encodeCircuitFrame,
@@ -851,5 +852,63 @@ describe("R-009 Stage 1 final hardening: backward direction rejected by producti
     // The commitFloor boolean was REMOVED — commit ownership is derived from
     // protocol state (direction + hopIndex), not caller-supplied.
     expect(processCircuitWireFrame.length).toBe(3);
+  });
+});
+
+// =====================================================================
+// R-009 Stage 1 final protocol reconciliation: re-key nonce-prefix freshness
+// (per the re-audit of 980ced6: nonce prefix MUST be bound to the circuit
+//  instance so a re-key on the same route produces a fresh nonce prefix,
+//  matching spec/08 §4.7. See ADR-0020.)
+// =====================================================================
+
+describe("R-009 Stage 1 final: re-key produces a fresh nonce prefix (ADR-0020)", () => {
+  test("same commitmentRoot + different ephemeral key → different nonce prefix", () => {
+    const route = makeRoute(1);
+    const commitmentRoot = route.commitmentRoot;
+
+    // Two different initiator ephemeral keypairs.
+    const initSk1 = randomBytes(32);
+    const initPk1 = x25519.getPublicKey(initSk1);
+    const initSk2 = randomBytes(32);
+    const initPk2 = x25519.getPublicKey(initSk2);
+
+    // Per ADR-0020: nonce prefix is bound to (commitment_root, initiator_eph_pub).
+    const np1 = deriveNoncePrefix(commitmentRoot, initPk1);
+    const np2 = deriveNoncePrefix(commitmentRoot, initPk2);
+
+    // Same route, different ephemeral keys → different nonce prefixes.
+    expect(toHex(np1)).not.toBe(toHex(np2));
+  });
+
+  test("same commitmentRoot + same ephemeral key → same nonce prefix (deterministic)", () => {
+    const route = makeRoute(1);
+    const commitmentRoot = route.commitmentRoot;
+    const initSk = randomBytes(32);
+    const initPk = x25519.getPublicKey(initSk);
+
+    // Same inputs → same nonce prefix (deterministic).
+    const np1 = deriveNoncePrefix(commitmentRoot, initPk);
+    const np2 = deriveNoncePrefix(commitmentRoot, initPk);
+    expect(toHex(np1)).toBe(toHex(np2));
+  });
+
+  test("re-key: two circuits on the same route use different nonce prefixes", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+
+    // Circuit A: setupCircuit generates a random ephemeral keypair internally.
+    const circuitA = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Circuit B: re-key on the same route — setupCircuit generates a NEW
+    // random ephemeral keypair. Per spec/08 §4.7 + ADR-0020, the nonce prefix
+    // MUST be fresh.
+    const circuitB = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // The two circuits have different CircuitIds (different ephemeral keys).
+    expect(circuitA.circuitIdHex).not.toBe(circuitB.circuitIdHex);
+    // And different nonce prefixes (bound to the circuit instance).
+    expect(toHex(circuitA.noncePrefix)).not.toBe(toHex(circuitB.noncePrefix));
   });
 });

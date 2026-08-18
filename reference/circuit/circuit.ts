@@ -151,17 +151,47 @@ export function deriveHopKeys(
 }
 
 /**
- * Derive the 64-bit circuit nonce prefix from the commitment root.
+ * Derive the 64-bit circuit nonce prefix.
  *
- * Per spec/08 §4.3 (FROZEN):
+ * Per spec/08 §4.3 (FROZEN — R-009 Stage 1 final protocol reconciliation, ADR-0020):
+ *
  *   prefix = first 8 bytes of HKDF-SHA256(
  *     salt = commitment_root,
- *     ikm  = "nonce-prefix",
+ *     ikm  = initiator_x25519_pub,   ; 32 bytes — binds nonce space to the circuit instance
  *     info = "SHARENET/CIRCUIT/NONCE/1"
  *   )
+ *
+ * The nonce prefix is bound to the CIRCUIT INSTANCE (commitment_root +
+ * initiator ephemeral X25519 public key), not just the route. This is
+ * critical for re-key safety:
+ *
+ *   Per spec/08 §4.7: "a new circuit MUST start from a fresh (eph_priv,
+ *   eph_pub) and a new circuit_nonce_prefix."
+ *
+ * Under the OLD derivation (pre-980ced6), the nonce prefix was bound only
+ * to `commitment_root`. A re-key on the same route produced the SAME nonce
+ * prefix — contradicting §4.7. Nonce uniqueness across re-key relied solely
+ * on the persistent sequence floor.
+ *
+ * Under this (corrected) derivation, the nonce prefix is bound to the
+ * initiator's ephemeral public key, so:
+ *
+ *   new eph keypair → new CircuitId → new nonce prefix
+ *
+ * Two circuits on the same route with different ephemeral keys get DIFFERENT
+ * nonce prefixes. The persistent receiver-local sequence floor
+ * (commitmentRoot, hopIndex, direction) still provides cross-re-key replay
+ * protection, but nonce uniqueness is now also guaranteed by construction
+ * — matching the normative text.
+ *
+ * NOTE: the ikm is the raw 32-byte initiator X25519 public key (the same
+ * key used in CircuitId derivation), NOT the string "nonce-prefix".
  */
-export function deriveNoncePrefix(commitmentRoot: Uint8Array): Uint8Array {
-  const prk = hkdfExtract(sha256, new TextEncoder().encode("nonce-prefix"), commitmentRoot);
+export function deriveNoncePrefix(
+  commitmentRoot: Uint8Array,
+  initiatorX25519PublicKey: Uint8Array,
+): Uint8Array {
+  const prk = hkdfExtract(sha256, initiatorX25519PublicKey, commitmentRoot);
   const info = new TextEncoder().encode("SHARENET/CIRCUIT/NONCE/1");
   const expanded = hkdfExpand(sha256, prk, info, 8);
   return expanded.slice(0, 8);
@@ -494,8 +524,10 @@ export function setupCircuit(
   const circuitId = deriveCircuitId(route.commitmentRoot, initiatorPublicKey);
   const circuitIdHex = toHex(circuitId);
 
-  // Derive the 64-bit nonce prefix from commitment_root (per spec/08 §4.3)
-  const noncePrefix = deriveNoncePrefix(route.commitmentRoot);
+  // Derive the 64-bit nonce prefix — bound to the circuit INSTANCE
+  // (commitment_root + initiator ephemeral public key) per spec/08 §4.3 +
+  // ADR-0020 (R-009 Stage 1 final protocol reconciliation).
+  const noncePrefix = deriveNoncePrefix(route.commitmentRoot, initiatorPublicKey);
 
   // Derive per-hop keys — uses commitment_root as salt (per spec/08 §4.1)
   const hopKeys: HopKeyMaterial[] = [];

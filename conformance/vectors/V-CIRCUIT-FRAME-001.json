@@ -5,18 +5,18 @@
   "adr": "adr/0017-protocol-freeze-reconciliation.md",
   "description": "CircuitFrame wire object: canonical CBOR encode/decode (ADR-0004 integer-keyed map), sealForwardFrame (onion-encrypt using the frozen R-008 crypto substrate), openFrame (AEAD-peel one layer), forwardFrame (relay forwarding). Per spec/08 §4.6: the frame carries circuit_nonce_prefix (8 bytes), frame_sequence (u32 BE), direction (0x01 forward / 0x02 backward), and the onion ciphertext. The AEAD AD is domain || commitment_root || frame_sequence || direction (FROZEN per R-008). R-009 builds the packet protocol ON TOP of the frozen R-008 crypto substrate — no crypto primitives are modified.",
   "sharedInputs": {
-    "commitmentRootHex": "af11de03a4799b05b1cc212b020bbd9062654ebab4cf7ecf7e851d0b90856958",
-    "noncePrefixHex": "d8f8663d379710e6",
+    "commitmentRootHex": "a4626225bc2a35d6bb74633c07b1cebfd90615abbf966a7d556774f1b93aaa8b",
+    "noncePrefixHex": "0bff2b87cab7e390",
     "initiatorX25519SecretKeyHex": "0101010101010101010101010101010101010101010101010101010101010101",
     "initiatorX25519PubHex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
     "relay0X25519SecretKeyHex": "0202020202020202020202020202020202020202020202020202020202020202",
     "relay0X25519PubHex": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
     "relay1X25519SecretKeyHex": "0303030303030303030303030303030303030303030303030303030303030303",
     "relay1X25519PubHex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22",
-    "forwardingKey0Hex": "980d96c259d0ac51d637993139a8b23259d5b3fa8d699ca1c717d2d6169b5b7b",
-    "forwardingKey1Hex": "d4d4cc7095779f135ccaf5853dabaefe8109ad8e77b7dfc53f0df26b2242b9f7",
-    "returnKey0Hex": "9ae2f864fca7a2248f71658d494a60d5fd1fe0e8ce4f08263a5f4b5322260f24",
-    "returnKey1Hex": "80c590a84643eea7cd7d660a82bd368138c67c5f484d27a1f22fac45179ead9a",
+    "forwardingKey0Hex": "6793c0777c1c91875354d62e5b2b6cf59c41e2508c36c7dc4dd9f1ad13150adc",
+    "forwardingKey1Hex": "8a75c5bfad7ddc0d804d829aef7042f600982ec9ec42a51f00c712533e694eef",
+    "returnKey0Hex": "e912d4d37dbec83cf11aeb3d30d97f1dd5b6b618576fc99fab8d2776fb73b01e",
+    "returnKey1Hex": "d7710509e0ea12bd1f49e1268901756600a48caa46b9f13dfdef9c36213a862a",
     "plaintextHex": "474554202f20485454502f312e310d0a486f73743a206578616d706c652e636f6d0d0a0d0a",
     "plaintextAscii": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
     "referenceNow": 1786876545
@@ -26,26 +26,26 @@
       "name": "encode-frame",
       "description": "Encode a CircuitFrame with known fields to canonical CBOR (ADR-0004 integer-keyed map).",
       "input": {
-        "circuitNoncePrefixHex": "d8f8663d379710e6",
+        "circuitNoncePrefixHex": "0bff2b87cab7e390",
         "frameSequence": 1,
         "direction": 1,
         "ciphertextHex": "deadbeefcafebabedeadbeefcafebabe"
       },
       "expected": {
-        "encodedHex": "a40148d8f8663d379710e6020103010450deadbeefcafebabedeadbeefcafebabe"
+        "encodedHex": "a401480bff2b87cab7e390020103010450deadbeefcafebabedeadbeefcafebabe"
       }
     },
     {
       "name": "decode-frame",
       "description": "Decode the canonical CBOR back to a CircuitFrame + validate field sizes.",
       "input": {
-        "encodedHex": "a40148d8f8663d379710e6020103010450deadbeefcafebabedeadbeefcafebabe"
+        "encodedHex": "a401480bff2b87cab7e390020103010450deadbeefcafebabedeadbeefcafebabe"
       },
       "expected": {
         "ok": true,
         "frameSequence": 1,
         "direction": 1,
-        "circuitNoncePrefixHex": "d8f8663d379710e6",
+        "circuitNoncePrefixHex": "0bff2b87cab7e390",
         "ciphertextHex": "deadbeefcafebabedeadbeefcafebabe"
       }
     },
@@ -67,10 +67,10 @@
         "plaintextHex": "474554202f20485454502f312e310d0a486f73743a206578616d706c652e636f6d0d0a0d0a"
       },
       "expected": {
-        "circuitNoncePrefixHex": "d8f8663d379710e6",
+        "circuitNoncePrefixHex": "0bff2b87cab7e390",
         "frameSequence": 1,
         "direction": 1,
-        "sealedEncodedHex": "a40148d8f8663d379710e602010301045845e42f679a2f0fd29180c429f8346781b0f8312d922728ab90a5a3c33a42e2ed3c4fb7f7216f1c15a24743a7b68ce40208d4856159262e26dc99083499f014d09d06bcce988a",
+        "sealedEncodedHex": "a401480bff2b87cab7e3900201030104584572917b97ece0ce9df6a1ddd9d1d9bef47e0c68290e73883130c2e7ec4c7d434472026bfc853dfd55b60e4d0db8e144653cd0651a5bc4fb73981608d6637091a5b254f021d5",
         "ciphertextLen": 69
       }
     },
@@ -83,7 +83,7 @@
       "expected": {
         "ok": true,
         "isTerminal": false,
-        "payloadHex": "25759b4891ccb41891c469b18260fb8e5ea5dd4319838d3fefa52ee052b1dad7bd3b517ddbd34960b4761f42bab018a8d6d86d5029",
+        "payloadHex": "3225c7aa7c3e4ce35066e6957fc361c57d374278dd1f3e2109e4776024e53e6b81cc7ca6927918458d19337899270ae59458b2b4e7",
         "payloadLen": 53
       }
     },
@@ -96,7 +96,7 @@
       "expected": {
         "ok": true,
         "terminal": false,
-        "nextFrameEncodedHex": "a40148d8f8663d379710e60201030104583525759b4891ccb41891c469b18260fb8e5ea5dd4319838d3fefa52ee052b1dad7bd3b517ddbd34960b4761f42bab018a8d6d86d5029",
+        "nextFrameEncodedHex": "a401480bff2b87cab7e390020103010458353225c7aa7c3e4ce35066e6957fc361c57d374278dd1f3e2109e4776024e53e6b81cc7ca6927918458d19337899270ae59458b2b4e7",
         "nextFrameCiphertextLen": 53
       }
     },
@@ -139,7 +139,7 @@
       "name": "noncanonical-integer-encoding",
       "description": "Non-minimal CBOR integer (0x1801 instead of 0x01) → REJECT (strict canonical decode).",
       "input": {
-        "encodedHex": "a40148d8f8663d379710e60218010301045820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        "encodedHex": "a401480bff2b87cab7e3900218010301045820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
       },
       "expected": {
         "ok": false,
@@ -150,7 +150,7 @@
       "name": "duplicate-key",
       "description": "Duplicate CBOR map key → REJECT (round-trip check detects it).",
       "input": {
-        "encodedHex": "a40148d8f8663d379710e6020102050301045820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+        "encodedHex": "a401480bff2b87cab7e390020102050301045820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
       },
       "expected": {
         "ok": false
@@ -160,7 +160,7 @@
       "name": "unknown-key",
       "description": "Unknown CBOR map key (5) → REJECT (only {1,2,3,4} are legal).",
       "input": {
-        "encodedHex": "a50148d8f8663d379710e602010301045820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0501"
+        "encodedHex": "a501480bff2b87cab7e39002010301045820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0501"
       },
       "expected": {
         "ok": false,
@@ -171,7 +171,7 @@
       "name": "trailing-bytes",
       "description": "Trailing bytes after a valid frame → REJECT (entire input must be consumed).",
       "input": {
-        "encodedHex": "a40148d8f8663d379710e602010301045820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd010203"
+        "encodedHex": "a401480bff2b87cab7e39002010301045820cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd010203"
       },
       "expected": {
         "ok": false,

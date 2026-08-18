@@ -39,7 +39,7 @@ const sharedSecret1 = x25519.getSharedSecret(initSk, relay1Pk);
 const keys0 = deriveHopKeys(sharedSecret0, 0, commitmentRoot);
 const keys1 = deriveHopKeys(sharedSecret1, 1, commitmentRoot);
 
-const noncePrefix = deriveNoncePrefix(commitmentRoot);
+const noncePrefix = deriveNoncePrefix(commitmentRoot, initPk);
 const circuitId = deriveCircuitId(commitmentRoot, initPk);
 
 // Construct a MINIMAL ActiveCircuit manually (NO setupCircuit — that generates
