@@ -57,6 +57,8 @@ import {
   type HopKeyMaterial,
   AEAD_KEY_BYTES,
 } from "./circuit";
+import type { CircuitAckReplayStore, CircuitSequenceFloorStore } from "./replay-stores";
+import { InMemoryCircuitAckReplayStore } from "./replay-stores";
 
 // -----------------------------------------------------------------------
 // Constants (FROZEN per spec/14 §4 + ADR-0017)
@@ -363,6 +365,20 @@ export function handleCircuitSetup(
   relayEd25519SecretKey: Uint8Array,
   commitmentRoot: Uint8Array,
   now: number = Math.floor(Date.now() / 1000),
+  /**
+   * TEST-ONLY hook: a fixed ack nonce (16 bytes).
+   *
+   * When provided, the ack is signed with this nonce instead of a fresh
+   * random one. This lets integration tests craft acks that share a nonce
+   * across different hops to prove the ack-replay key
+   * `(commitmentRoot, hopIndex, ackNonce)` includes the hop index.
+   *
+   * Production callers MUST leave this undefined so the nonce is fresh
+   * and unpredictable. A nonce reused across two genuine acks on the
+   * SAME hop would be a replay; this hook is only for crafting acks on
+   * DIFFERENT hops to prove hop isolation.
+   */
+  ackNonceForTest?: Uint8Array,
 ): { ok: true; ack: CircuitSetupAck; state: RelaySetupState } | { ok: false; reason: string } {
   // 1. Verify the route is genuine
   if (!isBrandedCommittedRoute(req.route)) {
@@ -396,8 +412,10 @@ export function handleCircuitSetup(
   const commitDigest = routeCommitmentDigest(req.route);
   const commitDigestHex = toHex(commitDigest);
 
-  // 9. Sign the ack (binds route + hop + keys + possession proof + transcript)
-  const ackNonce = randomBytes(16);
+  // 9. Sign the ack (binds route + hop + keys + possession proof + transcript).
+  //    The ack nonce is fresh random unless the test-only `ackNonceForTest`
+  //    hook is provided (used to prove hop-isolation in the ack-replay key).
+  const ackNonce = ackNonceForTest ?? randomBytes(16);
   const ackExpiry = now + CIRCUIT_EXPIRY_SECONDS;
   const payload = circuitAckSigningPayload(
     req.route.routeId, commitDigestHex, req.hopIndex,
@@ -451,9 +469,20 @@ export function handleCircuitSetup(
  *   4. Derive forwarding + return keys
  *   5. Store the hop key material
  *
+ * Per the R-008 integration audit: the initiator MUST ALSO atomically
+ * consume `(commitmentRoot, hopIndex, ackNonce)` through a
+ * `CircuitAckReplayStore` BEFORE returning success. An identical, still-fresh
+ * ack presented a second time is rejected as a replay. This consumption
+ * survives process restart when a durable store is supplied.
+ *
+ * The consumption happens AFTER all cryptographic verification (so invalid
+ * acks do not consume nonce space) but BEFORE returning success (so a
+ * duplicate is caught). Fail-closed: if the persistence operation cannot
+ * complete, the ack is rejected.
+ *
  * Returns the hop key material on success.
  */
-export function processCircuitSetupAck(
+export async function processCircuitSetupAck(
   ack: CircuitSetupAck,
   expectedRouteId: string,
   expectedRouteCommitmentDigestHex: string,
@@ -463,7 +492,21 @@ export function processCircuitSetupAck(
   initiatorX25519SecretKey: Uint8Array,
   commitmentRoot: Uint8Array,
   now: number = Math.floor(Date.now() / 1000),
-): { ok: true; hopKey: HopKeyMaterial } | { ok: false; reason: string } {
+  /**
+   * Optional ack replay store (R-008 integration fix).
+   *
+   * If provided, the ack is atomically consumed through the store before
+   * success is returned. A replayed ack (same commitmentRoot + hopIndex +
+   * ackNonce) is rejected. If absent, a fresh in-memory store is used
+   * (single-process / test path — does NOT survive restart).
+   *
+   * Per the R-008 integration audit: production paths MUST supply a durable
+   * store. The protocol core never imports Prisma; the durable SQLite
+   * implementation lives in `src/lib/sharenet/` and implements
+   * `CircuitAckReplayStore`.
+   */
+  ackStore: CircuitAckReplayStore = new InMemoryCircuitAckReplayStore(),
+): Promise<{ ok: true; hopKey: HopKeyMaterial } | { ok: false; reason: string }> {
   // 1. Verify routeId matches
   if (ack.routeId !== expectedRouteId) {
     return { ok: false, reason: `routeId mismatch: expected ${expectedRouteId}, got ${ack.routeId}` };
@@ -527,6 +570,23 @@ export function processCircuitSetupAck(
     return { ok: false, reason: `relay ${expectedHopIndex} AEAD possession proof invalid (wrong key or tampered)` };
   }
 
+  // 10. Atomically consume the ack through the replay store (R-008 integration).
+  //     This happens AFTER all cryptographic verification (so invalid acks do
+  //     not consume nonce space) but BEFORE returning success (so a duplicate
+  //     is caught). The consumption key is (commitmentRoot, hopIndex, ackNonce).
+  //     Fail-closed: if the ack was already consumed (replay) OR the persistence
+  //     operation cannot complete, the ack is rejected.
+  //
+  //     When a durable store is supplied, this consumption survives process
+  //     restart — a replayed ack after restart is still rejected.
+  const consumed = await ackStore.consume(commitmentRoot, expectedHopIndex, ack.ackNonce);
+  if (!consumed) {
+    return {
+      ok: false,
+      reason: `relay ${expectedHopIndex} ack replay: (commitmentRoot, hopIndex, ackNonce) already consumed or persistence failed (fail-closed)`,
+    };
+  }
+
   return {
     ok: true,
     hopKey: {
@@ -561,16 +621,39 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
  *   3. All ack signatures verified
  *   4. All hop keys derived
  *
+ * Per the R-008 integration audit: this function ALSO:
+ *   5. Atomically consumes each ack through the `CircuitAckReplayStore`
+ *      (via `processCircuitSetupAck`) — replayed acks are rejected.
+ *   6. Loads the prior sequence floor from the `CircuitSequenceFloorStore`
+ *      (if supplied) so a re-key on the same route continues from the
+ *      prior floor (spec/08 §4.5), and attaches the store to the
+ *      `ActiveCircuit` so `processCircuitFrame` does durable check+persist.
+ *
  * The resulting ActiveCircuit is registered in the circuit WeakSet.
  */
-export function establishDistributedCircuit(
+export async function establishDistributedCircuit(
   route: BrandedCommittedRoute,
   initiatorX25519SecretKey: Uint8Array,
   initiatorX25519PublicKey: Uint8Array,
   acks: CircuitSetupAck[],
   relayPublicKeys: Map<string, Uint8Array>, // nodeId → Ed25519 public key
   now: number,
-): { ok: true; circuit: ActiveCircuit } | { ok: false; reason: string } {
+  /**
+   * Optional ack replay store (R-008 integration fix).
+   * If absent, a fresh in-memory store is used (single-process / test path).
+   * Production paths MUST supply a durable store so ack replay protection
+   * survives process restart.
+   */
+  ackStore: CircuitAckReplayStore = new InMemoryCircuitAckReplayStore(),
+  /**
+   * Optional durable sequence-floor store (R-008 integration fix).
+   * If supplied, the prior floor for this route is loaded (re-key continuation,
+   * spec/08 §4.5) and the store is attached to the ActiveCircuit so
+   * `processCircuitFrame` does atomic durable check+persist. If absent,
+   * the circuit uses an in-memory guard only (does NOT survive restart).
+   */
+  floorStore?: CircuitSequenceFloorStore,
+): Promise<{ ok: true; circuit: ActiveCircuit } | { ok: false; reason: string }> {
   // 1. Verify the route is genuine
   if (!isBrandedCommittedRoute(route)) {
     return { ok: false, reason: "route is not a genuine BrandedCommittedRoute" };
@@ -589,7 +672,16 @@ export function establishDistributedCircuit(
   const noncePrefix = deriveNoncePrefix(route.commitmentRoot);
   const commitDigestHex = toHex(routeCommitmentDigest(route));
 
-  // 4. Process each ack
+  // 3b. Load the prior sequence floor for this route (re-key continuation,
+  //     spec/08 §4.5). If a floorStore is supplied, the floor is durable
+  //     and survives process restart. If absent, the guard starts at 0.
+  let initialFloor = 0n;
+  if (floorStore) {
+    initialFloor = await floorStore.getFloor(route.commitmentRoot);
+  }
+
+  // 4. Process each ack (async — each ack is atomically consumed through
+  //    the ackStore before being accepted).
   const hopKeys: HopKeyMaterial[] = [];
   for (let i = 0; i < route.hops.length; i++) {
     const hop = route.hops[i];
@@ -601,13 +693,14 @@ export function establishDistributedCircuit(
       return { ok: false, reason: `no Ed25519 public key for relay ${i} (${hop.nodeId})` };
     }
 
-    // Process the ack (with full binding verification).
+    // Process the ack (with full binding verification + ack store consumption).
     // Pass the route's commitment_root as the HKDF salt for key derivation.
-    const result = processCircuitSetupAck(
+    const result = await processCircuitSetupAck(
       ack, route.routeId, commitDigestHex, i,
       initiatorX25519PublicKey,
       relayEd25519PubKey,
       initiatorX25519SecretKey, route.commitmentRoot, now,
+      ackStore,
     );
     if (!result.ok) {
       return { ok: false, reason: result.reason };
@@ -619,7 +712,9 @@ export function establishDistributedCircuit(
     });
   }
 
-  // 5. Create the ActiveCircuit
+  // 5. Create the ActiveCircuit — seed the in-memory guard cache from the
+  //    durable floor (re-key continuation) and attach the floorStore so
+  //    processCircuitFrame does durable check+persist.
   const circuit: ActiveCircuit = {
     circuitId,
     circuitIdHex,
@@ -629,9 +724,10 @@ export function establishDistributedCircuit(
     initiatorX25519SecretKey,
     expiry: route.expiry,
     establishedAt: now,
-    replayGuard: new CircuitReplayGuard(),
+    replayGuard: new CircuitReplayGuard(initialFloor),
     noncePrefix,
     commitmentRoot: route.commitmentRoot,
+    floorStore,
   };
 
   return { ok: true, circuit };

@@ -32,6 +32,8 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { signMessage, verifySignature } from "../identity/keys";
 import { canonicalEncode, toHex, fromHex } from "../encoding/cbor";
 import { isBrandedCommittedRoute, type BrandedCommittedRoute } from "../transport/validated-types";
+import type { CircuitSequenceFloorStore } from "./replay-stores";
+import { InMemoryCircuitSequenceFloorStore } from "./replay-stores";
 
 // -----------------------------------------------------------------------
 // Constants (FROZEN per GATE-06)
@@ -371,6 +373,22 @@ export interface ActiveCircuit {
   noncePrefix: Uint8Array;
   /** The 32-byte commitment_root (for CircuitFrame AD construction per spec/08 §4.6) */
   commitmentRoot: Uint8Array;
+  /**
+   * The durable sequence-floor store backing this circuit's replay
+   * protection (R-008 integration fix).
+   *
+   * Per the R-008 integration audit: the security boundary for replay
+   * protection MUST live inside the protocol engine, with persistence
+   * abstracted behind `CircuitSequenceFloorStore`. When `processCircuitFrame`
+   * is given this store (or when the circuit carries one), frame acceptance
+   * does an atomic check-and-advance through the store — fail-closed,
+   * surviving process restart.
+   *
+   * If absent, `processCircuitFrame` falls back to the in-memory
+   * `replayGuard` (single-process / test path only — does NOT survive
+   * restart). Production paths MUST supply a durable store.
+   */
+  floorStore?: CircuitSequenceFloorStore;
 }
 
 // -----------------------------------------------------------------------
@@ -422,6 +440,27 @@ export function setupCircuit(
   route: BrandedCommittedRoute,
   relayX25519PublicKeys: Array<{ hopIndex: number; nodeId: string; x25519PublicKey: Uint8Array }>,
   now: number,
+  /**
+   * Optional durable sequence-floor store (R-008 integration fix).
+   *
+   * If provided, the circuit carries this store and `processCircuitFrame`
+   * will do atomic check-and-advance through it (fail-closed, survives
+   * process restart). If absent, the circuit uses the in-memory
+   * `replayGuard` only (single-process / test path).
+   *
+   * Per the R-008 integration audit: production paths MUST supply a durable
+   * store. The protocol core never imports Prisma; the durable SQLite
+   * implementation lives in `src/lib/sharenet/` and implements
+   * `CircuitSequenceFloorStore`.
+   */
+  floorStore?: CircuitSequenceFloorStore,
+  /**
+   * Optional initial floor (for re-key continuation per spec/08 §4.5).
+   * If `floorStore` is provided, the caller should load the prior floor
+   * from the store (async) and pass it here so the in-memory guard cache
+   * starts at the right value. If omitted, the guard starts at 0.
+   */
+  initialFloor?: bigint,
 ): ActiveCircuit {
   // R-008 hardening: runtime brand boundary — the FIRST check.
   // This is genuinely unforgeable (WeakSet tracks object identity, not
@@ -495,9 +534,13 @@ export function setupCircuit(
     initiatorX25519SecretKey: initiatorSecretKey,
     expiry: route.expiry,
     establishedAt: now,
-    replayGuard: new CircuitReplayGuard(),
+    // Seed the in-memory guard cache from the prior floor (re-key continuation,
+    // spec/08 §4.5). The durable store is the source of truth for cross-process
+    // durability; this cache is the fast-path for in-process replay checks.
+    replayGuard: new CircuitReplayGuard(initialFloor ?? 0n),
     noncePrefix,
     commitmentRoot: route.commitmentRoot,
+    floorStore,
   };
 }
 
@@ -552,6 +595,112 @@ export function relayDecrypt(
   const aad = buildCircuitFrameAD(circuit.commitmentRoot, frameSequence, 0x01);
   const decrypted = decryptPayload(hop.forwardingKey, nonce, ciphertext, aad);
   return { decrypted, aad };
+}
+
+// -----------------------------------------------------------------------
+// Circuit frame processing — atomic check + persist via the floor store
+// (R-008 integration fix)
+// -----------------------------------------------------------------------
+
+/**
+ * Result of processing an inbound circuit frame.
+ *
+ * - `{ ok: true, decrypted }`: the frame's sequence was accepted (strictly
+ *   higher than the floor) AND durably persisted; the payload was decrypted.
+ * - `{ ok: false, reason }`: the frame was rejected — replay/stale sequence,
+ *   persistence failure (fail-closed), or decryption failure (tampered).
+ */
+export type ProcessCircuitFrameResult =
+  | { ok: true; decrypted: Uint8Array }
+  | { ok: false; reason: string };
+
+/**
+ * Process an inbound circuit frame with atomic, durable replay protection.
+ *
+ * This is the protocol-path integration point required by the R-008 audit:
+ *
+ *   "CircuitReplayGuard must load its floor through the store and persist
+ *    every accepted sequence before treating it as accepted. Persistence
+ *    failure must fail closed."
+ *
+ * The operation is:
+ *   1. Resolve the floor store: the `floorStore` argument if given,
+ *      otherwise `circuit.floorStore` (set at setup), otherwise none
+ *      (in-memory `replayGuard` only — single-process / test path).
+ *   2. If a store is present: atomically check-and-advance the floor
+ *      through the store. This is a single durable transaction — the
+ *      sequence is accepted AND persisted together, or rejected together.
+ *      Fail-closed: if the transaction cannot complete, the frame is
+ *      rejected. This is what survives process restart.
+ *   3. If no store is present: use the in-memory `replayGuard` (sync).
+ *      This does NOT survive restart — it is the test-only path.
+ *   4. Decrypt the onion layer.
+ *
+ * Per spec/08 §4.5: the floor persists across re-key because it is keyed
+ * by `commitment_root` (the route identity), not the circuit ID.
+ *
+ * @param circuit - the active circuit
+ * @param hopIndex - which relay hop is processing this frame
+ * @param frameSequence - the frame's 32-bit sequence number
+ * @param ciphertext - the encrypted frame payload
+ * @param floorStore - optional override; if absent, uses `circuit.floorStore`
+ */
+export async function processCircuitFrame(
+  circuit: ActiveCircuit,
+  hopIndex: number,
+  frameSequence: number,
+  ciphertext: Uint8Array,
+  floorStore?: CircuitSequenceFloorStore,
+): Promise<ProcessCircuitFrameResult> {
+  const store = floorStore ?? circuit.floorStore;
+
+  if (store) {
+    // Durable path: atomic check-and-advance through the store.
+    // This single transaction persists the new floor BEFORE the frame
+    // is treated as accepted. Fail-closed: a persistence failure rejects
+    // the frame. Survives process restart.
+    const seq = BigInt(frameSequence);
+    const result = await store.checkAndAdvance(circuit.commitmentRoot, seq);
+    if (!result.ok) {
+      return { ok: false, reason: result.reason };
+    }
+    // Mirror the accepted floor into the in-memory guard cache so
+    // getSequenceFloor() reflects reality for the caller.
+    circuit.replayGuard.checkAndRecord(seq);
+  } else {
+    // In-memory path (single-process / test only — does NOT survive restart).
+    const result = circuit.replayGuard.checkAndRecord(BigInt(frameSequence));
+    if (!result.ok) {
+      return { ok: false, reason: result.reason };
+    }
+  }
+
+  // Decrypt the onion layer. A decryption failure (tampered ciphertext,
+  // wrong key) is also a rejection.
+  try {
+    const { decrypted } = relayDecrypt(circuit, hopIndex, frameSequence, ciphertext);
+    return { ok: true, decrypted };
+  } catch (e) {
+    return { ok: false, reason: `decryption failed: ${(e as Error).message}` };
+  }
+}
+
+/**
+ * Load the durable sequence floor for a route and return it.
+ *
+ * Helper for circuit setup: the caller loads the prior floor (async) then
+ * passes it to `setupCircuit` as `initialFloor` so the in-memory guard
+ * cache starts at the right value. This is the re-key continuation path
+ * (spec/08 §4.5).
+ *
+ * @param floorStore - the durable floor store
+ * @param commitmentRoot - the 32-byte route commitment root
+ */
+export async function loadCircuitFloor(
+  floorStore: CircuitSequenceFloorStore,
+  commitmentRoot: Uint8Array,
+): Promise<bigint> {
+  return floorStore.getFloor(commitmentRoot);
 }
 
 // -----------------------------------------------------------------------

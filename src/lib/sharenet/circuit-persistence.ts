@@ -8,9 +8,23 @@
  *   1. CircuitSequenceFloor — keyed by commitment_root, survives process restart
  *   2. ConsumedCircuitAck — (commitmentRoot, hopIndex, ackNonce) single-use
  *
- * The protocol core (reference/) uses the in-memory SequenceFloorStore for
- * testing; this module provides the durable persistence layer for the
- * web/control-plane components (src/lib/sharenet/).
+ * ARCHITECTURE (R-008 integration fix):
+ *
+ *   These Prisma helpers are the durable SUBSTRATE. They are adapted to the
+ *   protocol-level `CircuitSequenceFloorStore` + `CircuitAckReplayStore`
+ *   interfaces (defined in `reference/circuit/replay-stores.ts`) by
+ *   `src/lib/sharenet/durable-circuit-replay-stores.ts`.
+ *
+ *   The protocol core (`reference/`) consumes the INTERFACES — not these
+ *   helpers directly — so it never imports `@/lib/db` (enforced by arch
+ *   test #23, ADR-0013). The protocol path (`processCircuitFrame`,
+ *   `processCircuitSetupAck`, `establishDistributedCircuit`) is wired to
+ *   the durable substrate through these adapters.
+ *
+ *   This closes the R-008 integration gap flagged by the audit: the
+ *   durable persistence layer is no longer a separate application-level
+ *   concern — the reference protocol path itself uses it (via the
+ *   interface), so process-restart protection is proven end-to-end.
  */
 
 import { db } from "@/lib/db";

@@ -90,11 +90,11 @@ function makeFreshAck(ackCreatedAt: number = NOW) {
 
 describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () => {
   // a) expired: ackExpiry <= now → REJECT
-  test("expired ack (ackExpiry <= now) → REJECT", () => {
+  test("expired ack (ackExpiry <= now) → REJECT", async () => {
     const f = makeFreshAck();
     const expiredAck: CircuitSetupAck = { ...f.ack, ackExpiry: NOW - 1 };
     // processCircuitSetupAck now takes commitmentRoot (not circuitId) as the 8th arg.
-    const r = processCircuitSetupAck(
+    const r = await processCircuitSetupAck(
       expiredAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
       f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
@@ -103,14 +103,14 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
   });
 
   // b) malformed: ackExpiry <= ackTimestamp → REJECT
-  test("malformed ack (ackExpiry <= ackTimestamp) → REJECT", () => {
+  test("malformed ack (ackExpiry <= ackTimestamp) → REJECT", async () => {
     const f = makeFreshAck();
     // Dated slightly in the future so ackExpiry can be > now but < ackTimestamp.
     const futureTs = NOW + (ACK_MAX_CLOCK_SKEW_SECONDS + 10);
     const malformedAck: CircuitSetupAck = {
       ...f.ack, ackTimestamp: futureTs, ackExpiry: futureTs - 1,
     };
-    const r = processCircuitSetupAck(
+    const r = await processCircuitSetupAck(
       malformedAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
       f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
@@ -119,12 +119,12 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
   });
 
   // c) future-skewed: ackTimestamp > now + SKEW → REJECT
-  test("future-skewed ack (ackTimestamp > now + SKEW) → REJECT", () => {
+  test("future-skewed ack (ackTimestamp > now + SKEW) → REJECT", async () => {
     const f = makeFreshAck();
     const skewedAck: CircuitSetupAck = {
       ...f.ack, ackTimestamp: NOW + (ACK_MAX_CLOCK_SKEW_SECONDS + 50),
     };
-    const r = processCircuitSetupAck(
+    const r = await processCircuitSetupAck(
       skewedAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
       f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
@@ -133,12 +133,12 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
   });
 
   // d) stale: now - ackTimestamp > AGE → REJECT (max ACK age / TTL)
-  test("stale ack (age > ACK_MAX_AGE_SECONDS) → REJECT", () => {
+  test("stale ack (age > ACK_MAX_AGE_SECONDS) → REJECT", async () => {
     const f = makeFreshAck();
     const staleAck: CircuitSetupAck = {
       ...f.ack, ackTimestamp: NOW - (ACK_MAX_AGE_SECONDS + 10),
     };
-    const r = processCircuitSetupAck(
+    const r = await processCircuitSetupAck(
       staleAck, f.ctx.branded.routeId, f.commitDigestHex, 0,
       f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
@@ -147,10 +147,10 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
   });
 
   // Positive: a fresh ack (age 0, no skew, valid expiry) → ACCEPT
-  test("fresh ack (age 0, no skew) → ACCEPT", () => {
+  test("fresh ack (age 0, no skew) → ACCEPT", async () => {
     const f = makeFreshAck();
     // ackTimestamp === NOW, ackExpiry === NOW + 3600 → all freshness bounds pass.
-    const r = processCircuitSetupAck(
+    const r = await processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
       f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
@@ -161,11 +161,11 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
   // Uses a genuinely-signed ack created ACK_MAX_AGE_SECONDS in the past so
   // the signature still verifies (mutating the timestamp post-hoc would
   // invalidate the signature — a separate defense tested by the reject cases).
-  test("boundary: ack exactly at ACK_MAX_AGE_SECONDS old → ACCEPT (<= bound)", () => {
+  test("boundary: ack exactly at ACK_MAX_AGE_SECONDS old → ACCEPT (<= bound)", async () => {
     const f = makeFreshAck(NOW - ACK_MAX_AGE_SECONDS);
     // ackTimestamp === NOW - ACK_MAX_AGE_SECONDS, ackExpiry === ackTimestamp + 3600.
     // age === ACK_MAX_AGE_SECONDS → `now - ackTimestamp > AGE` is false → accept.
-    const r = processCircuitSetupAck(
+    const r = await processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
       f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
@@ -174,10 +174,10 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
 
   // Boundary: ack exactly at SKEW in the future → ACCEPT (<= bound)
   // Uses a genuinely-signed ack created SKEW seconds in the future.
-  test("boundary: ack exactly at SKEW in the future → ACCEPT (<= bound)", () => {
+  test("boundary: ack exactly at SKEW in the future → ACCEPT (<= bound)", async () => {
     const f = makeFreshAck(NOW + ACK_MAX_CLOCK_SKEW_SECONDS);
     // ackTimestamp === NOW + SKEW → `ackTimestamp > now + SKEW` is false → accept.
-    const r = processCircuitSetupAck(
+    const r = await processCircuitSetupAck(
       f.ack, f.ctx.branded.routeId, f.commitDigestHex, 0,
       f.initPk, f.ctx.kps[0]!.publicKey, f.initSk, f.ctx.branded.commitmentRoot, NOW,
     );
@@ -187,11 +187,11 @@ describe("R-008 hardening: ACK freshness bounds in processCircuitSetupAck", () =
   // Replay defense: an ack captured for circuit A cannot be replayed for a
   // different circuit (different routeCommitmentDigest) — rejected before
   // freshness even matters.
-  test("ack replay across circuits: different routeCommitmentDigest → REJECT", () => {
+  test("ack replay across circuits: different routeCommitmentDigest → REJECT", async () => {
     const f1 = makeFreshAck();
     const f2 = makeFreshAck(); // different route
     // Try to use ack1's data in circuit 2's context.
-    const r = processCircuitSetupAck(
+    const r = await processCircuitSetupAck(
       f1.ack, f2.ctx.branded.routeId, f2.commitDigestHex, 0,
       f2.initPk, f1.ctx.kps[0]!.publicKey, f2.initSk, f2.ctx.branded.commitmentRoot, NOW,
     );

@@ -1388,3 +1388,58 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The sequence floor now survives process restart via durable Prisma-backed persistence. Setup acks are single-use: (commitmentRoot, hopIndex, ackNonce) is enforced as unique by the database. Both are fail-closed.
+
+---
+Task ID: R008-integration-fix
+Agent: Z.ai Code (main)
+Task: Close the R-008 integration gap flagged by the re-audit of commit 59db3ca — the durable persistence layer existed but was NOT wired into the reference protocol path. The protocol core (reference/) still used the in-memory SequenceFloorStore; processCircuitSetupAck() did not consume the durable CircuitAckReplayStore; the "restart" tests only exercised the helpers directly, not the protocol path.
+
+Work Log:
+- Verified the audit's claims against the actual code at 59db3ca:
+  * reference/circuit/circuit.ts SequenceFloorStore was an in-memory Map<string, bigint> (lines 306-335).
+  * CircuitReplayGuard.checkAndRecord() was sync + in-memory only (lines 258-294).
+  * processCircuitSetupAck() in reference/circuit/distributed-setup.ts performed routeId/digest/hopIndex/initiator-key/freshness/signature/possession checks but NO durable ack-replay consumption (lines 456-540).
+  * src/lib/sharenet/circuit-persistence.ts was a separate application-layer module — the reference protocol path never called it.
+  * tests/r008-durable-persistence.test.ts only tested the Prisma helpers directly, not the protocol path.
+- Confirmed design constraints before implementing:
+  * Architecture test #23 enforces reference/ must NOT import @/lib/db (ADR-0013 layer separation).
+  * Conformance vectors V-CIRCUIT-001 tests CircuitReplayGuard.checkAndRecord (sync model); V-CIRCUIT-ACK-001 tests circuitAckSigningPayload (sync encoding). Neither tests processCircuitSetupAck — so making it async is safe.
+- Created reference/circuit/replay-stores.ts (NEW): protocol-level CircuitSequenceFloorStore + CircuitAckReplayStore interfaces (async, fail-closed) + InMemoryCircuitSequenceFloorStore + InMemoryCircuitAckReplayStore. NO Prisma imports (arch test #23 compliant). The interfaces are the security boundary — inside the protocol engine, with persistence abstracted behind them.
+- Refactored reference/circuit/circuit.ts:
+  * Added optional floorStore?: CircuitSequenceFloorStore field to ActiveCircuit.
+  * setupCircuit() now accepts optional floorStore + initialFloor params (stays sync — preserves gate-06 + trust-boundary tests + conformance).
+  * Added async processCircuitFrame() — the protocol-path integration point: atomically check-and-advance the floor through the store (fail-closed, survives restart), then decrypt. Falls back to the in-memory replayGuard only when no store is supplied (test path).
+  * Added async loadCircuitFloor() helper for re-key continuation (spec/08 §4.5).
+  * CircuitReplayGuard + SequenceFloorStore left UNCHANGED (sync — preserves V-CIRCUIT-001 + gate-06 tests).
+- Refactored reference/circuit/distributed-setup.ts:
+  * processCircuitSetupAck() is now async; accepts optional ackStore (defaults to fresh InMemoryCircuitAckReplayStore). After ALL cryptographic verification (routeId, digest, hopIndex, initiator key, freshness, signature, AEAD possession proof), it atomically consumes (commitmentRoot, hopIndex, ackNonce) through the ack store BEFORE returning success. Fail-closed: a duplicate or persistence failure rejects the ack.
+  * establishDistributedCircuit() is now async; accepts optional ackStore + floorStore. Loads the prior floor from floorStore (re-key continuation), processes each ack through the ackStore, seeds the in-memory guard from the durable floor, attaches floorStore to the ActiveCircuit.
+  * Added ackNonceForTest test-only hook to handleCircuitSetup() so integration tests can craft acks with a shared nonce across hops to prove hop isolation.
+- Created src/lib/sharenet/durable-circuit-replay-stores.ts (NEW): DurableSqliteCircuitSequenceFloorStore + DurableSqliteCircuitAckReplayStore implementing the protocol interfaces by adapting the existing Prisma circuit-persistence.ts helpers (getDurableCircuitFloor, checkAndUpdateDurableCircuitFloor, isAckFresh, consumeAck). This is the durable SUBSTRATE adapter — the protocol core consumes the interfaces, this binds Prisma to them.
+- Updated src/lib/sharenet/circuit-persistence.ts header comment: removed the stale claim that "the protocol core uses the in-memory SequenceFloorStore for testing; this module provides the durable persistence layer for the web/control-plane" — now documents that the protocol path uses the durable substrate via the interface adapters.
+- Updated tests/r008-distributed-circuit.test.ts + tests/r008h-ack-freshness.test.ts: added `await` to the now-async processCircuitSetupAck / establishDistributedCircuit calls; made the affected test callbacks async. Mechanical changes — test intent fully preserved.
+- Created tests/r008-durable-integration.test.ts (NEW, 9 tests) — the auditor's required PROTOCOL-LEVEL integration tests (not helper tests):
+  * Scenario 1 (sequence-floor durability): process seq=5 → accepted + floor persisted; simulate restart (new circuit, same route + same durable store); seq=4 → REJECTED (≤ floor 5); seq=6 → ACCEPTED (floor advances to 6).
+  * Scenario 2 (setup-ack single-use): process ack X → accepted + consumed; re-present identical ack X (same freshness window) → REJECTED (ack replay).
+  * Scenario 3 (ack hop-isolation): ack X on hop 0 + ack X on hop 1 (SAME nonce via ackNonceForTest) → BOTH accepted (key includes hopIndex); re-presenting ack X on hop 0 → REJECTED.
+  * Scenario 4 (establish wiring): establishDistributedCircuit with BOTH durable stores → ack consumed + floor loaded + frame processing durable; re-key on same route → prior floor continued (old seq rejected, new seq accepted).
+- Ran the full verification suite:
+  * Unit tests: 359 pass / 0 fail (was 350; +9 new integration tests).
+  * Architecture tests: 24/24 pass (incl. #23 confirming reference/ is still DB-free — the new reference/circuit/replay-stores.ts has zero Prisma imports).
+  * TS conformance vectors: 35/35 pass (frozen vectors unchanged).
+  * Python conformance vectors: 35/35 pass.
+  * Lint: clean (exit 0).
+
+Stage Summary:
+- The R-008 integration gap is CLOSED. The durable persistence layer is no longer a separate application-level concern — the reference protocol path itself uses it via the CircuitSequenceFloorStore + CircuitAckReplayStore interfaces.
+- Architecture (per the audit's recommendation):
+    CircuitReplayPersistence (interface, in reference/)
+        │
+        ├── DurableSqliteCircuitReplayStore (src/lib/sharenet/, adapts Prisma)
+        ├── InMemoryCircuitReplayStore (reference/, for tests + conformance)
+        └── future platform stores
+  reference/circuit/circuit.ts → CircuitReplayPersistence (via interface)
+- A protocol engineer in Rust/Kotlin can implement the same interface against any durable substrate (LMDB, RocksDB, SQLite) and the reference protocol path will use it without modification.
+- Fail-closed semantics verified: processCircuitFrame rejects on persistence failure; processCircuitSetupAck rejects on duplicate/failed consumption.
+- Process-restart protection proven end-to-end through the actual protocol path (not just the helpers): old sequences rejected after restart; replayed acks rejected after restart; hop isolation holds.
+- All existing tests, conformance vectors (TS + Python), and architecture tests preserved.

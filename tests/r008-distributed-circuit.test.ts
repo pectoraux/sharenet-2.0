@@ -55,7 +55,7 @@ function setupRoute(numHops = 2) {
 
 describe("R-008: Distributed circuit establishment", () => {
   // 1. Genuine distributed circuit setup succeeds
-  test("genuine distributed circuit setup: initiator + relay acks → ActiveCircuit", () => {
+  test("genuine distributed circuit setup: initiator + relay acks → ActiveCircuit", async () => {
     const ctx = setupRoute(2);
     expect(isBrandedCommittedRoute(ctx.branded)).toBe(true);
 
@@ -87,7 +87,7 @@ describe("R-008: Distributed circuit establishment", () => {
 
     // Initiator establishes the circuit from both acks
     const acks = [relay0Result.ack, relay1Result.ack];
-    const estResult = establishDistributedCircuit(
+    const estResult = await establishDistributedCircuit(
       ctx.branded, initSk, initPk, acks, ctx.hpk, NOW,
     );
     expect(estResult.ok).toBe(true);
@@ -97,7 +97,7 @@ describe("R-008: Distributed circuit establishment", () => {
   });
 
   // 2. Route substitution: different routeId in ack → FAIL
-  test("route substitution: ack with wrong routeId → FAIL", () => {
+  test("route substitution: ack with wrong routeId → FAIL", async () => {
     const ctx = setupRoute(2);
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
@@ -122,7 +122,7 @@ describe("R-008: Distributed circuit establishment", () => {
       [5, ctx.branded.expiry], [6, ctx.branded.initiatorNodeId], [7, ctx.branded.agreementDigest],
     ])), { dkLen: 32 }));
     // processCircuitSetupAck now takes commitmentRoot (not circuitId) as the 8th arg.
-    const result = processCircuitSetupAck(
+    const result = await processCircuitSetupAck(
       tamperedAck, ctx.branded.routeId, commitDigestHex, 0,
       initPk, ctx.kps[0]!.publicKey, initSk, ctx.branded.commitmentRoot, NOW,
     );
@@ -131,7 +131,7 @@ describe("R-008: Distributed circuit establishment", () => {
   });
 
   // 3. Replay: old ack in new circuit → FAIL
-  test("replay: old ack in new circuit → FAIL (different routeId)", () => {
+  test("replay: old ack in new circuit → FAIL (different routeId)", async () => {
     const ctx1 = setupRoute(1);
     const ctx2 = setupRoute(1); // different route
     const initSk = randomBytes(32);
@@ -147,7 +147,7 @@ describe("R-008: Distributed circuit establishment", () => {
 
     // Try to use the old ack with a DIFFERENT route (ctx2)
     const circuitId2 = deriveCircuitId(ctx2.branded.commitmentRoot, initPk);
-    const result = processCircuitSetupAck(
+    const result = await processCircuitSetupAck(
       relayResult.ack, ctx2.branded.routeId, bytesToHex(randomBytes(32)), 0,
       initPk, ctx1.kps[0]!.publicKey, initSk, ctx2.branded.commitmentRoot, NOW,
     );
@@ -156,7 +156,7 @@ describe("R-008: Distributed circuit establishment", () => {
   });
 
   // 4. Participant substitution: wrong relay responds → FAIL
-  test("participant substitution: wrong relay key → FAIL (signature invalid)", () => {
+  test("participant substitution: wrong relay key → FAIL (signature invalid)", async () => {
     const ctx = setupRoute(2);
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
@@ -177,7 +177,7 @@ describe("R-008: Distributed circuit establishment", () => {
       [3, ctx.branded.hops.map(h => h.capability)], [4, ctx.branded.hops.map(h => h.endpoint)],
       [5, ctx.branded.expiry], [6, ctx.branded.initiatorNodeId], [7, ctx.branded.agreementDigest],
     ])), { dkLen: 32 }));
-    const result = processCircuitSetupAck(
+    const result = await processCircuitSetupAck(
       relay0Result.ack, ctx.branded.routeId, commitDigestHex, 0,
       initPk, wrongKey, initSk, ctx.branded.commitmentRoot, NOW,
     );
@@ -203,7 +203,7 @@ describe("R-008: Distributed circuit establishment", () => {
   });
 
   // 6. Unauthorized circuit creation: no BrandedCommittedRoute → FAIL
-  test("unauthorized circuit creation: plain object instead of BrandedCommittedRoute → FAIL", () => {
+  test("unauthorized circuit creation: plain object instead of BrandedCommittedRoute → FAIL", async () => {
     const kp = generateNodeKeypair();
     const fakeRoute = {
       routeId: "fake",
@@ -215,7 +215,7 @@ describe("R-008: Distributed circuit establishment", () => {
     };
 
     // establishDistributedCircuit must reject the fake route
-    const result = establishDistributedCircuit(
+    const result = await establishDistributedCircuit(
       fakeRoute as any, randomBytes(32), randomBytes(32), [], new Map(), NOW,
     );
     expect(result.ok).toBe(false);
@@ -223,7 +223,7 @@ describe("R-008: Distributed circuit establishment", () => {
   });
 
   // 7. Multi-process encrypted traffic demonstration
-  test("encrypted traffic: initiator onion-encrypts → relay decrypts → gateway receives plaintext", () => {
+  test("encrypted traffic: initiator onion-encrypts → relay decrypts → gateway receives plaintext", async () => {
     const ctx = setupRoute(2);
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
@@ -246,7 +246,7 @@ describe("R-008: Distributed circuit establishment", () => {
 
     // Initiator establishes the circuit
     const acks = [relay0Result.ack, relay1Result.ack];
-    const estResult = establishDistributedCircuit(
+    const estResult = await establishDistributedCircuit(
       ctx.branded, initSk, initPk, acks, ctx.hpk, NOW,
     );
     expect(estResult.ok).toBe(true);
