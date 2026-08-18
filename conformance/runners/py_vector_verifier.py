@@ -21,6 +21,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import struct
 from io import BytesIO
@@ -1281,11 +1282,37 @@ def encode_circuit_frame(frame: dict) -> bytes:
 
 
 def decode_circuit_frame(data: bytes) -> dict:
-    """Decode a CircuitFrame from canonical CBOR + validate field sizes.
+    """Decode a CircuitFrame from canonical CBOR + STRICTLY enforce canonical
+    encoding + validate field sizes + sequence range.
+
+    Per the R-009 Stage 1 audit, decoding is STRICTLY canonical. The
+    following are REJECTED (fail-closed, before any cryptographic
+    operation):
+
+      - non-minimal CBOR integer encodings (e.g. 0x1801 instead of 0x01)
+      - non-minimal map-length encodings
+      - duplicate keys (cbor2 keeps the last; we detect via round-trip)
+      - unknown / extra keys (only {1,2,3,4} are legal)
+      - trailing bytes (the entire input must be consumed)
+      - non-canonical key ordering (keys must be in ascending order)
+
+    The canonical guarantee is enforced by the canonical round-trip
+    check: decode -> re-encode canonically -> byte-equality with the
+    original. If the re-encoded bytes differ, the input was non-canonical
+    and is rejected.
+
+    Per spec/08 §4.3 (FROZEN): frame_sequence MUST be in [1, 0xffffffff].
+    A sequence of 0 is rejected at the wire boundary (not deferred to
+    replay logic) -- wire validation rejects invalid protocol objects
+    early.
 
     Returns `{"ok": True, "frame": {...}}` on success or
     `{"ok": False, "reason": "..."}` on any malformed input.
     """
+    # Step 1: permissively decode one CBOR item, requiring NO trailing
+    # bytes. cbor2.loads is non-strict (silently ignores trailing bytes);
+    # the _strict_cbor_decode_one wrapper raises ValueError if any bytes
+    # remain after the decoded item.
     try:
         m = _strict_cbor_decode_one(data)
     except Exception as e:
@@ -1297,7 +1324,62 @@ def decode_circuit_frame(data: bytes) -> dict:
             "reason": f"CBOR top-level must be a map, got {type(m).__name__}",
         }
 
-    nonce_prefix = m.get(FRAME_KEY_NONCE_PREFIX)
+    # Step 2: reject unknown / extra keys. Only {1,2,3,4} are legal
+    # (per ADR-0004). This is checked BEFORE the canonical round-trip
+    # because a clean, canonical map with an extra key would otherwise
+    # round-trip successfully.
+    legal_keys = {
+        FRAME_KEY_NONCE_PREFIX,
+        FRAME_KEY_FRAME_SEQUENCE,
+        FRAME_KEY_DIRECTION,
+        FRAME_KEY_CIPHERTEXT,
+    }
+    for key in m.keys():
+        if key not in legal_keys:
+            return {
+                "ok": False,
+                "reason": f"unknown CBOR map key {key} "
+                          f"(only {{1,2,3,4}} are legal)",
+            }
+
+    # Exactly 4 keys required. Catches missing keys + duplicates that
+    # survived the decode because cbor2 keeps the last value of a
+    # duplicate.
+    if len(m) != len(legal_keys):
+        return {
+            "ok": False,
+            "reason": f"CircuitFrame map must have exactly "
+                      f"{len(legal_keys)} keys, got {len(m)} "
+                      f"(missing or duplicate)",
+        }
+
+    # Step 3: STRICT CANONICAL ROUND-TRIP CHECK.
+    # Re-encode the decoded map canonically and verify byte-equality with
+    # the original input. This rejects:
+    #   - non-minimal integer encodings (0x1801 -> canonical 0x01)
+    #   - non-canonical key ordering (cbor2 sorts keys; if input order
+    #     differed, bytes differ)
+    #   - duplicate keys (cbor2 kept the last value; re-encoding produces
+    #     one entry)
+    #   - trailing bytes (already caught by _strict_cbor_decode_one, but
+    #     this is defense-in-depth)
+    try:
+        reencoded = canonical_cbor_encode(m)
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": f"canonical re-encode failed: {e}",
+        }
+    if reencoded != data:
+        return {
+            "ok": False,
+            "reason": "non-canonical CBOR: re-encoded bytes differ from "
+                      "input (non-minimal encoding, duplicate keys, "
+                      "trailing bytes, or non-canonical key order)",
+        }
+
+    # Step 4: extract + validate each field.
+    nonce_prefix = m[FRAME_KEY_NONCE_PREFIX]
     if not isinstance(nonce_prefix, (bytes, bytearray)) or \
             len(nonce_prefix) != CIRCUIT_NONCE_PREFIX_BYTES:
         return {
@@ -1306,15 +1388,18 @@ def decode_circuit_frame(data: bytes) -> dict:
                       f"{CIRCUIT_NONCE_PREFIX_BYTES} bytes",
         }
 
-    frame_sequence = m.get(FRAME_KEY_FRAME_SEQUENCE)
+    frame_sequence = m[FRAME_KEY_FRAME_SEQUENCE]
+    # Per the R-009 Stage 1 audit: frame_sequence in [1, 0xffffffff]
+    # (NOT [0, ...]). A sequence of 0 is rejected at the wire boundary.
     if not isinstance(frame_sequence, int) or isinstance(frame_sequence, bool) \
-            or frame_sequence < 0 or frame_sequence > 0xffffffff:
+            or frame_sequence < 1 or frame_sequence > 0xffffffff:
         return {
             "ok": False,
-            "reason": "frame_sequence must be a u32 (0..4294967295)",
+            "reason": f"frame_sequence must be a u32 in "
+                      f"[1, 4294967295], got {frame_sequence}",
         }
 
-    direction = m.get(FRAME_KEY_DIRECTION)
+    direction = m[FRAME_KEY_DIRECTION]
     if not isinstance(direction, int) or isinstance(direction, bool) \
             or direction not in _LEGAL_DIRECTIONS:
         return {
@@ -1322,7 +1407,7 @@ def decode_circuit_frame(data: bytes) -> dict:
             "reason": "direction must be 0x01 (forward) or 0x02 (backward)",
         }
 
-    ciphertext = m.get(FRAME_KEY_CIPHERTEXT)
+    ciphertext = m[FRAME_KEY_CIPHERTEXT]
     if not isinstance(ciphertext, (bytes, bytearray)) or \
             len(ciphertext) < MIN_CIPHERTEXT_BYTES:
         return {
@@ -1730,6 +1815,99 @@ def verify_circuit_frame_vector(data: dict) -> dict:
                                 f"{name}: reason '{r['reason']}' !contains "
                                 f"'{expected['reasonContains']}'"
                             )
+
+            # ----- R-009 Stage 1 hardening: 5 new negative vectors -----
+            # These all decode an `encodedHex` input through
+            # `decode_circuit_frame` (which is now STRICTLY canonical per
+            # the R-009 Stage 1 audit) and assert the rejection.
+
+            elif name == "noncanonical-integer-encoding":
+                # Non-minimal CBOR integer (0x1801 instead of 0x01) ->
+                # REJECT. cbor2.loads accepts it, but the canonical
+                # round-trip check in decode_circuit_frame catches the
+                # mismatch (re-encoded bytes use 0x01).
+                decoded = decode_circuit_frame(bytes.fromhex(inp["encodedHex"]))
+                if decoded["ok"] != expected["ok"]:
+                    failures.append(
+                        f"{name}: expected ok={expected['ok']}, "
+                        f"got ok={decoded['ok']}"
+                    )
+                elif not decoded["ok"]:
+                    if expected["reasonContains"] not in decoded["reason"]:
+                        failures.append(
+                            f"{name}: reason '{decoded['reason']}' !contains "
+                            f"'{expected['reasonContains']}'"
+                        )
+
+            elif name == "duplicate-key":
+                # Duplicate CBOR map key -> REJECT. The map header count
+                # mismatch (a4 but body has 5 items) leaves trailing
+                # bytes after the decode -> CBOR decode failure.
+                decoded = decode_circuit_frame(bytes.fromhex(inp["encodedHex"]))
+                if decoded["ok"] != expected["ok"]:
+                    failures.append(
+                        f"{name}: expected ok={expected['ok']}, "
+                        f"got ok={decoded['ok']}"
+                    )
+
+            elif name == "unknown-key":
+                # Unknown CBOR map key (5) -> REJECT. The map decodes
+                # cleanly, but decode_circuit_frame's explicit unknown-key
+                # check rejects it.
+                decoded = decode_circuit_frame(bytes.fromhex(inp["encodedHex"]))
+                if decoded["ok"] != expected["ok"]:
+                    failures.append(
+                        f"{name}: expected ok={expected['ok']}, "
+                        f"got ok={decoded['ok']}"
+                    )
+                elif not decoded["ok"]:
+                    if expected["reasonContains"] not in decoded["reason"]:
+                        failures.append(
+                            f"{name}: reason '{decoded['reason']}' !contains "
+                            f"'{expected['reasonContains']}'"
+                        )
+
+            elif name == "trailing-bytes":
+                # Trailing bytes after a valid frame -> REJECT. The
+                # _strict_cbor_decode_one wrapper raises ValueError when
+                # bytes remain after the decoded item.
+                decoded = decode_circuit_frame(bytes.fromhex(inp["encodedHex"]))
+                if decoded["ok"] != expected["ok"]:
+                    failures.append(
+                        f"{name}: expected ok={expected['ok']}, "
+                        f"got ok={decoded['ok']}"
+                    )
+                elif not decoded["ok"]:
+                    # The rejection may surface as "non-canonical",
+                    # "CBOR decode failed", "too many terminals", or
+                    # "trailing" depending on the CBOR library. Match via
+                    # regex. The expected.reasonMatches field is a regex
+                    # string surrounded by '/' chars (e.g.
+                    # "/non-canonical|CBOR decode failed|...|trailing/").
+                    regex = expected["reasonMatches"]
+                    if regex.startswith("/") and regex.endswith("/"):
+                        regex = regex[1:-1]
+                    if not re.search(regex, decoded["reason"]):
+                        failures.append(
+                            f"{name}: reason '{decoded['reason']}' !matches "
+                            f"'{expected['reasonMatches']}'"
+                        )
+
+            elif name == "sequence-zero":
+                # frame_sequence=0 -> REJECT at the wire boundary. Per
+                # spec/08 §4.3, sequences start at 1.
+                decoded = decode_circuit_frame(bytes.fromhex(inp["encodedHex"]))
+                if decoded["ok"] != expected["ok"]:
+                    failures.append(
+                        f"{name}: expected ok={expected['ok']}, "
+                        f"got ok={decoded['ok']}"
+                    )
+                elif not decoded["ok"]:
+                    if expected["reasonContains"] not in decoded["reason"]:
+                        failures.append(
+                            f"{name}: reason '{decoded['reason']}' !contains "
+                            f"'{expected['reasonContains']}'"
+                        )
 
             else:
                 failures.append(f"{name}: unknown circuit-frame case name")

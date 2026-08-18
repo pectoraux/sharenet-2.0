@@ -1587,3 +1587,61 @@ Stage Summary:
 - New dependency declared: `cryptography>=42.0.0` added to `conformance/requirements.txt` (was already available in the environment, now made explicit).
 - No regressions: all 35 previously-passing Python vectors still pass.
 
+
+---
+Task ID: 5b-python-negative-vectors
+Agent: general-purpose (subagent)
+Task: Add the 5 new R-009 Stage 1 negative conformance vectors (`noncanonical-integer-encoding`, `duplicate-key`, `unknown-key`, `trailing-bytes`, `sequence-zero`) to the Python verifier at `conformance/runners/py_vector_verifier.py:verify_circuit_frame_vector`, so the Python runner independently mirrors the TS runner's 36/36 pass count on `V-CIRCUIT-FRAME-001`. The Python `decode_circuit_frame` also needed hardening to reject each case strictly canonically (mirroring `reference/circuit/frame.ts:decodeCircuitFrame`).
+
+Work Log:
+- Read context: worklog.md last 3 sections (R-008-possession-proof + sequence-floor, R008-integration-fix, R008-final-hardening) — confirmed the FROZEN R-008 crypto substrate + the mandatory durable-store ordering (AEAD-first → commit → accept) that R-009 Stage 1 builds on top of. Read `conformance/vectors/V-CIRCUIT-FRAME-001.json` (now 14 cases — 9 original + 5 new R-009 Stage 1 hardening). Read the existing `py_vector_verifier.py` `decode_circuit_frame` (non-strict) + dispatch table to understand the baseline gap. Read `reference/circuit/frame.ts:decodeCircuitFrame` (TS) — it has the canonical round-trip check + unknown-key check + exactly-4-keys check + `[1, 0xffffffff]` sequence range — these were the spec the Python verifier needed to mirror.
+
+- Confirmed baseline: `python3 conformance/runners/py_vector_verifier.py` → 35/36, with V-CIRCUIT-FRAME-001 failing all 5 new cases (`unknown circuit-frame case name`). The other 35 vectors pass cleanly.
+
+- Pre-flight experiment: ran the existing `decode_circuit_frame` against the 5 new vector inputs to confirm what each one needed:
+  * `noncanonical-integer-encoding` (input has `0x1801` for value 1): currently `ok=true` — cbor2.loads is non-strict and silently accepts non-minimal integer encodings. NEEDS canonical round-trip check.
+  * `duplicate-key` (input has `a4` map header with 5 items in body — duplicate key 2): currently `ok=false` with reason `"CBOR decode failed: trailing bytes after CBOR item (35 bytes)"`. This already passes — the count mismatch leaves the 5th item as trailing bytes that `_strict_cbor_decode_one` rejects. (Note: expected only requires `ok=false`, no `reasonContains`.)
+  * `unknown-key` (input has `a5` map with 5 cleanly-decoded items including key 5): currently `ok=true` — NEEDS explicit unknown-key check (the canonical round-trip would pass because the input is already canonical).
+  * `trailing-bytes` (input has 3 trailing bytes `01 02 03`): currently `ok=false` with reason `"CBOR decode failed: trailing bytes after CBOR item (3 bytes)"`. This already matches the expected regex `/non-canonical|CBOR decode failed|too many terminals|trailing/`.
+  * `sequence-zero` (input is canonical but `frame_sequence=0`): currently `ok=true` — the existing check used `frame_sequence < 0` (allowed 0). NEEDS tightening to `< 1` and updated reason text.
+
+- Independently verified (via `cbor2.dumps(decoded, canonical=True)` round-trip) that:
+  * `decode-frame` (canonical input) round-trips byte-equal → existing test preserved.
+  * `noncanonical-integer-encoding` round-trip mismatch (input `0x1801`, re-encoded `0x01`) → reject.
+  * `unknown-key` round-trip matches but decoded keys include 5 → MUST be caught by explicit unknown-key check.
+  * `sequence-zero` round-trip matches, keys are {1,2,3,4} → MUST be caught by the sequence-range check.
+
+- Edit 1: added `import re` to the imports block (needed for the `reasonMatches` regex check in the `trailing-bytes` branch).
+
+- Edit 2: rewrote `decode_circuit_frame` (lines 1284-1427) with a 4-step strict pipeline mirroring the TS reference implementation (`reference/circuit/frame.ts:decodeCircuitFrame`):
+  * Step 1: `_strict_cbor_decode_one` (permissive decode, NO trailing bytes — already present from the prior task).
+  * Step 2: reject unknown / extra CBOR map keys — only {1,2,3,4} are legal (per ADR-0004). Returns `reason="unknown CBOR map key N (only {1,2,3,4} are legal)"` (matches the `reasonContains="unknown CBOR map key 5"` expectation). Checked BEFORE the canonical round-trip because a clean, canonical map with an extra key would otherwise round-trip successfully. Also checks `len(m) == 4` to catch missing keys + duplicates that survived decode (cbor2 keeps the last value of a duplicate, so the decoded dict would have fewer than 4 keys).
+  * Step 3: STRICT CANONICAL ROUND-TRIP CHECK. Re-encode the decoded map canonically via `canonical_cbor_encode(m)` (= `cbor2.dumps(m, canonical=True)`) and verify byte-equality with the original input. Returns `reason="non-canonical CBOR: re-encoded bytes differ from input (non-minimal encoding, duplicate keys, trailing bytes, or non-canonical key order)"` (matches `reasonContains="non-canonical"`). This is the same approach the TS verifier uses (`canonicalEncode(decodedMap) === originalBytes → accept`). Catches non-minimal integer encodings, non-canonical key ordering, and duplicate keys (defense-in-depth — the duplicate-key case is already caught at Step 1 by the trailing-bytes check, but if cbor2 ever decoded duplicates cleanly, this would catch the resulting 3-key dict).
+  * Step 4: extract + validate each field. Same as before EXCEPT the `frame_sequence` range check: changed from `frame_sequence < 0` to `frame_sequence < 1`, and the reason from `"frame_sequence must be a u32 (0..4294967295)"` to `"frame_sequence must be a u32 in [1, 4294967295], got N"` (matches `reasonContains="frame_sequence must be a u32 in [1, 4294967295]"`). The other field checks (nonce_prefix=8 bytes, direction in {0x01, 0x02}, ciphertext ≥ 16 bytes) are unchanged. Also updated `m.get(KEY)` to `m[KEY]` since the Step 2 check guarantees all 4 keys are present.
+
+- Edit 3: added 5 new `elif name == "..."` branches to `verify_circuit_frame_vector` (lines 1819-1913), placed AFTER `wrong-circuit-rejected` and BEFORE the `else` (unknown-name) branch. Each branch:
+  * Calls `decode_circuit_frame(bytes.fromhex(inp["encodedHex"]))`.
+  * Asserts `decoded["ok"] == expected["ok"]`.
+  * If `expected` has `reasonContains`, asserts `expected["reasonContains"] in decoded["reason"]` (substring match — same pattern as the existing `tampered-ciphertext-rejected` / `wrong-circuit-rejected` branches).
+  * If `expected` has `reasonMatches` (a regex string surrounded by `/` chars, e.g. `"/non-canonical|CBOR decode failed|too many terminals|trailing/"`), strips the surrounding `/` chars and uses `re.search(regex, decoded["reason"])` to match. This is the only branch using `reasonMatches` — it's the `trailing-bytes` case, where the rejection may surface differently depending on the CBOR library (cbor2 surfaces it as `"CBOR decode failed: trailing bytes after CBOR item (N bytes)"` — which matches both `"CBOR decode failed"` and `"trailing"` in the regex).
+  * The `duplicate-key` branch is simpler (just asserts `ok == expected["ok"]`, no reason check) since the expected only requires `ok=false`.
+
+- Verification:
+  * `python3 conformance/runners/py_vector_verifier.py 2>&1 | tail -5` → `Passed: 36/36, Failed: 0` (exit 0).
+  * All 36 vectors pass — V-CIRCUIT-FRAME-001 (the only one previously failing) now passes all 14 cases (9 original + 5 new). The other 35 vectors (NodeID, Advertisement, PathValidation, Receipt, RouteCommit, RouteProposal, TopologyPropagation, Gateway-*, Circuit, CircuitAck, CircuitSetup, SVC, etc.) all still pass — zero regressions.
+  * Inspected the actual decoded reasons for each new case — all match the expected:
+    - `noncanonical-integer-encoding`: reason contains `"non-canonical"` ✓
+    - `duplicate-key`: `ok=false` ✓ (reason: `"CBOR decode failed: trailing bytes after CBOR item (35 bytes)"`)
+    - `unknown-key`: reason contains `"unknown CBOR map key 5"` ✓
+    - `trailing-bytes`: reason matches the regex via `"CBOR decode failed"` + `"trailing"` ✓
+    - `sequence-zero`: reason contains `"frame_sequence must be a u32 in [1, 4294967295]"` ✓
+  * Confirmed existing 9 V-CIRCUIT-FRAME-001 cases preserved — manually called `decode_circuit_frame` on the `decode-frame` (canonical) input → `ok=true` with the right frame fields; the `decode-malformed` (`000102`) case still rejects as `ok=false`; the `encode-frame` canonical encoding still produces the expected hex `a40148d8f8663d379710e6020103010450deadbeefcafebabedeadbeefcafebabe` (round-trip stable).
+
+- Independence preserved: AST-walked the file imports — only stdlib (`hashlib`, `hmac`, `json`, `os`, `re`, `sys`, `struct`, `io`, `pathlib`, `typing`) + `blake3`, `cbor2`, `nacl.signing`/`nacl.exceptions`, `cryptography.hazmat...ChaCha20Poly1305`/`cryptography.exceptions.InvalidTag`. ZERO imports from `reference/` or any TS-side module — the Python verifier remains a fully independent cross-implementation check.
+
+Stage Summary:
+- Python conformance runner: 35/36 → 36/36 vectors pass. V-CIRCUIT-FRAME-001 now passes all 14 cases (9 original + 5 R-009 Stage 1 hardening), matching the TS runner's 36/36 count.
+- The Python `decode_circuit_frame` is now STRICTLY canonical, mirroring the TS reference: it rejects non-minimal integer encodings (via canonical round-trip), duplicate keys (via trailing-bytes check at the decode step + defense-in-depth at the round-trip), unknown keys (via explicit {1,2,3,4} check), trailing bytes (via `_strict_cbor_decode_one`), non-canonical key ordering (via canonical round-trip), and `frame_sequence=0` (via the tightened `[1, 0xffffffff]` range check at the wire boundary).
+- The strict-canonical pipeline now mirrors `reference/circuit/frame.ts:decodeCircuitFrame` step-for-step (Step 1: permissive decode w/ no-trailing-bytes; Step 2: reject unknown keys + exactly-4-keys; Step 3: canonical round-trip; Step 4: field-size + sequence-range validation). Cross-implementation conformance is preserved.
+- The frozen R-008 crypto substrate (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload, deriveNoncePrefix) was NOT modified — R-009 Stage 1 hardening is purely wire-format strictness on top of the frozen substrate.
+- No regressions: all 35 previously-passing Python vectors still pass. The 9 original V-CIRCUIT-FRAME-001 cases still pass (verified the `decode-frame` canonical round-trip is byte-equal and the `encode-frame` canonical encoding is byte-stable).

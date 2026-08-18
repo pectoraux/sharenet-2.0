@@ -26,7 +26,7 @@
 import { describe, test, expect } from "bun:test";
 import { randomBytes } from "@reference/identity/keys";
 import { x25519 } from "@noble/curves/ed25519.js";
-import { toHex } from "@reference/encoding/cbor";
+import { toHex, canonicalEncode } from "@reference/encoding/cbor";
 import {
   setupCircuit,
   onionEncrypt,
@@ -42,6 +42,7 @@ import {
 import {
   forwardFrame,
   processWireFrame,
+  processCircuitWireFrame,
 } from "@reference/circuit/forwarding";
 import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
@@ -154,7 +155,7 @@ describe("R-009: sealForwardFrame + openFrame — 1-hop", () => {
 
 describe("R-009: sealForwardFrame + forwardFrame — 2-hop forwarding", () => {
   // 5. Full 2-hop forwarding chain: source → relay 0 → gateway (terminal)
-  test("full 2-hop chain: source seals → relay 0 forwards → gateway delivers plaintext", () => {
+  test("full 2-hop chain: source seals → relay 0 forwards → gateway delivers plaintext", async () => {
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
@@ -164,19 +165,22 @@ describe("R-009: sealForwardFrame + forwardFrame — 2-hop forwarding", () => {
     const sealed = sealForwardFrame(circuit, 1, plaintext);
     const wireBytes = encodeCircuitFrame(sealed);
 
-    // Relay 0: decode + forward one layer.
-    const relay0Result = processWireFrame(circuit, 0, wireBytes);
+    // Relay 0: decode + AEAD + durable commit + forward (canonical production path).
+    // Entry hop commits the floor (commitFloor=true, the default).
+    const relay0Result = await processCircuitWireFrame(circuit, 0, wireBytes);
     expect(relay0Result.ok).toBe(true);
     if (!relay0Result.ok) return;
-    expect(relay0Result.forward.terminal).toBe(false); // hop 0 is not terminal for 2-hop
+    expect(relay0Result.terminal).toBe(false); // hop 0 is not terminal for 2-hop
+    expect(relay0Result.committedSequence).toBe(1n);
 
-    // Encode the next frame + send to relay 1 (gateway).
-    const nextWireBytes = encodeCircuitFrame(relay0Result.forward.nextFrame);
-    const relay1Result = processWireFrame(circuit, 1, nextWireBytes);
+    // Forward the encoded nextFrame to relay 1 (gateway).
+    // Intermediate hop: commitFloor=false (the floor was committed at hop 0).
+    const nextWireBytes = relay0Result.nextWireBytes;
+    const relay1Result = await processCircuitWireFrame(circuit, 1, nextWireBytes, false);
     expect(relay1Result.ok).toBe(true);
     if (!relay1Result.ok) return;
-    expect(relay1Result.forward.terminal).toBe(true); // hop 1 IS terminal
-    expect(new TextDecoder().decode(relay1Result.forward.plaintext)).toBe(
+    expect(relay1Result.terminal).toBe(true); // hop 1 IS terminal
+    expect(new TextDecoder().decode(relay1Result.plaintext)).toBe(
       "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
     );
   });
@@ -402,23 +406,258 @@ describe("R-009: multi-frame sequential sequence (ORDERED_STREAM)", () => {
       const sealed = sealForwardFrame(circuit, seq, plaintext);
       const wireBytes = encodeCircuitFrame(sealed);
 
-      // Relay 0 forwards.
-      const r0 = processWireFrame(circuit, 0, wireBytes);
+      // Relay 0 forwards (canonical production path: decode + AEAD + commit + forward).
+      // Entry hop commits the floor (commitFloor=true, the default).
+      const r0 = await processCircuitWireFrame(circuit, 0, wireBytes);
       expect(r0.ok).toBe(true);
       if (!r0.ok) return;
-
-      // AEAD succeeded — durable commit at hop 0.
-      const commit = await floorStore.checkAndAdvance(route.commitmentRoot, BigInt(seq));
-      expect(commit.ok).toBe(true);
+      expect(r0.committedSequence).toBe(BigInt(seq));
 
       // Gateway (hop 1) delivers plaintext.
-      const nextWire = encodeCircuitFrame(r0.forward.nextFrame);
-      const r1 = processWireFrame(circuit, 1, nextWire);
+      // Intermediate hop: commitFloor=false (the floor was committed at hop 0).
+      const nextWire = r0.nextWireBytes;
+      const r1 = await processCircuitWireFrame(circuit, 1, nextWire, false);
       expect(r1.ok).toBe(true);
       if (!r1.ok) return;
-      expect(new TextDecoder().decode(r1.forward.plaintext)).toBe(`packet ${seq}`);
+      expect(new TextDecoder().decode(r1.plaintext)).toBe(`packet ${seq}`);
     }
 
     expect(await floorStore.getFloor(route.commitmentRoot)).toBe(10n);
+  });
+});
+
+// =====================================================================
+// R-009 Stage 1 hardening: strict canonical CBOR decoding
+// (per the re-audit: reject non-canonical encodings, duplicate keys,
+//  unknown keys, trailing bytes, sequence-zero)
+// =====================================================================
+
+describe("R-009 Stage 1 hardening: strict canonical CBOR decoding", () => {
+  // Helper: build a valid CircuitFrame then encode it, to get canonical bytes.
+  function makeValidFrame(): CircuitFrame {
+    return {
+      circuitNoncePrefix: new Uint8Array(8).fill(0xab),
+      frameSequence: 1,
+      direction: DIRECTION_FORWARD,
+      ciphertext: new Uint8Array(32).fill(0xcd),
+    };
+  }
+
+  test("valid canonical frame decodes successfully", () => {
+    const encoded = encodeCircuitFrame(makeValidFrame());
+    const decoded = decodeCircuitFrame(encoded);
+    expect(decoded.ok).toBe(true);
+  });
+
+  test("non-canonical integer encoding (0x1801 instead of 0x01) → REJECT", () => {
+    // Build a valid frame, encode, then tamper: replace the canonical 0x01
+    // (frame_sequence=1, one byte) with the non-minimal 0x1801 (two bytes).
+    // The canonical encoder uses 0x01 for value 1; 0x1801 is non-minimal.
+    const valid = encodeCircuitFrame(makeValidFrame());
+    // The frame_sequence (value 1) appears as byte 0x01 in the canonical encoding.
+    // Find it + replace with 0x18 0x01 (non-minimal 1-byte form).
+    const tampered = new Uint8Array(valid.length + 1);
+    let inserted = false;
+    let j = 0;
+    for (let i = 0; i < valid.length; i++) {
+      // The frame_sequence key (0x02) is followed by 0x01 (canonical) in the map.
+      if (!inserted && valid[i] === 0x02 && i + 1 < valid.length && valid[i + 1] === 0x01) {
+        tampered[j++] = 0x02; // key
+        tampered[j++] = 0x18; // AI=24 (1-byte follow)
+        tampered[j++] = 0x01; // value 1 (non-minimal)
+        i++; // skip the original 0x01
+        inserted = true;
+      } else {
+        tampered[j++] = valid[i]!;
+      }
+    }
+    const result = decodeCircuitFrame(tampered.slice(0, j));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("non-canonical");
+    }
+  });
+
+  test("duplicate key → REJECT", () => {
+    // Build a frame with a duplicate key (key 2 appears twice).
+    // cborg keeps the last value, so the decoded map has 1 entry for key 2.
+    // The round-trip check detects this (re-encoded bytes differ from input).
+    const valid = encodeCircuitFrame(makeValidFrame());
+    // Insert a duplicate key 2 + value right after the existing key 2 entry.
+    // Canonical form: a4 01 48 <8bytes> 02 01 03 01 04 58 <len> <bytes>
+    // We insert "02 05" (key 2, value 5) after the existing "02 01".
+    // This makes the map have 5 entries (with 2 being a dup), but the
+    // map-length prefix still says 4. cborg will decode 4 entries (skipping
+    // the 5th), so the round-trip check catches the trailing bytes.
+    const dup = new Uint8Array(valid.length + 2);
+    let j = 0;
+    let inserted = false;
+    for (let i = 0; i < valid.length; i++) {
+      dup[j++] = valid[i]!;
+      // After "02 01" (key 2, value 1), insert "02 05" (dup key 2, value 5).
+      if (!inserted && valid[i] === 0x01 && i > 0 && valid[i - 1] === 0x02) {
+        dup[j++] = 0x02; // dup key
+        dup[j++] = 0x05; // value 5
+        inserted = true;
+      }
+    }
+    const result = decodeCircuitFrame(dup.slice(0, j));
+    expect(result.ok).toBe(false);
+  });
+
+  test("unknown key (key 5) → REJECT", () => {
+    // Build a frame with an extra unknown key 5.
+    const valid = encodeCircuitFrame(makeValidFrame());
+    // The canonical encoding: a4 (map of 4) 01..02..03..04..
+    // Replace "a4" with "a5" (map of 5) + append "05 01" (key 5, value 1).
+    const withUnknown = new Uint8Array(valid.length + 2);
+    withUnknown[0] = 0xa5; // map of 5 (was a4)
+    withUnknown.set(valid.slice(1), 1);
+    withUnknown[valid.length] = 0x05; // key 5
+    withUnknown[valid.length + 1] = 0x01; // value 1
+    const result = decodeCircuitFrame(withUnknown);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("unknown CBOR map key 5");
+    }
+  });
+
+  test("trailing bytes → REJECT", () => {
+    // Append trailing bytes after a valid frame.
+    const valid = encodeCircuitFrame(makeValidFrame());
+    const withTrailing = new Uint8Array(valid.length + 3);
+    withTrailing.set(valid, 0);
+    withTrailing[valid.length] = 0x01;
+    withTrailing[valid.length + 1] = 0x02;
+    withTrailing[valid.length + 2] = 0x03;
+    const result = decodeCircuitFrame(withTrailing);
+    expect(result.ok).toBe(false);
+    // Trailing bytes are rejected — either as a CBOR decode error (cborg
+    // refuses to consume them) or as a non-canonical round-trip mismatch.
+    // Both are valid rejections.
+    if (!result.ok) {
+      expect(result.reason).toMatch(/non-canonical|CBOR decode failed|too many terminals|trailing/);
+    }
+  });
+
+  test("sequence zero (frame_sequence=0) → REJECT at wire boundary", () => {
+    // Attempt to decode a frame with frame_sequence=0. Per spec/08 §4.3,
+    // sequences start at 1. The wire decoder rejects 0 (not deferred to replay).
+    // Build the frame manually (encodeCircuitFrame would throw for seq=0).
+    const m = new Map<number, unknown>([
+      [1, new Uint8Array(8).fill(0xab)], // nonce_prefix
+      [2, 0], // frame_sequence = 0 (illegal)
+      [3, DIRECTION_FORWARD], // direction
+      [4, new Uint8Array(32).fill(0xcd)], // ciphertext
+    ]);
+    const encoded = canonicalEncode(m);
+    const result = decodeCircuitFrame(encoded);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("frame_sequence must be a u32 in [1, 4294967295]");
+    }
+  });
+
+  test("encode rejects frame_sequence=0 (defense-in-depth)", () => {
+    const badFrame: CircuitFrame = {
+      circuitNoncePrefix: new Uint8Array(8).fill(0xab),
+      frameSequence: 0, // illegal
+      direction: DIRECTION_FORWARD,
+      ciphertext: new Uint8Array(32).fill(0xcd),
+    };
+    expect(() => encodeCircuitFrame(badFrame)).toThrow(/frameSequence must be a u32 in \[1/);
+  });
+});
+
+// =====================================================================
+// R-009 Stage 1 hardening: canonical production path owns durable commit
+// (per the re-audit: processCircuitWireFrame owns decode → AEAD → commit → forward)
+// =====================================================================
+
+describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invariant", () => {
+  test("production path: valid frame → decode + AEAD + durable commit + forward", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    const plaintext = new TextEncoder().encode("production path");
+    const sealed = sealForwardFrame(circuit, 1, plaintext);
+    const wireBytes = encodeCircuitFrame(sealed);
+
+    // The production path owns the ENTIRE invariant.
+    const result = await processCircuitWireFrame(circuit, 0, wireBytes);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.terminal).toBe(true); // 1-hop: hop 0 is terminal
+    expect(result.committedSequence).toBe(1n);
+    expect(new TextDecoder().decode(result.plaintext)).toBe("production path");
+
+    // The floor was durably committed by the production path (not the caller).
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+  });
+
+  test("production path: tampered frame → AEAD fails → floor UNCHANGED (no commit)", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    const plaintext = new TextEncoder().encode("tampered");
+    const sealed = sealForwardFrame(circuit, 100, plaintext);
+    // Flip one bit in the ciphertext.
+    const tamperedWire = new Uint8Array(encodeCircuitFrame(sealed));
+    // Find the ciphertext region (after the header) + flip a bit.
+    // The ciphertext starts after the 4 map header bytes + nonce_prefix (10 bytes) +
+    // frame_sequence (2 bytes) + direction (2 bytes) = ~14 bytes in. Flip byte 15.
+    tamperedWire[15] ^= 0x01;
+
+    const result = await processCircuitWireFrame(circuit, 0, tamperedWire);
+    expect(result.ok).toBe(false);
+    // The floor is UNCHANGED — the production path did NOT commit (AEAD failed first).
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+  });
+
+  test("production path: replay → AEAD succeeds but commit rejects (floor unchanged)", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    const plaintext = new TextEncoder().encode("genuine");
+    const sealed = sealForwardFrame(circuit, 1, plaintext);
+    const wireBytes = encodeCircuitFrame(sealed);
+
+    // First presentation: accepted + committed.
+    const r1 = await processCircuitWireFrame(circuit, 0, wireBytes);
+    expect(r1.ok).toBe(true);
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+
+    // Replay: AEAD succeeds (valid ciphertext) but the durable commit rejects
+    // (1 ≤ floor 1). The production path catches the replay.
+    const r2 = await processCircuitWireFrame(circuit, 0, wireBytes);
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.reason).toContain("≤ floor");
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // unchanged
+  });
+
+  test("production path: non-canonical wire → REJECT at decode (before AEAD)", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Non-canonical: trailing bytes appended to a valid frame.
+    const sealed = sealForwardFrame(circuit, 1, new TextEncoder().encode("x"));
+    const valid = encodeCircuitFrame(sealed);
+    const withTrailing = new Uint8Array(valid.length + 1);
+    withTrailing.set(valid, 0);
+    withTrailing[valid.length] = 0xff; // trailing byte
+
+    const result = await processCircuitWireFrame(circuit, 0, withTrailing);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/non-canonical|CBOR decode failed|too many terminals|trailing/);
+    // Floor unchanged — decode rejected before AEAD/commit.
+    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
   });
 });

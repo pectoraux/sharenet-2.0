@@ -1157,6 +1157,64 @@ function verifyCircuitFrameVector(data: any): VectorResult {
             }
           }
         }
+      } else if (v.name === "noncanonical-integer-encoding") {
+        // Decode a non-minimal CBOR integer encoding → REJECT (strict canonical).
+        const decoded = decodeCircuitFrame(hexToBytes(input.encodedHex));
+        if (decoded.ok !== expected.ok) {
+          caseOk = false;
+          failures.push(`${v.name}: expected ok=${expected.ok}, got ok=${decoded.ok}`);
+        } else if (!decoded.ok) {
+          if (!decoded.reason.includes(expected.reasonContains)) {
+            caseOk = false;
+            failures.push(`${v.name}: reason "${decoded.reason}" !contains "${expected.reasonContains}"`);
+          }
+        }
+      } else if (v.name === "duplicate-key") {
+        // Decode a frame with a duplicate CBOR map key → REJECT.
+        const decoded = decodeCircuitFrame(hexToBytes(input.encodedHex));
+        if (decoded.ok !== expected.ok) {
+          caseOk = false;
+          failures.push(`${v.name}: expected ok=${expected.ok}, got ok=${decoded.ok}`);
+        }
+      } else if (v.name === "unknown-key") {
+        // Decode a frame with an unknown CBOR map key → REJECT.
+        const decoded = decodeCircuitFrame(hexToBytes(input.encodedHex));
+        if (decoded.ok !== expected.ok) {
+          caseOk = false;
+          failures.push(`${v.name}: expected ok=${expected.ok}, got ok=${decoded.ok}`);
+        } else if (!decoded.ok) {
+          if (!decoded.reason.includes(expected.reasonContains)) {
+            caseOk = false;
+            failures.push(`${v.name}: reason "${decoded.reason}" !contains "${expected.reasonContains}"`);
+          }
+        }
+      } else if (v.name === "trailing-bytes") {
+        // Decode a frame with trailing bytes → REJECT (entire input must be consumed).
+        const decoded = decodeCircuitFrame(hexToBytes(input.encodedHex));
+        if (decoded.ok !== expected.ok) {
+          caseOk = false;
+          failures.push(`${v.name}: expected ok=${expected.ok}, got ok=${decoded.ok}`);
+        } else if (!decoded.ok) {
+          // The rejection may surface as "non-canonical", "CBOR decode failed",
+          // or "too many terminals" depending on the CBOR library. Match via regex.
+          const reasonMatches = new RegExp(expected.reasonMatches).test(decoded.reason);
+          if (!reasonMatches) {
+            caseOk = false;
+            failures.push(`${v.name}: reason "${decoded.reason}" !matches ${expected.reasonMatches}`);
+          }
+        }
+      } else if (v.name === "sequence-zero") {
+        // Decode a frame with frame_sequence=0 → REJECT (sequences start at 1).
+        const decoded = decodeCircuitFrame(hexToBytes(input.encodedHex));
+        if (decoded.ok !== expected.ok) {
+          caseOk = false;
+          failures.push(`${v.name}: expected ok=${expected.ok}, got ok=${decoded.ok}`);
+        } else if (!decoded.ok) {
+          if (!decoded.reason.includes(expected.reasonContains)) {
+            caseOk = false;
+            failures.push(`${v.name}: reason "${decoded.reason}" !contains "${expected.reasonContains}"`);
+          }
+        }
       } else {
         throw new Error(`unknown circuit-frame case name: ${v.name}`);
       }

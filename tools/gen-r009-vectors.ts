@@ -1,6 +1,6 @@
 import { bytesToHex } from "@reference/identity/keys";
 import { x25519 } from "@noble/curves/ed25519.js";
-import { toHex } from "@reference/encoding/cbor";
+import { toHex, canonicalEncode } from "@reference/encoding/cbor";
 import {
   deriveCircuitId,
   deriveHopKeys,
@@ -213,5 +213,104 @@ const output = {
     notes: "All vectors use fixed seeds (initSk=0x01*32, relay0Sk=0x02*32, relay1Sk=0x03*32) for reproducibility. The forwardingKeys are derived from deterministic X25519 ECDH + HKDF (salt=commitment_root). The verifier reconstructs a minimal ActiveCircuit from sharedInputs and tests the frame primitives. R-008 crypto substrate (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload) is NOT modified — R-009 builds on top.",
   },
 };
+
+// --- R-009 Stage 1 hardening: strict canonical CBOR + sequence-zero vectors ---
+
+// Vector 10: non-canonical integer encoding (0x1801 instead of 0x01)
+const validEnc = encodeCircuitFrame({
+  circuitNoncePrefix: noncePrefix,
+  frameSequence: 1,
+  direction: DIRECTION_FORWARD,
+  ciphertext: new Uint8Array(32).fill(0xcd),
+});
+// Tamper: replace the canonical 0x01 (frame_sequence=1) with non-minimal 0x18 0x01.
+const nonCanon = new Uint8Array(validEnc.length + 1);
+let inserted = false;
+let nj = 0;
+for (let i = 0; i < validEnc.length; i++) {
+  if (!inserted && validEnc[i] === 0x02 && i + 1 < validEnc.length && validEnc[i + 1] === 0x01) {
+    nonCanon[nj++] = 0x02;
+    nonCanon[nj++] = 0x18;
+    nonCanon[nj++] = 0x01;
+    i++;
+    inserted = true;
+  } else {
+    nonCanon[nj++] = validEnc[i]!;
+  }
+}
+const nonCanonResult = decodeCircuitFrame(nonCanon.slice(0, nj));
+
+// Vector 11: duplicate key
+const dupEnc = new Uint8Array(validEnc.length + 2);
+let dj = 0;
+let dupInserted = false;
+for (let i = 0; i < validEnc.length; i++) {
+  dupEnc[dj++] = validEnc[i]!;
+  if (!dupInserted && validEnc[i] === 0x01 && i > 0 && validEnc[i - 1] === 0x02) {
+    dupEnc[dj++] = 0x02;
+    dupEnc[dj++] = 0x05;
+    dupInserted = true;
+  }
+}
+const dupResult = decodeCircuitFrame(dupEnc.slice(0, dj));
+
+// Vector 12: unknown key (key 5)
+const unknownEnc = new Uint8Array(validEnc.length + 2);
+unknownEnc[0] = 0xa5;
+unknownEnc.set(validEnc.slice(1), 1);
+unknownEnc[validEnc.length] = 0x05;
+unknownEnc[validEnc.length + 1] = 0x01;
+const unknownResult = decodeCircuitFrame(unknownEnc);
+
+// Vector 13: trailing bytes
+const trailingEnc = new Uint8Array(validEnc.length + 3);
+trailingEnc.set(validEnc, 0);
+trailingEnc[validEnc.length] = 0x01;
+trailingEnc[validEnc.length + 1] = 0x02;
+trailingEnc[validEnc.length + 2] = 0x03;
+const trailingResult = decodeCircuitFrame(trailingEnc);
+
+// Vector 14: sequence zero
+const seqZeroMap = new Map<number, unknown>([
+  [1, new Uint8Array(8).fill(0xab)],
+  [2, 0],
+  [3, DIRECTION_FORWARD],
+  [4, new Uint8Array(32).fill(0xcd)],
+]);
+const seqZeroEnc = canonicalEncode(seqZeroMap);
+const seqZeroResult = decodeCircuitFrame(seqZeroEnc);
+
+(output as any).vectors.push(
+  {
+    name: "noncanonical-integer-encoding",
+    description: "Non-minimal CBOR integer (0x1801 instead of 0x01) → REJECT (strict canonical decode).",
+    input: { encodedHex: toHex(nonCanon.slice(0, nj)) },
+    expected: { ok: false, reasonContains: "non-canonical" },
+  },
+  {
+    name: "duplicate-key",
+    description: "Duplicate CBOR map key → REJECT (round-trip check detects it).",
+    input: { encodedHex: toHex(dupEnc.slice(0, dj)) },
+    expected: { ok: false },
+  },
+  {
+    name: "unknown-key",
+    description: "Unknown CBOR map key (5) → REJECT (only {1,2,3,4} are legal).",
+    input: { encodedHex: toHex(unknownEnc) },
+    expected: { ok: false, reasonContains: "unknown CBOR map key 5" },
+  },
+  {
+    name: "trailing-bytes",
+    description: "Trailing bytes after a valid frame → REJECT (entire input must be consumed).",
+    input: { encodedHex: toHex(trailingEnc) },
+    expected: { ok: false, reasonMatches: "/non-canonical|CBOR decode failed|too many terminals|trailing/" },
+  },
+  {
+    name: "sequence-zero",
+    description: "frame_sequence=0 → REJECT at wire boundary (per spec/08 §4.3: sequences start at 1).",
+    input: { encodedHex: toHex(seqZeroEnc) },
+    expected: { ok: false, reasonContains: "frame_sequence must be a u32 in [1, 4294967295]" },
+  },
+);
 
 console.log(JSON.stringify(output, null, 2));

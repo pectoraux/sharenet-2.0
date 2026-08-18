@@ -45,7 +45,7 @@
  *   unauthenticated frame must NOT advance the floor.
  */
 
-import { canonicalEncode, toHex } from "../encoding/cbor";
+import { canonicalEncode, canonicalDecode, toHex } from "../encoding/cbor";
 import {
   buildNonce,
   buildCircuitFrameAD,
@@ -115,6 +115,22 @@ const FRAME_KEY_DIRECTION = 3;
 const FRAME_KEY_CIPHERTEXT = 4;
 
 /**
+ * The set of legal CBOR map keys for a CircuitFrame (per spec/08 §4.6 +
+ * ADR-0004). Decoding MUST reject any map containing a key outside this set.
+ */
+const LEGAL_FRAME_KEYS = new Set<number>([
+  FRAME_KEY_NONCE_PREFIX,
+  FRAME_KEY_FRAME_SEQUENCE,
+  FRAME_KEY_DIRECTION,
+  FRAME_KEY_CIPHERTEXT,
+]);
+
+/** Minimum legal frame_sequence (per spec/08 §4.3: starts at 1). */
+const MIN_FRAME_SEQUENCE = 1;
+/** Maximum legal frame_sequence (u32 max). */
+const MAX_FRAME_SEQUENCE = 0xffffffff;
+
+/**
  * Encode a CircuitFrame to canonical CBOR for the wire.
  *
  * Per spec/08 §4.6 + ADR-0004: the frame is a canonical CBOR map with
@@ -124,8 +140,12 @@ const FRAME_KEY_CIPHERTEXT = 4;
  *   3 → direction (uint .size 1)
  *   4 → ciphertext (bstr)
  *
- * The encoding is canonical (deterministic) so the bytes are reproducible
- * across implementations (TS / Python / Rust / Kotlin).
+ * Per spec/08 §4.3 (FROZEN): frame_sequence starts at 1 and MUST be in
+ * [1, 0xffffffff]. A sequence of 0 is NOT a valid protocol frame and is
+ * rejected at the wire boundary (not deferred to replay logic).
+ *
+ * The encoding is canonical (deterministic, RFC 8949 §4.2.2) so the bytes
+ * are reproducible across implementations (TS / Python / Rust / Kotlin).
  */
 export function encodeCircuitFrame(frame: CircuitFrame): Uint8Array {
   // Validate field sizes before encoding (defense-in-depth).
@@ -134,9 +154,13 @@ export function encodeCircuitFrame(frame: CircuitFrame): Uint8Array {
       `encodeCircuitFrame: circuitNoncePrefix must be ${CIRCUIT_NONCE_PREFIX_BYTES} bytes, got ${frame.circuitNoncePrefix.length}`,
     );
   }
-  if (!Number.isInteger(frame.frameSequence) || frame.frameSequence < 0 || frame.frameSequence > 0xffffffff) {
+  // Per the R-009 Stage 1 audit: frame_sequence ∈ [1, 0xffffffff] (NOT [0, ...]).
+  // The frozen R-008 model requires sequences to start at 1.
+  if (!Number.isInteger(frame.frameSequence) ||
+      frame.frameSequence < MIN_FRAME_SEQUENCE ||
+      frame.frameSequence > MAX_FRAME_SEQUENCE) {
     throw new Error(
-      `encodeCircuitFrame: frameSequence must be a u32 (0..4294967295), got ${frame.frameSequence}`,
+      `encodeCircuitFrame: frameSequence must be a u32 in [1, 4294967295], got ${frame.frameSequence}`,
     );
   }
   if (!LEGAL_DIRECTIONS.has(frame.direction)) {
@@ -160,37 +184,93 @@ export function encodeCircuitFrame(frame: CircuitFrame): Uint8Array {
 /**
  * Result of decoding a wire CircuitFrame.
  *
- * - `{ ok: true, frame }`: the wire bytes decoded to a valid CircuitFrame.
+ * - `{ ok: true, frame }`: the wire bytes decoded to a valid, canonical CircuitFrame.
  * - `{ ok: false, reason }`: the wire bytes are malformed (invalid CBOR,
- *   wrong field sizes, illegal direction, etc.).
+ *   non-canonical encoding, wrong field sizes, illegal direction, etc.).
  */
 export type DecodeCircuitFrameResult =
   | { ok: true; frame: CircuitFrame }
   | { ok: false; reason: string };
 
 /**
- * Decode a CircuitFrame from canonical CBOR wire bytes + validate all
- * field sizes.
+ * Decode a CircuitFrame from canonical CBOR wire bytes + STRICTLY enforce
+ * canonical encoding + validate all field sizes + sequence range.
  *
- * Per spec/08 §4.6: validates that:
- *   - circuit_nonce_prefix is exactly 8 bytes
- *   - frame_sequence fits in a u32 (0..4294967295)
- *   - direction is 0x01 or 0x02
- *   - ciphertext is a bstr (any length ≥ 16, since AEAD tag is 16 bytes)
+ * Per the R-009 Stage 1 audit, decoding is STRICTLY canonical. The following
+ * are REJECTED (fail-closed, before any cryptographic operation):
+ *
+ *   - non-minimal CBOR integer encodings (e.g. 0x1801 instead of 0x01)
+ *   - non-minimal map-length encodings
+ *   - duplicate keys (cborg keeps the last; we detect via round-trip)
+ *   - unknown / extra keys (only {1,2,3,4} are legal)
+ *   - trailing bytes (the entire input must be consumed)
+ *   - non-canonical key ordering (keys must be in ascending order)
+ *
+ * The canonical guarantee is enforced by the **canonical round-trip check**:
+ * decode → re-encode canonically → byte-equality with the original. If the
+ * re-encoded bytes differ, the input was non-canonical and is rejected.
+ *
+ * Per spec/08 §4.3 (FROZEN): frame_sequence MUST be in [1, 0xffffffff].
+ * A sequence of 0 is rejected at the wire boundary (not deferred to replay
+ * logic) — wire validation rejects invalid protocol objects early.
  *
  * Returns `{ ok: false, reason }` for any malformed frame. The caller MUST
  * reject malformed frames before any cryptographic operation (fail-closed).
  */
 export function decodeCircuitFrame(bytes: Uint8Array): DecodeCircuitFrameResult {
-  // Decode the canonical CBOR map.
-  let m: Map<number, unknown>;
+  // Step 1: permissively decode the CBOR (cborg accepts any valid CBOR).
+  // We enforce canonicality in step 2 via the round-trip check.
+  let decoded: unknown;
   try {
-    m = decodeCanonicalMap(bytes);
+    decoded = canonicalDecode(bytes);
   } catch (e) {
     return { ok: false, reason: `CBOR decode failed: ${(e as Error).message}` };
   }
 
-  // Extract + validate each field.
+  // Step 2: verify the decoded value is a Map with exactly the 4 legal keys.
+  if (!(decoded instanceof Map)) {
+    return { ok: false, reason: "CircuitFrame must be a CBOR map" };
+  }
+  const m = decoded as Map<number, unknown>;
+
+  // Reject unknown / extra keys. Only {1,2,3,4} are legal.
+  for (const key of m.keys()) {
+    if (!LEGAL_FRAME_KEYS.has(key)) {
+      return { ok: false, reason: `unknown CBOR map key ${key} (only {1,2,3,4} are legal)` };
+    }
+  }
+  // Exactly 4 keys required.
+  if (m.size !== LEGAL_FRAME_KEYS.size) {
+    return {
+      ok: false,
+      reason: `CircuitFrame map must have exactly ${LEGAL_FRAME_KEYS.size} keys, got ${m.size} (missing or duplicate)`,
+    };
+  }
+
+  // Step 3: STRICT CANONICAL ROUND-TRIP CHECK.
+  // Re-encode the decoded map canonically and verify byte-equality with the
+  // original input. This rejects:
+  //   - non-minimal integer encodings (0x1801 → canonical 0x01)
+  //   - non-canonical key ordering (cborg sorts keys; if input order differed, bytes differ)
+  //   - duplicate keys (cborg kept the last value; re-encoding produces one entry)
+  //   - trailing bytes (if present, the re-encode omits them → bytes differ)
+  //
+  // This is the simplest robust defense per the audit's recommendation:
+  //   "canonicalEncode(decodedMap) === originalBytes → accept"
+  let reencoded: Uint8Array;
+  try {
+    reencoded = canonicalEncode(decoded);
+  } catch (e) {
+    return { ok: false, reason: `canonical re-encode failed: ${(e as Error).message}` };
+  }
+  if (!bytesEqual(bytes, reencoded)) {
+    return {
+      ok: false,
+      reason: "non-canonical CBOR: re-encoded bytes differ from input (non-minimal encoding, duplicate keys, trailing bytes, or non-canonical key order)",
+    };
+  }
+
+  // Step 4: extract + validate each field.
   const noncePrefix = m.get(FRAME_KEY_NONCE_PREFIX);
   if (!(noncePrefix instanceof Uint8Array) || noncePrefix.length !== CIRCUIT_NONCE_PREFIX_BYTES) {
     return {
@@ -200,9 +280,10 @@ export function decodeCircuitFrame(bytes: Uint8Array): DecodeCircuitFrameResult 
   }
 
   const frameSequence = m.get(FRAME_KEY_FRAME_SEQUENCE);
+  // Per the R-009 Stage 1 audit: frame_sequence ∈ [1, 0xffffffff] (NOT [0, ...]).
   if (typeof frameSequence !== "number" || !Number.isInteger(frameSequence) ||
-      frameSequence < 0 || frameSequence > 0xffffffff) {
-    return { ok: false, reason: "frame_sequence must be a u32 (0..4294967295)" };
+      frameSequence < MIN_FRAME_SEQUENCE || frameSequence > MAX_FRAME_SEQUENCE) {
+    return { ok: false, reason: `frame_sequence must be a u32 in [1, 4294967295], got ${frameSequence}` };
   }
 
   const direction = m.get(FRAME_KEY_DIRECTION);
@@ -227,103 +308,12 @@ export function decodeCircuitFrame(bytes: Uint8Array): DecodeCircuitFrameResult 
   };
 }
 
-/**
- * Minimal canonical CBOR map decoder.
- *
- * Decodes a CBOR map with integer keys (per ADR-0004). This is a focused
- * decoder for the CircuitFrame wire object — it does NOT implement the
- * full CBOR spec. It handles: map with integer keys, bstr (Uint8Array),
- * uint (number), text (string).
- *
- * For the full CBOR spec, see RFC 8949 §4.2.2 (canonical CBOR).
- */
-function decodeCanonicalMap(bytes: Uint8Array): Map<number, unknown> {
-  if (bytes.length === 0) {
-    throw new Error("empty input");
-  }
-  const view = bytes;
-  let offset = 0;
-
-  // Major type 5 (map) with the count in the additional info.
-  const firstByte = view[offset]!;
-  offset++;
-  const majorType = firstByte >> 5;
-  const ai = firstByte & 0x1f;
-
-  if (majorType !== 5) {
-    throw new Error(`expected CBOR map (major type 5), got major type ${majorType}`);
-  }
-
-  let count: number;
-  if (ai < 24) {
-    count = ai;
-  } else if (ai === 24) {
-    count = view[offset]!; offset++;
-  } else if (ai === 25) {
-    count = (view[offset]! << 8) | view[offset + 1]!; offset += 2;
-  } else {
-    throw new Error(`unsupported CBOR map count AI=${ai}`);
-  }
-
-  const m = new Map<number, unknown>();
-  for (let i = 0; i < count; i++) {
-    // Decode key (must be a uint — ADR-0004 integer-keyed map).
-    const keyResult = decodeItem(view, offset);
-    if (typeof keyResult.value !== "number") {
-      throw new Error(`CBOR map key must be uint, got ${typeof keyResult.value}`);
-    }
-    offset = keyResult.nextOffset;
-
-    // Decode value.
-    const valResult = decodeItem(view, offset);
-    offset = valResult.nextOffset;
-
-    m.set(keyResult.value, valResult.value);
-  }
-  return m;
-}
-
-/** Decode a single CBOR item (uint, bstr, or text) starting at `offset`. */
-function decodeItem(bytes: Uint8Array, offset: number): { value: unknown; nextOffset: number } {
-  if (offset >= bytes.length) {
-    throw new Error("unexpected end of CBOR input");
-  }
-  const firstByte = bytes[offset]!;
-  const majorType = firstByte >> 5;
-  const ai = firstByte & 0x1f;
-  let o = offset + 1;
-
-  // Resolve the argument (additional info).
-  let arg: number;
-  if (ai < 24) {
-    arg = ai;
-  } else if (ai === 24) {
-    arg = bytes[o]!; o++;
-  } else if (ai === 25) {
-    arg = (bytes[o]! << 8) | bytes[o + 1]!; o += 2;
-  } else if (ai === 26) {
-    arg = (bytes[o]! * 0x1000000) + ((bytes[o + 1]! << 16) | (bytes[o + 2]! << 8) | bytes[o + 3]!); o += 4;
-  } else {
-    throw new Error(`unsupported CBOR AI=${ai}`);
-  }
-
-  switch (majorType) {
-    case 0: // uint
-      return { value: arg, nextOffset: o };
-    case 2: { // bstr
-      const bstr = bytes.slice(o, o + arg);
-      if (bstr.length !== arg) {
-        throw new Error(`CBOR bstr claims ${arg} bytes but only ${bstr.length} available`);
-      }
-      return { value: bstr, nextOffset: o + arg };
-    }
-    case 3: { // text
-      const text = new TextDecoder().decode(bytes.slice(o, o + arg));
-      return { value: text, nextOffset: o + arg };
-    }
-    default:
-      throw new Error(`unsupported CBOR major type ${majorType} at offset ${offset}`);
-  }
+/** Constant-time byte equality. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
 }
 
 // -----------------------------------------------------------------------
@@ -467,14 +457,6 @@ export function openFrame(
   const isTerminal = frame.direction === DIRECTION_FORWARD && hopIndex === circuit.hops.length - 1;
 
   return { ok: true, payload, isTerminal };
-}
-
-/** Constant-time byte equality. */
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
-  return diff === 0;
 }
 
 // Re-export for convenience.

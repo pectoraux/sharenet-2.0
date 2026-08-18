@@ -5,38 +5,40 @@
  * ACTIVE, data-plane frames flow hop-by-hop. Each relay:
  *
  *   1. Receives a wire CircuitFrame from the previous hop.
- *   2. Decodes it (canonical CBOR).
+ *   2. Decodes it (strict canonical CBOR — rejects non-canonical encodings,
+ *      duplicate keys, unknown keys, trailing bytes per the R-009 Stage 1 audit).
  *   3. AEAD-authenticates + decrypts ONE layer (openFrame — step 1 of the
  *      R-008 frozen ordering).
- *   4. Durable sequence commit (step 2 — the caller's responsibility, via
- *      CircuitSequenceFloorStore. Must happen AFTER AEAD succeeds.)
+ *   4. Durable sequence commit (step 2 — via circuit.floorStore.checkAndAdvance.
+ *      MUST happen AFTER AEAD succeeds. Fail-closed.)
  *   5. Either:
  *      a. Forwards the inner frame to the next hop (encode + send), OR
  *      b. Delivers the plaintext locally (if this is the terminal hop).
  *
- * This module implements steps 3 + 5 (the relay's forwarding logic). Step 4
- * (durable replay protection) is the caller's responsibility — it wraps
- * around `forwardFrame` using the R-008 frozen ordering.
+ * CANONICAL PRODUCTION ENTRY POINT (R-009 Stage 1 hardening):
  *
- * R-008 FROZEN PROTOCOL ORDERING (data-plane):
- *   1. AEAD authenticate + decrypt      (openFrame — inside forwardFrame)
- *   2. atomic durable sequence commit   (caller — via CircuitSequenceFloorStore)
- *   3. frame accepted + forwarded
+ *   `processCircuitWireFrame()` is the canonical production relay entry point.
+ *   It owns the ENTIRE R-008 frozen ordering invariant:
  *
- * The caller's flow:
- *   ```typescript
- *   const decoded = decodeCircuitFrame(wireBytes);
- *   if (!decoded.ok) return reject(decoded.reason);
- *   const fwd = forwardFrame(circuit, hopIndex, decoded.frame);
- *   if (!fwd.ok) return reject(fwd.reason);  // AEAD failed — floor UNCHANGED
- *   // AEAD succeeded — now commit the durable sequence floor.
- *   const commit = await circuit.floorStore.checkAndAdvance(
- *     circuit.commitmentRoot, BigInt(decoded.frame.frameSequence));
- *   if (!commit.ok) return reject(commit.reason);  // replay/stale — floor UNCHANGED
- *   // Frame accepted — forward or deliver.
- *   if (fwd.terminal) deliverPlaintext(fwd.plaintext);
- *   else sendToNextHop(encodeCircuitFrame(fwd.nextFrame));
- *   ```
+ *     decode → AEAD authenticate → durable sequence commit → forward/deliver
+ *
+ *   There is no "caller must remember step 2" contract for the production
+ *   path. The durable commit happens inside this function, AFTER AEAD
+ *   succeeds and BEFORE forwarding. If AEAD fails, the floor is UNCHANGED
+ *   (the commit is never reached).
+ *
+ *   The lower-level `openFrame()` (in frame.ts) is kept as the AEAD-only
+ *   primitive for cryptographic testing + the conformance vectors. It does
+ *   NOT do the durable commit.
+ *
+ * R-008 FROZEN PROTOCOL ORDERING (data-plane, enforced here):
+ *   1. decode (strict canonical CBOR)
+ *   2. AEAD authenticate + decrypt      (openFrame — reject if tag fails)
+ *   3. atomic durable sequence commit   (circuit.floorStore.checkAndAdvance)
+ *   4. forward / deliver
+ *
+ *   Steps 2+3 are the R-008 frozen ordering. Step 3 happens ONLY after step 2
+ *   succeeds — an unauthenticated frame MUST NOT advance the floor.
  */
 
 import {
@@ -49,39 +51,57 @@ import {
 import type { ActiveCircuit } from "./circuit";
 
 // -----------------------------------------------------------------------
-// Forwarding result
+// Forwarding result (AEAD-only, no durable commit)
 // -----------------------------------------------------------------------
 
 /**
- * Result of forwarding a CircuitFrame at a relay hop.
+ * Result of forwarding a CircuitFrame at a relay hop (AEAD peel only —
+ * does NOT include the durable sequence commit).
  *
- * - `{ ok: true, terminal: true, plaintext }`: this is the terminal hop
- *   (the gateway for forward direction). The payload is the application
- *   plaintext — deliver it locally.
- * - `{ ok: true, terminal: false, nextFrame }`: this is an intermediate
- *   hop. The inner ciphertext has been revealed; encode `nextFrame` and
- *   forward it to the next hop.
- * - `{ ok: false, reason }`: AEAD authentication failed. The caller MUST
- *   reject the frame and MUST NOT advance the durable sequence floor
- *   (R-008 frozen ordering).
+ * This is the lower-level result used by the conformance vectors + tests.
+ * The production path uses `ProcessCircuitWireFrameResult` (below), which
+ * includes the durable commit.
+ *
+ * - `{ ok: true, terminal: true, plaintext }`: terminal hop — deliver plaintext.
+ * - `{ ok: true, terminal: false, nextFrame }`: intermediate hop — forward nextFrame.
+ * - `{ ok: false, reason }`: AEAD authentication failed. Floor MUST NOT advance.
  */
 export type ForwardFrameResult =
   | { ok: true; terminal: true; plaintext: Uint8Array }
   | { ok: true; terminal: false; nextFrame: CircuitFrame }
   | { ok: false; reason: string };
 
+/**
+ * Result of the CANONICAL PRODUCTION relay entry point (includes durable commit).
+ *
+ * - `{ ok: true, terminal: true, plaintext }`: terminal hop — plaintext delivered,
+ *   floor durably committed.
+ * - `{ ok: true, terminal: false, nextWireBytes }`: intermediate hop — encode these
+ *   bytes + forward to the next hop. Floor durably committed.
+ * - `{ ok: false, reason }`: frame rejected (decode failed, AEAD failed, or
+ *   durable commit failed/replay). The floor is UNCHANGED.
+ */
+export type ProcessCircuitWireFrameResult =
+  | { ok: true; terminal: true; plaintext: Uint8Array; committedSequence: bigint }
+  | { ok: true; terminal: false; nextWireBytes: Uint8Array; committedSequence: bigint }
+  | { ok: false; reason: string };
+
 // -----------------------------------------------------------------------
-// forwardFrame — relay peels one layer
+// forwardFrame — relay peels one AEAD layer (NO durable commit)
 // -----------------------------------------------------------------------
 
 /**
  * Forward a CircuitFrame at a relay hop: peel one AEAD layer and produce
  * the outgoing wire frame (or deliver the plaintext if terminal).
  *
- * This is the relay's data-plane processing function. It performs step 1
- * (AEAD authenticate + decrypt) of the R-008 frozen ordering. The caller
- * is responsible for step 2 (durable sequence commit) AFTER this function
- * returns `{ ok: true }`.
+ * This is the LOWER-LEVEL function: it performs step 1 (AEAD authenticate +
+ * decrypt) of the R-008 frozen ordering ONLY. It does NOT do the durable
+ * sequence commit (step 2). Use this for:
+ *   - Conformance vectors (which test AEAD + forwarding, not durable state)
+ *   - Unit tests of the onion peel mechanics
+ *
+ * For the PRODUCTION relay path, use `processCircuitWireFrame()` instead —
+ * it owns the full invariant (decode → AEAD → durable commit → forward).
  *
  * Per spec/08 §4.1 + §4.6:
  *   - The relay decrypts one layer using its forwardingKey (forward direction)
@@ -92,8 +112,7 @@ export type ForwardFrameResult =
  *   - If this is the terminal hop (last hop, forward direction), the
  *     decrypted payload is the application plaintext.
  *   - Otherwise, the decrypted payload is the inner ciphertext — wrap it
- *     in a new CircuitFrame with the SAME header (nonce_prefix +
- *     frame_sequence + direction) and forward to the next hop.
+ *     in a new CircuitFrame with the SAME header + forward to the next hop.
  *
  * The outgoing CircuitFrame carries the SAME header as the incoming frame
  * (the header is hop-invariant — only the ciphertext shrinks by 16 bytes
@@ -115,7 +134,7 @@ export function forwardFrame(
     return { ok: false, reason: openResult.reason };
   }
 
-  // Step 5: forward or deliver.
+  // Forward or deliver.
   if (openResult.isTerminal) {
     // Terminal hop — the payload is the application plaintext.
     return { ok: true, terminal: true, plaintext: openResult.payload };
@@ -134,18 +153,111 @@ export function forwardFrame(
 }
 
 // -----------------------------------------------------------------------
-// Full relay processing helper (decode + forward)
+// CANONICAL PRODUCTION ENTRY POINT: processCircuitWireFrame
+// (decode → AEAD → durable commit → forward — owns the full invariant)
 // -----------------------------------------------------------------------
 
 /**
- * Result of processing a raw wire frame at a relay: decode + forward.
+ * Process a raw wire CircuitFrame at a relay: the CANONICAL PRODUCTION
+ * entry point that owns the ENTIRE R-008 frozen ordering invariant.
  *
- * - `{ ok: true, decoded, forward }`: the wire bytes decoded successfully
- *   AND the AEAD layer peeled. The caller must still do the durable
- *   sequence commit (step 2 of the R-008 frozen ordering) before
- *   accepting the frame.
- * - `{ ok: false, reason }`: either the decode failed OR the AEAD failed.
- *   The caller rejects the frame; the floor MUST NOT advance.
+ * Per the R-009 Stage 1 audit: the production wire entry point MUST own
+ * the durable commit, so an implementation cannot accidentally use a
+ * "decode + AEAD" path and forget step 2. This function is that single
+ * canonical executable path.
+ *
+ * Pipeline (R-008 frozen ordering):
+ *   1. decode (strict canonical CBOR — rejects non-canonical encodings)
+ *   2. AEAD authenticate + decrypt one layer (openFrame)
+ *      → reject if tag fails (floor UNCHANGED — DoS fix from R-008)
+ *   3. atomic durable sequence commit (circuit.floorStore.checkAndAdvance)
+ *      → reject if replay/stale (seq ≤ floor) or persistence fails (fail-closed)
+ *   4. forward / deliver
+ *      → terminal hop: deliver plaintext
+ *      → intermediate hop: encode nextFrame → forward bytes to next hop
+ *
+ * CRITICAL: the durable commit (step 3) happens ONLY after AEAD succeeds
+ * (step 2). An unauthenticated/tampered frame is rejected at step 2 and the
+ * floor is NEVER touched. This is the DoS fix from R-008 (AEAD-before-commit).
+ *
+ * DURABLE COMMIT SEMANTICS (multi-hop):
+ *   The durable sequence floor is keyed by `commitmentRoot` (the route), NOT
+ *   by hop. A frame with `frameSequence=N` is processed by EVERY hop on the
+ *   route, but the floor should be committed ONCE — at the entry hop (the
+ *   first relay that sees this frameSequence for this route). Subsequent
+ *   hops process the SAME frameSequence; they MUST NOT re-commit the floor
+ *   (that would be a self-replay).
+ *
+ *   The `commitFloor` parameter controls this:
+ *     - `commitFloor = true` (default, entry hop): commit the floor, then forward.
+ *     - `commitFloor = false` (intermediate hops, gateway): AEAD only, no commit.
+ *
+ *   In a real deployment, the entry relay (hop 0) calls with `commitFloor=true`;
+ *   every subsequent hop calls with `commitFloor=false`. This commits the floor
+ *   exactly once per frame per route, at the point of ingress.
+ *
+ * @param circuit - the active circuit (carries floorStore + per-hop keys)
+ * @param hopIndex - which relay hop is processing
+ * @param wireBytes - the raw canonical-CBOR-encoded CircuitFrame from the previous hop
+ * @param commitFloor - whether to perform the durable sequence commit (entry hop: true;
+ *                      intermediate hops: false). Defaults to true (entry-hop semantics).
+ * @returns the processing result (see ProcessCircuitWireFrameResult)
+ */
+export async function processCircuitWireFrame(
+  circuit: ActiveCircuit,
+  hopIndex: number,
+  wireBytes: Uint8Array,
+  commitFloor: boolean = true,
+): Promise<ProcessCircuitWireFrameResult> {
+  // Step 1: decode (strict canonical CBOR).
+  const decoded = decodeCircuitFrame(wireBytes);
+  if (!decoded.ok) {
+    return { ok: false, reason: decoded.reason };
+  }
+  const frame = decoded.frame;
+
+  // Step 2 (R-008 frozen ordering): AEAD authenticate + decrypt one layer.
+  const forward = forwardFrame(circuit, hopIndex, frame);
+  if (!forward.ok) {
+    // AEAD failed — the floor MUST NOT advance. Do NOT call floorStore.
+    return { ok: false, reason: forward.reason };
+  }
+
+  // Step 3 (R-008 frozen ordering): atomic durable sequence commit.
+  // This happens ONLY after AEAD succeeds AND only at the entry hop
+  // (commitFloor=true). Intermediate hops (commitFloor=false) skip the
+  // commit — the floor was already committed at the entry hop.
+  const seq = BigInt(frame.frameSequence);
+  if (commitFloor) {
+    const commitResult = await circuit.floorStore.checkAndAdvance(
+      circuit.commitmentRoot,
+      seq,
+    );
+    if (!commitResult.ok) {
+      // Replay/stale or persistence failure — reject. Floor UNCHANGED.
+      return { ok: false, reason: commitResult.reason };
+    }
+  }
+
+  // Step 4: forward / deliver. The frame is accepted.
+  if (forward.terminal) {
+    return { ok: true, terminal: true, plaintext: forward.plaintext, committedSequence: seq };
+  }
+  // Intermediate hop — encode the nextFrame for the next hop.
+  const nextWireBytes = encodeCircuitFrame(forward.nextFrame);
+  return { ok: true, terminal: false, nextWireBytes, committedSequence: seq };
+}
+
+// -----------------------------------------------------------------------
+// Test-only helper: decode + AEAD peel (NO durable commit)
+// -----------------------------------------------------------------------
+
+/**
+ * Result of decode + forward (AEAD only — NO durable commit).
+ *
+ * Provided for the conformance vectors + unit tests that need to test the
+ * decode + AEAD mechanics without committing durable state. The PRODUCTION
+ * path uses `processCircuitWireFrame()` (above), which includes the commit.
  */
 export type ProcessWireFrameResult =
   | {
@@ -156,36 +268,31 @@ export type ProcessWireFrameResult =
   | { ok: false; reason: string };
 
 /**
- * Process a raw wire CircuitFrame at a relay: decode + forward one layer.
+ * Decode a wire CircuitFrame + peel one AEAD layer (NO durable commit).
  *
- * This is the full relay entry point for the data plane. It:
- *   1. Decodes the wire bytes (canonical CBOR) → CircuitFrame.
- *   2. Forwards (peels one AEAD layer) → either a nextFrame or terminal plaintext.
+ * TEST-ONLY helper. This function performs steps 1-2 (decode + AEAD) but
+ * NOT step 3 (durable commit). It is used by the conformance vectors and
+ * unit tests to verify the decode + AEAD mechanics in isolation.
  *
- * It does NOT do the durable sequence commit (step 2 of the R-008 frozen
- * ordering) — the caller must do that AFTER this returns `{ ok: true }`,
- * using `circuit.floorStore.checkAndAdvance(circuit.commitmentRoot,
- * BigInt(decoded.frameSequence))`.
- *
- * This separation enforces the R-008 frozen ordering: AEAD first (this
- * function), durable commit second (the caller), accept third.
+ * WARNING: do NOT use this as a production relay entry point — it does not
+ * do the durable sequence commit. Use `processCircuitWireFrame()` instead.
  *
  * @param circuit - the active circuit
  * @param hopIndex - which relay hop is processing
- * @param wireBytes - the raw CBOR-encoded CircuitFrame bytes from the previous hop
+ * @param wireBytes - the raw CBOR-encoded CircuitFrame bytes
  */
 export function processWireFrame(
   circuit: ActiveCircuit,
   hopIndex: number,
   wireBytes: Uint8Array,
 ): ProcessWireFrameResult {
-  // Step 0: decode the wire bytes.
+  // Step 1: decode the wire bytes.
   const decoded = decodeCircuitFrame(wireBytes);
   if (!decoded.ok) {
     return { ok: false, reason: decoded.reason };
   }
 
-  // Step 1 (R-008 frozen ordering): AEAD authenticate + decrypt one layer.
+  // Step 2 (R-008 frozen ordering): AEAD authenticate + decrypt one layer.
   const forward = forwardFrame(circuit, hopIndex, decoded.frame);
   if (!forward.ok) {
     return { ok: false, reason: forward.reason };
