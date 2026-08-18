@@ -1,0 +1,143 @@
+{
+  "id": "V-CIRCUIT-FRAME-001",
+  "status": "frozen",
+  "spec": "spec/08-circuits.md §4.6, spec/00 §24, GATE-06, R-009",
+  "adr": "adr/0017-protocol-freeze-reconciliation.md",
+  "description": "CircuitFrame wire object: canonical CBOR encode/decode (ADR-0004 integer-keyed map), sealForwardFrame (onion-encrypt using the frozen R-008 crypto substrate), openFrame (AEAD-peel one layer), forwardFrame (relay forwarding). Per spec/08 §4.6: the frame carries circuit_nonce_prefix (8 bytes), frame_sequence (u32 BE), direction (0x01 forward / 0x02 backward), and the onion ciphertext. The AEAD AD is domain || commitment_root || frame_sequence || direction (FROZEN per R-008). R-009 builds the packet protocol ON TOP of the frozen R-008 crypto substrate — no crypto primitives are modified.",
+  "sharedInputs": {
+    "commitmentRootHex": "006a6d458a2dec8d201c3617a069cf23e8133529f2385899d78ebcea398abb48",
+    "noncePrefixHex": "40fd068ae40e5b98",
+    "initiatorX25519SecretKeyHex": "0101010101010101010101010101010101010101010101010101010101010101",
+    "initiatorX25519PubHex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+    "relay0X25519SecretKeyHex": "0202020202020202020202020202020202020202020202020202020202020202",
+    "relay0X25519PubHex": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
+    "relay1X25519SecretKeyHex": "0303030303030303030303030303030303030303030303030303030303030303",
+    "relay1X25519PubHex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22",
+    "forwardingKey0Hex": "f1717c950ba9c5116caddc7dcc18af5b1d331eb673d9c5f8bc9e4d5a44359b14",
+    "forwardingKey1Hex": "2e993024f290c6437c9844014c261d98530c500994dbda0eade1ad74b366cf18",
+    "returnKey0Hex": "563f6de6bd3591a283e16d11325104cb420db79517f269875f341399b88f6de0",
+    "returnKey1Hex": "36de5805e0d722f66079e627db7d9012a01bd988fc6eb9745b839f054867a702",
+    "plaintextHex": "474554202f20485454502f312e310d0a486f73743a206578616d706c652e636f6d0d0a0d0a",
+    "plaintextAscii": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    "referenceNow": 1786876545
+  },
+  "vectors": [
+    {
+      "name": "encode-frame",
+      "description": "Encode a CircuitFrame with known fields to canonical CBOR (ADR-0004 integer-keyed map).",
+      "input": {
+        "circuitNoncePrefixHex": "40fd068ae40e5b98",
+        "frameSequence": 1,
+        "direction": 1,
+        "ciphertextHex": "deadbeefcafebabedeadbeefcafebabe"
+      },
+      "expected": {
+        "encodedHex": "a4014840fd068ae40e5b98020103010450deadbeefcafebabedeadbeefcafebabe"
+      }
+    },
+    {
+      "name": "decode-frame",
+      "description": "Decode the canonical CBOR back to a CircuitFrame + validate field sizes.",
+      "input": {
+        "encodedHex": "a4014840fd068ae40e5b98020103010450deadbeefcafebabedeadbeefcafebabe"
+      },
+      "expected": {
+        "ok": true,
+        "frameSequence": 1,
+        "direction": 1,
+        "circuitNoncePrefixHex": "40fd068ae40e5b98",
+        "ciphertextHex": "deadbeefcafebabedeadbeefcafebabe"
+      }
+    },
+    {
+      "name": "decode-malformed",
+      "description": "Decode invalid CBOR bytes → ok=false (malformed frame rejected before any crypto).",
+      "input": {
+        "encodedHex": "000102"
+      },
+      "expected": {
+        "ok": false
+      }
+    },
+    {
+      "name": "seal-forward-frame",
+      "description": "sealForwardFrame: 2-hop onion-encrypt the plaintext at seq=1 → CircuitFrame, then encode to wire.",
+      "input": {
+        "frameSequence": 1,
+        "plaintextHex": "474554202f20485454502f312e310d0a486f73743a206578616d706c652e636f6d0d0a0d0a"
+      },
+      "expected": {
+        "circuitNoncePrefixHex": "40fd068ae40e5b98",
+        "frameSequence": 1,
+        "direction": 1,
+        "sealedEncodedHex": "a4014840fd068ae40e5b980201030104584574a037339a452dacafc346bea3f81d655cf0ece8fd74229e48a2e77a7a5c9004693ce9596e5e9ea7ebd5824e8c7d991ce1c2cb070d6b93cfb0e26e18e191767092a7818506",
+        "ciphertextLen": 69
+      }
+    },
+    {
+      "name": "open-frame-hop0",
+      "description": "openFrame at hop 0: peel the outermost layer (forwardingKey0). isTerminal=false (hop 1 is terminal for a 2-hop circuit).",
+      "input": {
+        "frame": "sealedForwardFrame@seq1"
+      },
+      "expected": {
+        "ok": true,
+        "isTerminal": false,
+        "payloadHex": "adf147e22518b1d725d24783f10028b1e9c415f01cba3fcc0dc756878f4aada0ba64a3f8db18f295d27b4c02a637d36b8d6f3048a1",
+        "payloadLen": 53
+      }
+    },
+    {
+      "name": "forward-frame-hop0",
+      "description": "forwardFrame at hop 0: produces nextFrame (same header + inner ciphertext) for hop 1.",
+      "input": {
+        "frame": "sealedForwardFrame@seq1"
+      },
+      "expected": {
+        "ok": true,
+        "terminal": false,
+        "nextFrameEncodedHex": "a4014840fd068ae40e5b9802010301045835adf147e22518b1d725d24783f10028b1e9c415f01cba3fcc0dc756878f4aada0ba64a3f8db18f295d27b4c02a637d36b8d6f3048a1",
+        "nextFrameCiphertextLen": 53
+      }
+    },
+    {
+      "name": "forward-frame-hop1-terminal",
+      "description": "forwardFrame at hop 1 (terminal hop): delivers the original application plaintext.",
+      "input": {
+        "frame": "nextFrame@hop0"
+      },
+      "expected": {
+        "ok": true,
+        "terminal": true,
+        "plaintextHex": "474554202f20485454502f312e310d0a486f73743a206578616d706c652e636f6d0d0a0d0a",
+        "plaintextAscii": "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
+      }
+    },
+    {
+      "name": "tampered-ciphertext-rejected",
+      "description": "openFrame with a single bit flipped in the ciphertext → AEAD authentication fails (ok=false). Per R-008 frozen ordering: the floor is NOT advanced.",
+      "input": {
+        "frame": "tampered@seq1"
+      },
+      "expected": {
+        "ok": false,
+        "reasonContains": "AEAD authentication failed"
+      }
+    },
+    {
+      "name": "wrong-circuit-rejected",
+      "description": "openFrame with a mismatched circuit_nonce_prefix → rejected (frame does not belong to this circuit).",
+      "input": {
+        "frame": "wrongNoncePrefix@seq1"
+      },
+      "expected": {
+        "ok": false,
+        "reasonContains": "nonce_prefix mismatch"
+      }
+    }
+  ],
+  "verification": {
+    "runner": "ts-vector-runner.ts:verifyCircuitFrameVector + py_vector_verifier.py:verify_circuit_frame_vector",
+    "notes": "All vectors use fixed seeds (initSk=0x01*32, relay0Sk=0x02*32, relay1Sk=0x03*32) for reproducibility. The forwardingKeys are derived from deterministic X25519 ECDH + HKDF (salt=commitment_root). The verifier reconstructs a minimal ActiveCircuit from sharedInputs and tests the frame primitives. R-008 crypto substrate (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload) is NOT modified — R-009 builds on top."
+  }
+}

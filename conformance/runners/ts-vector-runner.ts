@@ -72,6 +72,15 @@ import {
   type CircuitSetupRequest,
 } from "@reference/circuit/distributed-setup";
 import {
+  encodeCircuitFrame,
+  decodeCircuitFrame,
+  sealForwardFrame,
+  openFrame,
+  DIRECTION_FORWARD,
+  type CircuitFrame,
+} from "@reference/circuit/frame";
+import { forwardFrame } from "@reference/circuit/forwarding";
+import {
   evaluateGatewayRequest,
   defaultGatewayPolicy,
   defaultGatewayCapacity,
@@ -957,6 +966,216 @@ function verifyCircuitAckVector(data: any): VectorResult {
 }
 
 // ---------------------------------------------------------------------------
+// V-CIRCUIT-FRAME-001 — CircuitFrame wire object + seal/open/forward (R-009).
+// Tests the data-plane packet protocol built ON the frozen R-008 crypto
+// substrate. The verifier reconstructs a minimal ActiveCircuit from the
+// vector's sharedInputs (fixed seeds → deterministic keys) and exercises:
+//   - encodeCircuitFrame / decodeCircuitFrame (canonical CBOR)
+//   - sealForwardFrame (source onion-encrypt)
+//   - openFrame (relay AEAD-peel one layer)
+//   - forwardFrame (relay forwarding — nextFrame or terminal plaintext)
+//   - tamper rejection (AEAD fails → floor unchanged per R-008)
+//   - wrong-circuit rejection (nonce_prefix mismatch)
+// ---------------------------------------------------------------------------
+
+function verifyCircuitFrameVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const shared = data.sharedInputs || {};
+  let allOk = true;
+  const failures: string[] = [];
+
+  // Reconstruct a minimal ActiveCircuit from the shared inputs.
+  // The forwardingKeys are carried directly (deterministic from fixed ECDH seeds).
+  const commitmentRoot = hexToBytes(shared.commitmentRootHex);
+  const noncePrefix = deriveNoncePrefix(commitmentRoot);
+  const fwdKey0 = hexToBytes(shared.forwardingKey0Hex);
+  const fwdKey1 = hexToBytes(shared.forwardingKey1Hex);
+  const retKey0 = hexToBytes(shared.returnKey0Hex);
+  const retKey1 = hexToBytes(shared.returnKey1Hex);
+
+  // Minimal ActiveCircuit for sealForwardFrame / openFrame / forwardFrame.
+  // (These functions only use: commitmentRoot, noncePrefix, hops[].forwardingKey/returnKey.)
+  const circuit = {
+    commitmentRoot,
+    noncePrefix,
+    hops: [
+      { hopIndex: 0, nodeId: "", forwardingKey: fwdKey0, returnKey: retKey0, relayX25519PublicKey: new Uint8Array(32) },
+      { hopIndex: 1, nodeId: "", forwardingKey: fwdKey1, returnKey: retKey1, relayX25519PublicKey: new Uint8Array(32) },
+    ],
+  } as any;
+
+  // Track the sealed forward frame + nextFrame across vectors (some vectors
+  // reference the output of a previous vector).
+  let sealedForwardFrame: CircuitFrame | null = null;
+  let nextFrameAtHop0: CircuitFrame | null = null;
+
+  for (const v of vectors) {
+    try {
+      const input = v.input || {};
+      const expected = v.expected || {};
+      let caseOk = true;
+
+      if (v.name === "encode-frame") {
+        const frame: CircuitFrame = {
+          circuitNoncePrefix: hexToBytes(input.circuitNoncePrefixHex),
+          frameSequence: input.frameSequence,
+          direction: input.direction,
+          ciphertext: hexToBytes(input.ciphertextHex),
+        };
+        const encoded = encodeCircuitFrame(frame);
+        const encodedHex = toHex(encoded);
+        if (encodedHex !== expected.encodedHex) {
+          caseOk = false;
+          failures.push(`${v.name}: encoded ${encodedHex} != ${expected.encodedHex}`);
+        }
+      } else if (v.name === "decode-frame") {
+        const decoded = decodeCircuitFrame(hexToBytes(input.encodedHex));
+        if (expected.ok) {
+          if (!decoded.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: decode failed: ${decoded.reason}`);
+          } else {
+            if (decoded.frame.frameSequence !== expected.frameSequence) caseOk = false;
+            if (decoded.frame.direction !== expected.direction) caseOk = false;
+            if (toHex(decoded.frame.circuitNoncePrefix) !== expected.circuitNoncePrefixHex) caseOk = false;
+            if (toHex(decoded.frame.ciphertext) !== expected.ciphertextHex) caseOk = false;
+            if (!caseOk) failures.push(`${v.name}: decoded fields mismatch`);
+          }
+        } else {
+          if (decoded.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: expected ok=false, got ok=true`);
+          }
+        }
+      } else if (v.name === "decode-malformed") {
+        const decoded = decodeCircuitFrame(hexToBytes(input.encodedHex));
+        if (decoded.ok !== expected.ok) {
+          caseOk = false;
+          failures.push(`${v.name}: expected ok=${expected.ok}, got ok=${decoded.ok}`);
+        }
+      } else if (v.name === "seal-forward-frame") {
+        const plaintext = hexToBytes(shared.plaintextHex);
+        const sealed = sealForwardFrame(circuit, input.frameSequence, plaintext);
+        const sealedEncoded = encodeCircuitFrame(sealed);
+        const sealedEncodedHex = toHex(sealedEncoded);
+        sealedForwardFrame = sealed;
+        if (sealedEncodedHex !== expected.sealedEncodedHex) {
+          caseOk = false;
+          failures.push(`${v.name}: sealedEncoded ${sealedEncodedHex} != ${expected.sealedEncodedHex}`);
+        }
+        if (sealed.ciphertext.length !== expected.ciphertextLen) {
+          caseOk = false;
+          failures.push(`${v.name}: ciphertextLen ${sealed.ciphertext.length} != ${expected.ciphertextLen}`);
+        }
+      } else if (v.name === "open-frame-hop0") {
+        if (!sealedForwardFrame) { caseOk = false; failures.push(`${v.name}: no sealedForwardFrame`); }
+        else {
+          const r = openFrame(circuit, 0, sealedForwardFrame);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`);
+          } else if (r.ok) {
+            if (r.isTerminal !== expected.isTerminal) caseOk = false;
+            if (r.payload.length !== expected.payloadLen) caseOk = false;
+            if (toHex(r.payload) !== expected.payloadHex) caseOk = false;
+            if (!caseOk) failures.push(`${v.name}: open result mismatch`);
+          }
+        }
+      } else if (v.name === "forward-frame-hop0") {
+        if (!sealedForwardFrame) { caseOk = false; failures.push(`${v.name}: no sealedForwardFrame`); }
+        else {
+          const r = forwardFrame(circuit, 0, sealedForwardFrame);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`);
+          } else if (r.ok) {
+            if (r.terminal !== expected.terminal) {
+              caseOk = false;
+              failures.push(`${v.name}: terminal ${r.terminal} != ${expected.terminal}`);
+            } else if (!r.terminal) {
+              const nfEncoded = encodeCircuitFrame(r.nextFrame);
+              if (toHex(nfEncoded) !== expected.nextFrameEncodedHex) {
+                caseOk = false;
+                failures.push(`${v.name}: nextFrame mismatch`);
+              }
+              if (r.nextFrame.ciphertext.length !== expected.nextFrameCiphertextLen) {
+                caseOk = false;
+                failures.push(`${v.name}: nextFrameCiphertextLen ${r.nextFrame.ciphertext.length} != ${expected.nextFrameCiphertextLen}`);
+              }
+              nextFrameAtHop0 = r.nextFrame;
+            }
+          }
+        }
+      } else if (v.name === "forward-frame-hop1-terminal") {
+        if (!nextFrameAtHop0) { caseOk = false; failures.push(`${v.name}: no nextFrameAtHop0`); }
+        else {
+          const r = forwardFrame(circuit, 1, nextFrameAtHop0);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`);
+          } else if (r.ok && r.terminal) {
+            if (toHex(r.plaintext) !== expected.plaintextHex) {
+              caseOk = false;
+              failures.push(`${v.name}: plaintext mismatch`);
+            }
+          }
+        }
+      } else if (v.name === "tampered-ciphertext-rejected") {
+        if (!sealedForwardFrame) { caseOk = false; failures.push(`${v.name}: no sealedForwardFrame`); }
+        else {
+          // Flip one bit in the ciphertext.
+          const tamperedCt = new Uint8Array(sealedForwardFrame.ciphertext);
+          tamperedCt[0] ^= 0x01;
+          const tamperedFrame: CircuitFrame = { ...sealedForwardFrame, ciphertext: tamperedCt };
+          const r = openFrame(circuit, 0, tamperedFrame);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: expected ok=false, got ok=${r.ok}`);
+          } else if (!r.ok) {
+            if (!r.reason.includes(expected.reasonContains)) {
+              caseOk = false;
+              failures.push(`${v.name}: reason "${r.reason}" !contains "${expected.reasonContains}"`);
+            }
+          }
+        }
+      } else if (v.name === "wrong-circuit-rejected") {
+        if (!sealedForwardFrame) { caseOk = false; failures.push(`${v.name}: no sealedForwardFrame`); }
+        else {
+          // Mismatch the nonce_prefix.
+          const wrongFrame: CircuitFrame = {
+            ...sealedForwardFrame,
+            circuitNoncePrefix: new Uint8Array(8).fill(0xff),
+          };
+          const r = openFrame(circuit, 0, wrongFrame);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: expected ok=false, got ok=${r.ok}`);
+          } else if (!r.ok) {
+            if (!r.reason.includes(expected.reasonContains)) {
+              caseOk = false;
+              failures.push(`${v.name}: reason "${r.reason}" !contains "${expected.reasonContains}"`);
+            }
+          }
+        }
+      } else {
+        throw new Error(`unknown circuit-frame case name: ${v.name}`);
+      }
+
+      if (!caseOk) allOk = false;
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} circuit-frame cases match`,
+    actual: allOk ? `${vectors.length} circuit-frame cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // V-CONTRIBUTION-PROOF-001 — ContributionProof derivation.
 // A ContributionProof is created ONLY from a verified bilateral receipt.
 // We reconstruct the receipt from input + intermediate signatures, then
@@ -1703,6 +1922,8 @@ for (const file of files) {
     result = verifyCircuitSetupVector(data);
   } else if (data.id?.startsWith("V-CIRCUIT-ACK-")) {
     result = verifyCircuitAckVector(data);
+  } else if (data.id?.startsWith("V-CIRCUIT-FRAME-")) {
+    result = verifyCircuitFrameVector(data);
   } else if (data.id?.startsWith("V-CIRCUIT-")) {
     result = verifyCircuitVector(data);
   } else if (data.id?.startsWith("V-GATEWAY-SVC-")) {

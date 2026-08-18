@@ -4,3 +4,6 @@
 blake3>=1.0.0
 cbor2>=5.6.0
 pynacl>=1.5.0
+# Added for V-CIRCUIT-FRAME-001 (R-009): ChaCha20-Poly1305 AEAD for the
+# CircuitFrame wire object + onion encryption.
+cryptography>=42.0.0

@@ -223,7 +223,7 @@
       "id": "V-PATH-VALIDATION-001",
       "protocol": "routing",
       "schema_version": "1",
-      "expected_result": "PathValidationResult canonical encoding (spec-only — no TS impl yet)",
+      "expected_result": "PathValidationResult canonical encoding (spec-only \u2014 no TS impl yet)",
       "file": "V-PATH-VALIDATION-001.json"
     },
     {
@@ -246,6 +246,13 @@
       "schema_version": "1",
       "expected_result": "LedgerEntry split signing/hash payload construction + mutations",
       "file": "V-LEDGER-ENTRY-001.json"
+    },
+    {
+      "id": "V-CIRCUIT-FRAME-001",
+      "protocol": "circuit",
+      "schema_version": "1",
+      "expected_result": "CircuitFrame wire encode/decode + sealForwardFrame + openFrame + forwardFrame (onion peel) + tamper/wrong-circuit rejection",
+      "file": "V-CIRCUIT-FRAME-001.json"
     }
   ]
 }

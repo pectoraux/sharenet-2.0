@@ -23,6 +23,7 @@ import json
 import os
 import sys
 import struct
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,8 @@ import blake3
 import cbor2
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
+from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+from cryptography.exceptions import InvalidTag
 
 # -----------------------------------------------------------------------
 # ShareNet constants (from spec/02-identity.md §2.1)
@@ -399,6 +402,9 @@ def verify_vector(data: dict) -> dict:
 
     elif vid.startswith("V-CIRCUIT-ACK-"):
         return verify_circuit_ack_vector(data)
+
+    elif vid.startswith("V-CIRCUIT-FRAME-"):
+        return verify_circuit_frame_vector(data)
 
     elif vid.startswith("V-CIRCUIT-"):
         return verify_circuit_vector(data)
@@ -1140,6 +1146,605 @@ def _parse_seq_from_call(call_str: str) -> int:
     if inner.endswith("n"):
         inner = inner[:-1]
     return int(inner)
+
+
+# -----------------------------------------------------------------------
+# CircuitFrame wire object (added for R-009 — V-CIRCUIT-FRAME-001)
+#
+# INDEPENDENT implementation of the data-plane CircuitFrame wire object
+# (spec/08 §4.6). This is the byte-for-byte independent Python verifier
+# of the TS `reference/circuit/frame.ts` + `reference/circuit/circuit.ts`
+# primitives. No code is shared with the TS implementation — both
+# sides independently reproduce the same wire bytes from the same vector.
+#
+# Per spec/08 §4.6 (FROZEN):
+#
+#   CircuitFrame = {
+#       circuit_nonce_prefix:  bstr .size 8,   ; per-circuit prefix (§4.3)
+#       frame_sequence:        uint .size 4,    ; big-endian, starts at 1
+#       direction:             uint .size 1,   ; 0x01 = forward, 0x02 = backward
+#       ciphertext:            bstr,           ; ChaCha20-Poly1305 onion payload
+#   }
+#
+#   AD = utf8("SHARENET/CIRCUIT/FRAME/1")
+#      || commitment_root       ; 32 bytes
+#      || frame_sequence         ; 4 bytes big-endian
+#      || direction              ; 1 byte
+#
+# R-008 FROZEN PROTOCOL ORDERING (data-plane frame acceptance):
+#   1. AEAD authenticate + decrypt      (openFrame — reject if tag fails)
+#   2. atomic durable sequence commit   (caller — via CircuitSequenceFloorStore)
+#   3. frame accepted
+# openFrame performs step 1 only. The caller performs step 2 AFTER
+# openFrame succeeds. An unauthenticated frame MUST NOT advance the floor.
+# -----------------------------------------------------------------------
+
+CIRCUIT_FRAME_DOMAIN = b"SHARENET/CIRCUIT/FRAME/1"
+DIRECTION_FORWARD = 0x01
+DIRECTION_BACKWARD = 0x02
+FRAME_SEQUENCE_BYTES = 4
+DIRECTION_BYTES = 1
+AEAD_TAG_BYTES = 16
+MIN_CIPHERTEXT_BYTES = AEAD_TAG_BYTES
+
+# CBOR integer keys for CircuitFrame (per ADR-0004).
+FRAME_KEY_NONCE_PREFIX = 1
+FRAME_KEY_FRAME_SEQUENCE = 2
+FRAME_KEY_DIRECTION = 3
+FRAME_KEY_CIPHERTEXT = 4
+_LEGAL_DIRECTIONS = (DIRECTION_FORWARD, DIRECTION_BACKWARD)
+
+
+def build_circuit_frame_ad(commitment_root: bytes, frame_sequence: int,
+                           direction: int) -> bytes:
+    """AEAD associated data per spec/08 §4.6 (FROZEN).
+
+    AD = "SHARENET/CIRCUIT/FRAME/1" || commitment_root (32) ||
+         frame_sequence (4 BE) || direction (1)
+    """
+    return (CIRCUIT_FRAME_DOMAIN + commitment_root +
+            struct.pack(">I", frame_sequence) + bytes([direction]))
+
+
+def encrypt_payload(key: bytes, nonce: bytes, plaintext: bytes,
+                    aad: bytes = b"") -> bytes:
+    """ChaCha20-Poly1305 AEAD encrypt. Returns ciphertext || tag (16 bytes)."""
+    return ChaCha20Poly1305(key).encrypt(nonce, plaintext, aad)
+
+
+def decrypt_payload(key: bytes, nonce: bytes, ciphertext: bytes,
+                    aad: bytes = b"") -> bytes:
+    """ChaCha20-Poly1305 AEAD decrypt. Returns plaintext, or raises InvalidTag."""
+    return ChaCha20Poly1305(key).decrypt(nonce, ciphertext, aad)
+
+
+def _strict_cbor_decode_one(data: bytes) -> Any:
+    """Decode a single CBOR item, requiring NO trailing bytes.
+
+    cbor2.loads is non-strict (decodes the first item and silently ignores
+    trailing bytes). For wire objects, trailing bytes after a CBOR item are
+    malformed. This wrapper raises ValueError if any bytes remain after the
+    decoded item, mirroring the TS focused decoder.
+    """
+    bio = BytesIO(data)
+    decoder = cbor2.CBORDecoder(bio)
+    value = decoder.decode()
+    if bio.tell() != len(data):
+        raise ValueError(
+            f"trailing bytes after CBOR item "
+            f"({len(data) - bio.tell()} bytes)"
+        )
+    return value
+
+
+def encode_circuit_frame(frame: dict) -> bytes:
+    """Encode a CircuitFrame as canonical CBOR (ADR-0004 integer-keyed map).
+
+    `frame` is a dict with keys:
+      circuitNoncePrefix: bytes (8)
+      frameSequence: int (u32)
+      direction: int (0x01 or 0x02)
+      ciphertext: bytes
+    """
+    nonce_prefix = frame["circuitNoncePrefix"]
+    frame_sequence = frame["frameSequence"]
+    direction = frame["direction"]
+    ciphertext = frame["ciphertext"]
+
+    if not isinstance(nonce_prefix, (bytes, bytearray)) or \
+            len(nonce_prefix) != CIRCUIT_NONCE_PREFIX_BYTES:
+        raise ValueError(
+            f"encodeCircuitFrame: circuitNoncePrefix must be "
+            f"{CIRCUIT_NONCE_PREFIX_BYTES} bytes, got {len(nonce_prefix)}"
+        )
+    if not isinstance(frame_sequence, int) or frame_sequence < 0 or \
+            frame_sequence > 0xffffffff:
+        raise ValueError(
+            f"encodeCircuitFrame: frameSequence must be a u32, "
+            f"got {frame_sequence}"
+        )
+    if direction not in _LEGAL_DIRECTIONS:
+        raise ValueError(
+            f"encodeCircuitFrame: direction must be 0x01 (forward) or "
+            f"0x02 (backward), got 0x{direction:02x}"
+        )
+    if not isinstance(ciphertext, (bytes, bytearray)):
+        raise ValueError("encodeCircuitFrame: ciphertext must be bytes")
+
+    m = {
+        FRAME_KEY_NONCE_PREFIX: bytes(nonce_prefix),
+        FRAME_KEY_FRAME_SEQUENCE: frame_sequence,
+        FRAME_KEY_DIRECTION: direction,
+        FRAME_KEY_CIPHERTEXT: bytes(ciphertext),
+    }
+    return canonical_cbor_encode(m)
+
+
+def decode_circuit_frame(data: bytes) -> dict:
+    """Decode a CircuitFrame from canonical CBOR + validate field sizes.
+
+    Returns `{"ok": True, "frame": {...}}` on success or
+    `{"ok": False, "reason": "..."}` on any malformed input.
+    """
+    try:
+        m = _strict_cbor_decode_one(data)
+    except Exception as e:
+        return {"ok": False, "reason": f"CBOR decode failed: {e}"}
+
+    if not isinstance(m, dict):
+        return {
+            "ok": False,
+            "reason": f"CBOR top-level must be a map, got {type(m).__name__}",
+        }
+
+    nonce_prefix = m.get(FRAME_KEY_NONCE_PREFIX)
+    if not isinstance(nonce_prefix, (bytes, bytearray)) or \
+            len(nonce_prefix) != CIRCUIT_NONCE_PREFIX_BYTES:
+        return {
+            "ok": False,
+            "reason": f"circuit_nonce_prefix must be a bstr of "
+                      f"{CIRCUIT_NONCE_PREFIX_BYTES} bytes",
+        }
+
+    frame_sequence = m.get(FRAME_KEY_FRAME_SEQUENCE)
+    if not isinstance(frame_sequence, int) or isinstance(frame_sequence, bool) \
+            or frame_sequence < 0 or frame_sequence > 0xffffffff:
+        return {
+            "ok": False,
+            "reason": "frame_sequence must be a u32 (0..4294967295)",
+        }
+
+    direction = m.get(FRAME_KEY_DIRECTION)
+    if not isinstance(direction, int) or isinstance(direction, bool) \
+            or direction not in _LEGAL_DIRECTIONS:
+        return {
+            "ok": False,
+            "reason": "direction must be 0x01 (forward) or 0x02 (backward)",
+        }
+
+    ciphertext = m.get(FRAME_KEY_CIPHERTEXT)
+    if not isinstance(ciphertext, (bytes, bytearray)) or \
+            len(ciphertext) < MIN_CIPHERTEXT_BYTES:
+        return {
+            "ok": False,
+            "reason": f"ciphertext must be a bstr of at least "
+                      f"{MIN_CIPHERTEXT_BYTES} bytes (AEAD tag)",
+        }
+
+    return {
+        "ok": True,
+        "frame": {
+            "circuitNoncePrefix": bytes(nonce_prefix),
+            "frameSequence": frame_sequence,
+            "direction": direction,
+            "ciphertext": bytes(ciphertext),
+        },
+    }
+
+
+def seal_forward_frame(circuit: dict, frame_sequence: int,
+                       plaintext: bytes) -> dict:
+    """Onion-encrypt the plaintext from the outermost hop (last) to the
+    innermost hop (first), producing a forward CircuitFrame.
+
+    Per spec/08 §4.1 + §4.6: the source encrypts from hop N-1 down to hop 0.
+    Each relay decrypts one layer with its forwardingKey.
+
+    `circuit` is a dict with:
+      commitmentRoot: bytes (32)
+      noncePrefix: bytes (8)
+      hops: list of dicts each with `forwardingKey` (bytes 32) + `returnKey`.
+    """
+    if not isinstance(frame_sequence, int) or frame_sequence < 1 \
+            or frame_sequence > 0xffffffff:
+        raise ValueError(
+            f"sealForwardFrame: frameSequence must be a u32 ≥ 1, "
+            f"got {frame_sequence}"
+        )
+
+    aad = build_circuit_frame_ad(
+        circuit["commitmentRoot"], frame_sequence, DIRECTION_FORWARD)
+    nonce = build_circuit_nonce(circuit["noncePrefix"], frame_sequence)
+
+    # Onion-encrypt from the outermost hop (last) to the innermost hop (first).
+    data = bytes(plaintext)
+    for i in range(len(circuit["hops"]) - 1, -1, -1):
+        hop = circuit["hops"][i]
+        data = encrypt_payload(hop["forwardingKey"], nonce, data, aad)
+
+    return {
+        "circuitNoncePrefix": bytes(circuit["noncePrefix"]),
+        "frameSequence": frame_sequence,
+        "direction": DIRECTION_FORWARD,
+        "ciphertext": data,
+    }
+
+
+def open_frame(circuit: dict, hop_index: int, frame: dict) -> dict:
+    """Peel ONE AEAD layer of a CircuitFrame at the given hop.
+
+    Returns `{"ok": True, "payload": bytes, "isTerminal": bool}` on success
+    or `{"ok": False, "reason": str}` on AEAD failure / wrong circuit.
+
+    Per R-008 frozen ordering: this function performs ONLY the AEAD step
+    (step 1). The caller is responsible for the durable sequence commit
+    (step 2) AFTER this returns ok=True. An AEAD failure MUST NOT advance
+    the floor.
+    """
+    if hop_index < 0 or hop_index >= len(circuit["hops"]):
+        return {"ok": False, "reason": f"no hop at index {hop_index}"}
+
+    hop = circuit["hops"][hop_index]
+
+    # Defense-in-depth: verify the frame's nonce_prefix matches the circuit's.
+    # (AEAD AD already binds to commitment_root; this is a fast early reject.)
+    if not _constant_time_bytes_equal(frame["circuitNoncePrefix"],
+                                      circuit["noncePrefix"]):
+        return {
+            "ok": False,
+            "reason": "circuit_nonce_prefix mismatch "
+                      "(frame does not belong to this circuit)",
+        }
+
+    # Select the key based on direction: forwardingKey for forward, returnKey
+    # for backward.
+    if frame["direction"] == DIRECTION_FORWARD:
+        key = hop["forwardingKey"]
+    else:
+        key = hop["returnKey"]
+
+    nonce = build_circuit_nonce(circuit["noncePrefix"], frame["frameSequence"])
+    aad = build_circuit_frame_ad(
+        circuit["commitmentRoot"], frame["frameSequence"], frame["direction"])
+
+    try:
+        payload = decrypt_payload(key, nonce, frame["ciphertext"], aad)
+    except InvalidTag as e:
+        return {
+            "ok": False,
+            "reason": f"AEAD authentication failed: {e}",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "reason": f"AEAD authentication failed: {e}",
+        }
+
+    # Terminal hop for forward direction = last hop in the route.
+    is_terminal = (frame["direction"] == DIRECTION_FORWARD and
+                   hop_index == len(circuit["hops"]) - 1)
+
+    return {"ok": True, "payload": payload, "isTerminal": is_terminal}
+
+
+def forward_frame(circuit: dict, hop_index: int, frame: dict) -> dict:
+    """Relay peels one AEAD layer and produces either a nextFrame (for the
+    next hop) or the terminal plaintext.
+
+    Returns one of:
+      {"ok": True, "terminal": True, "plaintext": bytes}
+      {"ok": True, "terminal": False, "nextFrame": dict}
+      {"ok": False, "reason": str}
+    """
+    open_result = open_frame(circuit, hop_index, frame)
+    if not open_result["ok"]:
+        return {"ok": False, "reason": open_result["reason"]}
+
+    if open_result["isTerminal"]:
+        return {"ok": True, "terminal": True,
+                "plaintext": open_result["payload"]}
+
+    next_frame = {
+        "circuitNoncePrefix": bytes(frame["circuitNoncePrefix"]),
+        "frameSequence": frame["frameSequence"],
+        "direction": frame["direction"],
+        "ciphertext": open_result["payload"],
+    }
+    return {"ok": True, "terminal": False, "nextFrame": next_frame}
+
+
+def _constant_time_bytes_equal(a: bytes, b: bytes) -> bool:
+    """Constant-time byte equality."""
+    if len(a) != len(b):
+        return False
+    diff = 0
+    for x, y in zip(a, b):
+        diff |= x ^ y
+    return diff == 0
+
+
+def verify_circuit_frame_vector(data: dict) -> dict:
+    """Verify a V-CIRCUIT-FRAME-* vector (CircuitFrame wire object).
+
+    Reconstructs a minimal ActiveCircuit from the vector's sharedInputs,
+    then exercises each of the 9 cases (encode/decode/seal/open/forward/
+    tamper-reject/wrong-circuit-reject). The implementation is fully
+    INDEPENDENT of the TS runner — it reuses only the same wire format
+    spec (spec/08 §4.6) + the same R-008 frozen crypto substrate
+    (HKDF-SHA256 nonce_prefix + ChaCha20-Poly1305 AEAD + the AD layout).
+    """
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    shared = data.get("sharedInputs", {}) or {}
+
+    commitment_root = bytes.fromhex(shared["commitmentRootHex"])
+    nonce_prefix = bytes.fromhex(shared["noncePrefixHex"])
+    fwd_key_0 = bytes.fromhex(shared["forwardingKey0Hex"])
+    fwd_key_1 = bytes.fromhex(shared["forwardingKey1Hex"])
+    ret_key_0 = bytes.fromhex(shared["returnKey0Hex"])
+    ret_key_1 = bytes.fromhex(shared["returnKey1Hex"])
+
+    # Minimal ActiveCircuit for seal_forward_frame / open_frame / forward_frame.
+    # (These functions only use: commitmentRoot, noncePrefix, hops[].)
+    circuit = {
+        "commitmentRoot": commitment_root,
+        "noncePrefix": nonce_prefix,
+        "hops": [
+            {"hopIndex": 0, "forwardingKey": fwd_key_0, "returnKey": ret_key_0},
+            {"hopIndex": 1, "forwardingKey": fwd_key_1, "returnKey": ret_key_1},
+        ],
+    }
+
+    # Sanity-check that the shared noncePrefix is what the R-008 HKDF
+    # derivation produces from the commitment_root. (Independent re-derivation
+    # proves the frozen substrate is consistent.)
+    derived_prefix = derive_circuit_nonce_prefix(commitment_root)
+    if derived_prefix != nonce_prefix:
+        return {
+            "id": vid,
+            "passed": False,
+            "expected": f"derived noncePrefix {nonce_prefix.hex()}",
+            "actual": f"derived {derived_prefix.hex()} (mismatch)",
+        }
+
+    # Carry state across cases (some vectors reference prior outputs).
+    sealed_forward_frame = None  # set by seal-forward-frame
+    next_frame_at_hop_0 = None  # set by forward-frame-hop0
+
+    failures = []
+    for v in vectors:
+        try:
+            name = v["name"]
+            inp = v.get("input", {}) or {}
+            expected = v.get("expected", {}) or {}
+
+            if name == "encode-frame":
+                frame = {
+                    "circuitNoncePrefix": bytes.fromhex(
+                        inp["circuitNoncePrefixHex"]),
+                    "frameSequence": inp["frameSequence"],
+                    "direction": inp["direction"],
+                    "ciphertext": bytes.fromhex(inp["ciphertextHex"]),
+                }
+                encoded = encode_circuit_frame(frame)
+                if encoded.hex() != expected["encodedHex"]:
+                    failures.append(
+                        f"{name}: encoded {encoded.hex()} != "
+                        f"{expected['encodedHex']}"
+                    )
+
+            elif name == "decode-frame":
+                decoded = decode_circuit_frame(bytes.fromhex(inp["encodedHex"]))
+                if expected["ok"]:
+                    if not decoded["ok"]:
+                        failures.append(
+                            f"{name}: decode failed: {decoded['reason']}"
+                        )
+                    else:
+                        f_ = decoded["frame"]
+                        if f_["frameSequence"] != expected["frameSequence"]:
+                            failures.append(
+                                f"{name}: frameSequence "
+                                f"{f_['frameSequence']} != "
+                                f"{expected['frameSequence']}"
+                            )
+                        if f_["direction"] != expected["direction"]:
+                            failures.append(
+                                f"{name}: direction {f_['direction']} != "
+                                f"{expected['direction']}"
+                            )
+                        if f_["circuitNoncePrefix"].hex() != \
+                                expected["circuitNoncePrefixHex"]:
+                            failures.append(
+                                f"{name}: noncePrefix "
+                                f"{f_['circuitNoncePrefix'].hex()} != "
+                                f"{expected['circuitNoncePrefixHex']}"
+                            )
+                        if f_["ciphertext"].hex() != \
+                                expected["ciphertextHex"]:
+                            failures.append(
+                                f"{name}: ciphertext "
+                                f"{f_['ciphertext'].hex()} != "
+                                f"{expected['ciphertextHex']}"
+                            )
+                else:
+                    if decoded["ok"]:
+                        failures.append(
+                            f"{name}: expected ok=false, got ok=true"
+                        )
+
+            elif name == "decode-malformed":
+                decoded = decode_circuit_frame(bytes.fromhex(inp["encodedHex"]))
+                if decoded["ok"] != expected["ok"]:
+                    failures.append(
+                        f"{name}: expected ok={expected['ok']}, "
+                        f"got ok={decoded['ok']}"
+                    )
+
+            elif name == "seal-forward-frame":
+                plaintext = bytes.fromhex(shared["plaintextHex"])
+                sealed = seal_forward_frame(circuit, inp["frameSequence"],
+                                            plaintext)
+                sealed_encoded = encode_circuit_frame(sealed)
+                sealed_forward_frame = sealed
+                if sealed_encoded.hex() != expected["sealedEncodedHex"]:
+                    failures.append(
+                        f"{name}: sealedEncoded "
+                        f"{sealed_encoded.hex()} != "
+                        f"{expected['sealedEncodedHex']}"
+                    )
+                if len(sealed["ciphertext"]) != expected["ciphertextLen"]:
+                    failures.append(
+                        f"{name}: ciphertextLen "
+                        f"{len(sealed['ciphertext'])} != "
+                        f"{expected['ciphertextLen']}"
+                    )
+
+            elif name == "open-frame-hop0":
+                if sealed_forward_frame is None:
+                    failures.append(f"{name}: no sealedForwardFrame")
+                else:
+                    r = open_frame(circuit, 0, sealed_forward_frame)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: ok {r['ok']} != {expected['ok']}"
+                        )
+                    elif r["ok"]:
+                        if r["isTerminal"] != expected["isTerminal"]:
+                            failures.append(
+                                f"{name}: isTerminal {r['isTerminal']} != "
+                                f"{expected['isTerminal']}"
+                            )
+                        if len(r["payload"]) != expected["payloadLen"]:
+                            failures.append(
+                                f"{name}: payloadLen "
+                                f"{len(r['payload'])} != "
+                                f"{expected['payloadLen']}"
+                            )
+                        if r["payload"].hex() != expected["payloadHex"]:
+                            failures.append(
+                                f"{name}: payload "
+                                f"{r['payload'].hex()} != "
+                                f"{expected['payloadHex']}"
+                            )
+
+            elif name == "forward-frame-hop0":
+                if sealed_forward_frame is None:
+                    failures.append(f"{name}: no sealedForwardFrame")
+                else:
+                    r = forward_frame(circuit, 0, sealed_forward_frame)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: ok {r['ok']} != {expected['ok']}"
+                        )
+                    elif r["ok"]:
+                        if r["terminal"] != expected["terminal"]:
+                            failures.append(
+                                f"{name}: terminal {r['terminal']} != "
+                                f"{expected['terminal']}"
+                            )
+                        elif not r["terminal"]:
+                            nf = r["nextFrame"]
+                            nf_encoded = encode_circuit_frame(nf)
+                            if nf_encoded.hex() != \
+                                    expected["nextFrameEncodedHex"]:
+                                failures.append(
+                                    f"{name}: nextFrame "
+                                    f"{nf_encoded.hex()} != "
+                                    f"{expected['nextFrameEncodedHex']}"
+                                )
+                            if len(nf["ciphertext"]) != \
+                                    expected["nextFrameCiphertextLen"]:
+                                failures.append(
+                                    f"{name}: nextFrameCiphertextLen "
+                                    f"{len(nf['ciphertext'])} != "
+                                    f"{expected['nextFrameCiphertextLen']}"
+                                )
+                            next_frame_at_hop_0 = nf
+
+            elif name == "forward-frame-hop1-terminal":
+                if next_frame_at_hop_0 is None:
+                    failures.append(f"{name}: no nextFrameAtHop0")
+                else:
+                    r = forward_frame(circuit, 1, next_frame_at_hop_0)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: ok {r['ok']} != {expected['ok']}"
+                        )
+                    elif r["ok"] and r["terminal"]:
+                        if r["plaintext"].hex() != expected["plaintextHex"]:
+                            failures.append(
+                                f"{name}: plaintext "
+                                f"{r['plaintext'].hex()} != "
+                                f"{expected['plaintextHex']}"
+                            )
+
+            elif name == "tampered-ciphertext-rejected":
+                if sealed_forward_frame is None:
+                    failures.append(f"{name}: no sealedForwardFrame")
+                else:
+                    # Flip one bit in the ciphertext.
+                    tampered_ct = bytearray(sealed_forward_frame["ciphertext"])
+                    tampered_ct[0] ^= 0x01
+                    tampered_frame = dict(sealed_forward_frame)
+                    tampered_frame["ciphertext"] = bytes(tampered_ct)
+                    r = open_frame(circuit, 0, tampered_frame)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: expected ok={expected['ok']}, "
+                            f"got ok={r['ok']}"
+                        )
+                    elif not r["ok"]:
+                        if expected["reasonContains"] not in r["reason"]:
+                            failures.append(
+                                f"{name}: reason '{r['reason']}' !contains "
+                                f"'{expected['reasonContains']}'"
+                            )
+
+            elif name == "wrong-circuit-rejected":
+                if sealed_forward_frame is None:
+                    failures.append(f"{name}: no sealedForwardFrame")
+                else:
+                    # Mismatch the nonce_prefix.
+                    wrong_frame = dict(sealed_forward_frame)
+                    wrong_frame["circuitNoncePrefix"] = bytes([0xff] * 8)
+                    r = open_frame(circuit, 0, wrong_frame)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: expected ok={expected['ok']}, "
+                            f"got ok={r['ok']}"
+                        )
+                    elif not r["ok"]:
+                        if expected["reasonContains"] not in r["reason"]:
+                            failures.append(
+                                f"{name}: reason '{r['reason']}' !contains "
+                                f"'{expected['reasonContains']}'"
+                            )
+
+            else:
+                failures.append(f"{name}: unknown circuit-frame case name")
+
+        except Exception as e:
+            failures.append(f"{v.get('name', '?')}: threw {e}")
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} circuit-frame cases match",
+        "actual": f"{len(vectors)} circuit-frame cases match" if passed
+                  else f"FAILED: {'; '.join(failures)}",
+    }
 
 
 # -----------------------------------------------------------------------

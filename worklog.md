@@ -1531,3 +1531,59 @@ Stage Summary:
   constructors — no production path can accidentally fall back to in-memory replay
   protection.
 - Pushed to origin/main at 0135fa2 (ffc4e35..0135fa2 main -> main).
+
+---
+Task ID: 5-python-verifier
+Agent: general-purpose (subagent)
+Task: Add the INDEPENDENT Python conformance verifier for the ShareNet 2.0 R-009 CircuitFrame wire object to `conformance/runners/py_vector_verifier.py`. The TS conformance runner already verified `V-CIRCUIT-FRAME-001` (9 cases); this task closes the spec↔registry↔manifest↔TS↔Python cross-implementation conformance chain by adding the independent Python implementation that verifies the same vector file.
+
+Work Log:
+- Read context: `worklog.md` last 3 sections (R-008-possession-proof, R-008-durable-persistence, R008-final-hardening) — confirmed the FROZEN R-008 crypto substrate (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload, deriveNoncePrefix) that R-009 must build on top of. Read `conformance/vectors/V-CIRCUIT-FRAME-001.json` (9 cases: encode-frame, decode-frame, decode-malformed, seal-forward-frame, open-frame-hop0, forward-frame-hop0, forward-frame-hop1-terminal, tampered-ciphertext-rejected, wrong-circuit-rejected). Read the TS reference `reference/circuit/frame.ts` (encodeCircuitFrame, decodeCircuitFrame, sealForwardFrame, openFrame) + `reference/circuit/forwarding.ts` (forwardFrame) + `reference/circuit/circuit.ts` (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload) for the wire-format semantics. Read the existing Python verifier structure to match the established pattern (`canonical_cbor_encode`, `derive_circuit_nonce_prefix`, `build_circuit_nonce`, dispatch table at lines 397-410).
+
+- Confirmed dependency availability: `cbor2` (canonical CBOR) is already imported; `cryptography` (for ChaCha20-Poly1305 AEAD) was available in the environment but not declared in `conformance/requirements.txt` — added `cryptography>=42.0.0` with a comment explaining it is needed for V-CIRCUIT-FRAME-001 (R-009).
+
+- Pre-flight byte-stability check: wrote a one-shot Python script to independently reproduce `sealedEncodedHex` from the vector's sharedInputs (onion-encrypt the plaintext with forwardingKey1 then forwardingKey0, build the CBOR map). Result matched the expected hex exactly — `a4014840fd068ae40e5b98...04584574a037339a452dacafc...`. This proved the AEAD/AD/nonce layout is correct before integrating the logic into the verifier.
+
+- Imported `from io import BytesIO`, `from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305`, `from cryptography.exceptions import InvalidTag` at the top of `py_vector_verifier.py`.
+
+- Added a new section "# CircuitFrame wire object (added for R-009 — V-CIRCUIT-FRAME-001)" after the existing circuit code (after `_parse_seq_from_call`, before the gateway policy section). Implements the wire object from scratch using only spec/08 §4.6 — NO code shared with the TS runner. Components:
+  - Constants: `CIRCUIT_FRAME_DOMAIN = b"SHARENET/CIRCUIT/FRAME/1"`, `DIRECTION_FORWARD = 0x01`, `DIRECTION_BACKWARD = 0x02`, `FRAME_SEQUENCE_BYTES = 4`, `DIRECTION_BYTES = 1`, `AEAD_TAG_BYTES = 16`, `MIN_CIPHERTEXT_BYTES = 16`, CBOR map keys `FRAME_KEY_NONCE_PREFIX/FRAME_SEQUENCE/DIRECTION/CIPHERTEXT = 1/2/3/4` (per ADR-0004), `_LEGAL_DIRECTIONS`.
+  - `build_circuit_frame_ad(commitment_root, frame_sequence, direction)`: FROZEN AD layout — `CIRCUIT_FRAME_DOMAIN || commitment_root (32) || frame_sequence (4 BE) || direction (1)`.
+  - `encrypt_payload(key, nonce, plaintext, aad)` / `decrypt_payload(key, nonce, ciphertext, aad)`: ChaCha20-Poly1305 AEAD via `cryptography`'s `ChaCha20Poly1305`. Encrypt returns ciphertext||tag (16 bytes); decrypt raises `InvalidTag` on tag failure.
+  - `_strict_cbor_decode_one(data)`: wraps `cbor2.CBORDecoder` over a `BytesIO` and raises `ValueError` if any bytes remain after the decoded item. This is necessary because `cbor2.loads` is non-strict (silently ignores trailing bytes) — wire objects must reject malformed inputs like the `000102` test vector (which `cbor2.loads` would decode as `uint 0` and silently swallow the trailing `0102`).
+  - `encode_circuit_frame(frame)`: validates field sizes (nonce_prefix=8 bytes, frame_sequence=u32, direction∈{1,2}, ciphertext=bytes) then canonical-CBOR encodes the integer-keyed map via the existing `canonical_cbor_encode`.
+  - `decode_circuit_frame(data)`: returns `{"ok": True, "frame": {...}}` or `{"ok": False, "reason": "..."}`. Validates that the decoded CBOR top-level is a dict (map), each field's type/size, and that ciphertext is at least 16 bytes (AEAD tag). Mirrors the TS focused decoder's strictness.
+  - `seal_forward_frame(circuit, frame_sequence, plaintext)`: onion-encrypts from hop N-1 down to hop 0 (so for a 2-hop circuit, first encrypt with `hops[1].forwardingKey`, then encrypt with `hops[0].forwardingKey`). Returns a forward CircuitFrame dict.
+  - `open_frame(circuit, hop_index, frame)`: peel ONE AEAD layer. (1) Verifies `frame.circuitNoncePrefix` matches `circuit.noncePrefix` via constant-time comparison (fast-path early reject with reason `"circuit_nonce_prefix mismatch (frame does not belong to this circuit)"` — this contains the substring `"nonce_prefix mismatch"` expected by the wrong-circuit-rejected case). (2) Selects `forwardingKey` for forward direction / `returnKey` for backward. (3) Builds nonce via the existing `build_circuit_nonce` + AD via `build_circuit_frame_ad`. (4) AEAD decrypts; on `InvalidTag` returns `{"ok": False, "reason": "AEAD authentication failed: ..."}` (matches the `tampered-ciphertext-rejected` case's `reasonContains`). (5) Computes `isTerminal = direction==FORWARD and hop_index==len(hops)-1`. Per R-008 frozen ordering, this function performs ONLY the AEAD step (step 1) — the durable sequence commit (step 2) is the caller's responsibility and is NOT exercised by this vector (no replay-floor cases here).
+  - `forward_frame(circuit, hop_index, frame)`: wraps `open_frame`. On terminal → returns `{"ok": True, "terminal": True, "plaintext": ...}`. On intermediate → builds a `nextFrame` with the SAME header (nonce_prefix + frame_sequence + direction) + the inner ciphertext (ciphertext shrinks by 16 bytes per hop = the AEAD tag), returns `{"ok": True, "terminal": False, "nextFrame": ...}`.
+  - `_constant_time_bytes_equal(a, b)`: constant-time byte equality (defense-in-depth for the nonce_prefix early-reject).
+  - `verify_circuit_frame_vector(data)`: reconstructs a minimal ActiveCircuit (commitmentRoot + noncePrefix + 2 hops each with forwardingKey/returnKey) from `sharedInputs`, sanity-checks that `derive_circuit_nonce_prefix(commitmentRoot)` reproduces the shared `noncePrefixHex` (independent re-derivation proves the frozen substrate is consistent), then dispatches each of the 9 cases by name:
+    - `encode-frame`: builds a CircuitFrame, encodes to CBOR, asserts hex matches `expected.encodedHex`.
+    - `decode-frame`: decodes the CBOR hex, asserts each field matches.
+    - `decode-malformed`: decodes `000102`, asserts `ok == false`.
+    - `seal-forward-frame`: onion-encrypts the plaintext, encodes to wire, asserts `sealedEncodedHex` + `ciphertextLen == 69`. Stashes the sealed frame for the next 4 cases.
+    - `open-frame-hop0`: opens at hop 0, asserts `ok`, `isTerminal==false`, `payloadHex` (53 bytes), `payloadLen`.
+    - `forward-frame-hop0`: forwards at hop 0, asserts `terminal==false` + `nextFrameEncodedHex` + `nextFrameCiphertextLen`. Stashes the nextFrame.
+    - `forward-frame-hop1-terminal`: forwards the stashed nextFrame at hop 1, asserts `terminal==true` + `plaintextHex` matches the original plaintext.
+    - `tampered-ciphertext-rejected`: flips bit 0 in the sealed ciphertext, asserts `ok==false` + reason contains `"AEAD authentication failed"`.
+    - `wrong-circuit-rejected`: replaces the frame's circuitNoncePrefix with `ff*8`, asserts `ok==false` + reason contains `"nonce_prefix mismatch"`.
+    - Returns the standard `{"id", "passed", "expected", "actual"}` dict matching the existing verifier pattern.
+
+- Added dispatch branch in `verify_vector`: `elif vid.startswith("V-CIRCUIT-FRAME-"): return verify_circuit_frame_vector(data)` placed AFTER `V-CIRCUIT-ACK-` and BEFORE the generic `V-CIRCUIT-` branch (so the more specific FRAME prefix takes precedence — otherwise `V-CIRCUIT-FRAME-001` would have fallen through to `verify_circuit_vector` and reported `unknown circuit sub-vector` for all 9 cases, which is exactly the failure mode observed in the pre-fix baseline).
+
+- Verified zero regressions:
+  - `python3 conformance/runners/py_vector_verifier.py 2>&1 | tail -5` → `Passed: 36/36, Failed: 0` (was 35/35 — V-CIRCUIT-FRAME-001 was previously routed to `verify_circuit_vector` and failed all 9 cases).
+  - All 4 V-CIRCUIT-* vectors pass: V-CIRCUIT-001, V-CIRCUIT-ACK-001, V-CIRCUIT-FRAME-001 (NEW), V-CIRCUIT-SETUP-001.
+  - Process exit code is 0 (clean).
+  - 36 PASS lines, 0 FAIL lines.
+
+- Independence confirmed: the Python verifier imports ONLY `cryptography.hazmat.primitives.ciphers.aead.ChaCha20Poly1305`, `cbor2`, `blake3`, `pynacl`, `hashlib`, `hmac`, `struct`, `io.BytesIO` — zero imports from `reference/` or any TS-side module. It reuses the existing Python helpers `canonical_cbor_encode`, `build_circuit_nonce`, `derive_circuit_nonce_prefix` (already verified by V-CIRCUIT-001), but the CircuitFrame wire object, onion encryption, AEAD-peel, and forward-frame logic are implemented from scratch using only the spec/08 §4.6 wire format + AD layout. The byte-for-byte match between the Python output and the TS-generated expected hex proves cross-implementation conformance.
+
+Stage Summary:
+- Python conformance runner: 35/35 → 36/36 vectors pass (+1 V-CIRCUIT-FRAME-001). The independent Python implementation reproduces every byte of the TS-generated expected values for all 9 cases of the CircuitFrame wire object.
+- The spec↔registry↔manifest↔TS↔Python conformance chain for R-009 CircuitFrame is now CLOSED: the TS runner and the Python runner independently verify the same frozen vector file using independent cryptographic libraries (TS: `@noble/ciphers` chacha20poly1305; Python: `cryptography.hazmat...ChaCha20Poly1305`) + independent CBOR encoders (TS: custom canonical encoder; Python: `cbor2.dumps(canonical=True)`).
+- Cross-implementation byte-stability is now RATIFIED for the CircuitFrame wire object: canonical CBOR encoding, ChaCha20-Poly1305 AEAD ciphertext+tag, and the onion-encryption byte layout are reproducible across TS and Python with zero divergence.
+- The frozen R-008 crypto substrate (buildNonce, buildCircuitFrameAD, deriveNoncePrefix) was NOT modified — R-009 builds on top of it. The Python verifier independently re-derives `noncePrefix` from `commitmentRoot` via the existing `derive_circuit_nonce_prefix` helper (HKDF-SHA256, salt=commitment_root, ikm=b"nonce-prefix", info=SHARENET/CIRCUIT/NONCE/1) and asserts it matches the shared input — proving the substrate is consistent across the spec↔Python axis.
+- New dependency declared: `cryptography>=42.0.0` added to `conformance/requirements.txt` (was already available in the environment, now made explicit).
+- No regressions: all 35 previously-passing Python vectors still pass.
+
