@@ -41,9 +41,20 @@ yarn-error.log*
 mini-services/node-link/data/*/
 mini-services/node-link/data/*-keypair.json
 !mini-services/node-link/data/README.md
+# The node-link service can also write its data dir nested under its own cwd:
+mini-services/node-link/mini-services/
 
 # vercel
 .vercel
+
+# --- runtime PID + sandbox log files (written by .zscripts/*-daemon.sh) ---
+*.pid
+.zscripts/*.log
+
+# --- env files (gitignored — secrets live here, never commit) ---
+.env
+.env.local
+.env.*
 
 
 # typescript
