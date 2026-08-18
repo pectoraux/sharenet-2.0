@@ -235,22 +235,23 @@ export const LEDGER_ENTRY_DOMAIN = "SHARENET/CONTRIBUTION/LEDGER/1";
 
 export interface LedgerEntry {
   sequence: number;           // monotonic ledger-wide counter
-  proof: ContributionProof;
+  proofHash: string;          // hex of receiptHash from the ContributionProof (wire representation)
   verifiedAt: number;         // when the verifier confirmed the proof
   verifierId: string;         // NodeId of the verifying node
-  verifierSignature: Uint8Array; // Ed25519 by verifier over the entry (excl. prev_hash)
-  prevHash: string;           // hex of BLAKE3-256(entry_{n-1}); "0000...0000" for genesis
-  entryHash: string;          // hex of BLAKE3-256(this entry, excl. entryHash itself)
+  verifierSignature: Uint8Array; // Ed25519 by verifier over the entry body
+  prevHash: string;           // hex of BLAKE3-256(entry_{n-1}); "0"*64 for genesis
+  entryHash: string;          // hex of BLAKE3-256(this entry, excl. entryHash)
 }
 
 /**
  * Compute the canonical encoding of a LedgerEntry body (excl. entryHash).
- * Keys 1-6 per spec/11 §4.
+ * Keys 1-6 per spec/11 §4. The proof is represented by its hash (proofHash),
+ * not the full ContributionProof object — this is the wire representation.
  */
 export function ledgerEntrySigningPayload(entry: Omit<LedgerEntry, "entryHash">): Uint8Array {
   const m = new Map<number, unknown>([
     [1, entry.sequence],
-    [2, entry.proof.receiptHash], // proof is represented by its hash
+    [2, entry.proofHash],
     [3, entry.verifiedAt],
     [4, entry.verifierId],
     [5, entry.verifierSignature],
@@ -287,6 +288,7 @@ export function computeLedgerEntryHash(entry: Omit<LedgerEntry, "entryHash">): s
  */
 export class ContributionLedger {
   private entries: LedgerEntry[] = [];
+  private proofs: Map<string, ContributionProof> = new Map(); // proofHash → proof (internal)
   private seenReceiptHashes = new Set<string>();
   private nextSeq = 0;
 
@@ -316,10 +318,10 @@ export class ContributionLedger {
       ? this.entries[this.entries.length - 1]!.entryHash
       : "0".repeat(64); // genesis entry
 
-    // Build the entry (without entryHash)
+    // Build the entry (without entryHash) — uses proofHash, not the full proof
     const entryWithoutHash: Omit<LedgerEntry, "entryHash"> = {
       sequence: seq,
-      proof,
+      proofHash: proof.receiptHash,
       verifiedAt: now,
       verifierId: verifierNodeId,
       verifierSignature: new Uint8Array(0), // placeholder — will be replaced
@@ -345,6 +347,7 @@ export class ContributionLedger {
     };
 
     this.entries.push(entry);
+    this.proofs.set(proof.receiptHash, proof);
     this.seenReceiptHashes.add(proof.receiptHash);
 
     return { ok: true, sequence: seq, entryHash };
@@ -372,7 +375,7 @@ export class ContributionLedger {
       // Verify verifier signature
       const entryWithoutHash: Omit<LedgerEntry, "entryHash"> = {
         sequence: entry.sequence,
-        proof: entry.proof,
+        proofHash: entry.proofHash,
         verifiedAt: entry.verifiedAt,
         verifierId: entry.verifierId,
         verifierSignature: entry.verifierSignature,
@@ -404,16 +407,25 @@ export class ContributionLedger {
     return this.entries;
   }
 
-  /** Get entries for a specific contributor. */
+  /** Get entries for a specific contributor (looks up proof internally). */
   getEntriesByContributor(contributorNodeId: string): readonly LedgerEntry[] {
-    return this.entries.filter((e) => e.proof.contributorNodeId === contributorNodeId);
+    return this.entries.filter((e) => {
+      const proof = this.proofs.get(e.proofHash);
+      return proof?.contributorNodeId === contributorNodeId;
+    });
   }
 
-  /** Total bytes forwarded by a contributor. */
+  /** Total bytes forwarded by a contributor (looks up proof internally). */
   getTotalBytesForwarded(contributorNodeId: string): number {
     return this.entries
-      .filter((e) => e.proof.contributorNodeId === contributorNodeId)
-      .reduce((sum, e) => sum + e.proof.bytesForwarded, 0);
+      .filter((e) => {
+        const proof = this.proofs.get(e.proofHash);
+        return proof?.contributorNodeId === contributorNodeId;
+      })
+      .reduce((sum, e) => {
+        const proof = this.proofs.get(e.proofHash);
+        return sum + (proof?.bytesForwarded ?? 0);
+      }, 0);
   }
 
   /** Total entries in the ledger. */
