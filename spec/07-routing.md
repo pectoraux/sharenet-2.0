@@ -136,6 +136,32 @@ integer-keyed CBOR maps (ADR-0004) over the semantically-significant
 fields. The `routeId` field is NOT included in the proposal or its
 canonical encoding.
 
+#### 5.1.1 SignedRouteProposal (Wire Object)
+
+The canonical signed wire object carrying a `RouteProposal` and its
+source signature. This is the object that is transmitted on the wire;
+the bare `RouteProposal` is the unsigned inner payload.
+
+```
+SignedRouteProposal = {
+  proposal:    RouteProposal,               ; the unsigned proposal
+  signature:   bstr .size 64,                ; Ed25519 by source
+}
+```
+
+The `signature` is over the proposal signing payload:
+```
+payload = utf8("SHARENET/ROUTE/PROPOSAL/1")
+    || canonicalEncode(proposal_fields)
+```
+
+where `canonicalEncode` produces an integer-keyed CBOR map (ADR-0004)
+over the semantically-significant fields of `RouteProposal` (excluding
+`routeId`, which is not present).
+
+This wire object is consumed by `createRouteProposal()` and verified
+via `verifySignature(sourcePublicKey, payload, signature)`.
+
 ### 5.2 RouteAcceptance
 
 Emitted by **each hop** in response to a RouteProposal. Acceptance is
