@@ -3,45 +3,49 @@
   "status": "frozen",
   "spec": "spec/08-circuits.md §4.8a, R-009 Stage 2",
   "adr": "adr/0021-return-onion-template-distribution.md",
-  "description": "GatewayReturnTemplate: the authenticated transfer wire object. The initiator signs the template binding it to (circuitId, commitmentRoot, noncePrefix, kRet, envelope, expiry, gatewayNodeId). The gateway verifies the signature + checks its own NodeId + expiry. Only the intended terminal gateway can accept the template. Domain: SHARENET/CIRCUIT/RETURN/TEMPLATE/1.",
+  "description": "GatewayReturnTemplate: the CONFIDENTIAL + authenticated transfer wire object. K_ret is encrypted to the gateway's X25519 public key (NOT plaintext). The initiator signs the complete binding including encryptedKRet + gatewayX25519PublicKey. The gateway verifies the signature + checks its own NodeId + X25519 public key + expiry, then decrypts K_ret via ECDH.",
   "sharedInputs": {
-    "commitmentRootHex": "e4879ba5bf939d339471bb7b8d18b4031bfb23e1ada58a5d47ac1d683081bca9",
-    "noncePrefixHex": "d969b3f82257e8ac",
-    "circuitIdHex": "e7a39107f99580ab98b221411605f4413fac05be5cdf17369fd65fa5efc2086a",
+    "commitmentRootHex": "7df07585c3a026c533511002394ab7a5d7e567972cc057492256918fe62b8d65",
+    "noncePrefixHex": "1c9693e7d2b0324e",
+    "circuitIdHex": "832946cb7ea03f5962dd9f303f4af94ab0b6e621409c3836b4ac945eb5abf28b",
     "initiatorX25519SecretKeyHex": "0101010101010101010101010101010101010101010101010101010101010101",
     "initiatorX25519PubHex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
     "relay0X25519SecretKeyHex": "0202020202020202020202020202020202020202020202020202020202020202",
     "relay0X25519PubHex": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
     "relay1X25519SecretKeyHex": "0303030303030303030303030303030303030303030303030303030303030303",
     "relay1X25519PubHex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22",
-    "returnKey0Hex": "7edff68776d3a31fabcaf1bfa0e9e658cf020a005596b617f8c5c37099738e3c",
-    "returnKey1Hex": "d207de113152b3dd9d75087771a3c7332759959d8fe11845e3c115383590e125",
+    "returnKey0Hex": "0e897ad51180b58c4b2479eb7c93483cf94adc72824836aa1451e03554f2fc2c",
+    "returnKey1Hex": "f3e4760a153e8fd8acc9d3a097ffaf932e717c7f0f3fbd712adf1d9f13b46226",
     "kRetHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "gatewayX25519SecretKeyHex": "0505050505050505050505050505050505050505050505050505050505050505",
+    "gatewayX25519PubHex": "50a61409b1ddd0325e9b16b700e719e9772c07000b1bd7786e907c653d20495d",
     "initiatorEd25519SecretKeyHex": "0404040404040404040404040404040404040404040404040404040404040404",
     "initiatorEd25519PubHex": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
-    "gatewayNodeId": "axhl2aheu6s36m2bkmtjfyuadp4fw4433ses4msjorwgimnmsjpa",
+    "gatewayNodeId": "x4mx4kns42cwasozppes7bjvveogusujwjcy47lk7qx5zsibazsq",
     "expiry": 1786880145,
     "referenceNow": 1786876545
   },
   "vectors": [
     {
       "name": "sign-gateway-template",
-      "description": "signGatewayReturnTemplate: initiator signs the template binding (circuitId, commitmentRoot, noncePrefix, kRet, envelope, expiry, gatewayNodeId).",
+      "description": "signGatewayReturnTemplate: initiator encrypts K_ret to the gateway's X25519 key + signs the complete binding.",
       "input": {},
       "expected": {
-        "gatewayNodeId": "axhl2aheu6s36m2bkmtjfyuadp4fw4433ses4msjorwgimnmsjpa",
+        "gatewayNodeId": "x4mx4kns42cwasozppes7bjvveogusujwjcy47lk7qx5zsibazsq",
         "expiry": 1786880145,
         "initiatorEd25519PubHex": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
-        "signatureHex": "752c724c13927a573ed0351f05f03d0b0aa397196f892f36458632a890df73dee354af30a221c8999b81c50bb58d108546d698da10eabb19c63215dfd15f0608",
-        "encodedHex": "a9015820e7a39107f99580ab98b221411605f4413fac05be5cdf17369fd65fa5efc2086a025820e4879ba5bf939d339471bb7b8d18b4031bfb23e1ada58a5d47ac1d683081bca90348d969b3f82257e8ac045820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05584081c5709470c7c3d39703bd32d92b70b8c88c2d3867cb1b31b53fbd4db15f9b05d181465570ba15966a8bf37f59b01d69b82b7e4a5dea1d9863baa1d98fdfc553061a6a81a0910778346178686c3261686575367333366d32626b6d746a66797561647034667734343333736573346d736a6f727767696d6e6d736a7061085820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c095840752c724c13927a573ed0351f05f03d0b0aa397196f892f36458632a890df73dee354af30a221c8999b81c50bb58d108546d698da10eabb19c63215dfd15f0608",
-        "encodedLen": 346
+        "gatewayX25519PubHex": "50a61409b1ddd0325e9b16b700e719e9772c07000b1bd7786e907c653d20495d",
+        "initiatorX25519PubHex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+        "encryptedKRetLen": 48,
+        "kRetNonceLen": 12,
+        "encodedLen": 446
       }
     },
     {
       "name": "decode-gateway-template",
       "description": "decodeGatewayReturnTemplate: decode the canonical CBOR wire bytes back to the GatewayReturnTemplate.",
       "input": {
-        "encodedHex": "a9015820e7a39107f99580ab98b221411605f4413fac05be5cdf17369fd65fa5efc2086a025820e4879ba5bf939d339471bb7b8d18b4031bfb23e1ada58a5d47ac1d683081bca90348d969b3f82257e8ac045820aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa05584081c5709470c7c3d39703bd32d92b70b8c88c2d3867cb1b31b53fbd4db15f9b05d181465570ba15966a8bf37f59b01d69b82b7e4a5dea1d9863baa1d98fdfc553061a6a81a0910778346178686c3261686575367333366d32626b6d746a66797561647034667734343333736573346d736a6f727767696d6e6d736a7061085820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c095840752c724c13927a573ed0351f05f03d0b0aa397196f892f36458632a890df73dee354af30a221c8999b81c50bb58d108546d698da10eabb19c63215dfd15f0608"
+        "encodedHex": "ac015820832946cb7ea03f5962dd9f303f4af94ab0b6e621409c3836b4ac945eb5abf28b0258207df07585c3a026c533511002394ab7a5d7e567972cc057492256918fe62b8d6503481c9693e7d2b0324e04583094953caa9e6b0226b026ff123b4ec391a5eeec22eaab44a22ad993fcb5ce4443afc83910dbc73e74f4d2b95251d8524e054c6f8a05b8126c7b69cb1d478906584013e8bf38964931a2cf6f130c40658ebde76f104e7129966bfd3720290e74f20940e81899bf7a0eb54a606fe8f00bc24bf4ba29b11813750d5566304543690bb3071a6a81a09108783478346d78346b6e733432637761736f7a7070657337626a7676656f677573756a776a637934376c6b377178357a736962617a737109582050a61409b1ddd0325e9b16b700e719e9772c07000b1bd7786e907c653d20495d0a5820a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a2090b5820ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c0c5840174cdda1aeb919b263afe27becdefe6ecb3cca2cea5cf2a410392a701e7addbc61a79df3102c1b3f05fca2e6a5935c70776db3b2d3a9c2bfe0d5790ac3ea8c0f"
       },
       "expected": {
         "ok": true
@@ -49,7 +53,7 @@
     },
     {
       "name": "verify-gateway-template",
-      "description": "verifyGatewayReturnTemplate: gateway verifies the signature + checks NodeId + expiry → accepts, extracts ReturnOnionTemplate.",
+      "description": "verifyGatewayReturnTemplate: gateway verifies signature + NodeId + X25519 key + expiry → decrypts K_ret → accepts.",
       "input": {},
       "expected": {
         "ok": true
@@ -57,13 +61,22 @@
     },
     {
       "name": "wrong-gateway-rejected",
-      "description": "verifyGatewayReturnTemplate with wrong gatewayNodeId → REJECT (only the intended gateway can accept).",
+      "description": "verifyGatewayReturnTemplate with wrong gatewayNodeId → REJECT.",
       "input": {
         "expectedGatewayNodeId": "wrong-node-id"
       },
       "expected": {
         "ok": false,
         "reasonContains": "gateway NodeId mismatch"
+      }
+    },
+    {
+      "name": "wrong-gateway-key-rejected",
+      "description": "verifyGatewayReturnTemplate with wrong gatewayX25519PublicKey → REJECT (identity-to-key substitution).",
+      "input": {},
+      "expected": {
+        "ok": false,
+        "reasonContains": "X25519 public key mismatch"
       }
     },
     {
@@ -78,10 +91,10 @@
       }
     },
     {
-      "name": "tampered-kret-rejected",
-      "description": "verifyGatewayReturnTemplate with tampered kRet → signature invalid → REJECT.",
+      "name": "tampered-encrypted-kret-rejected",
+      "description": "verifyGatewayReturnTemplate with tampered encryptedKRet → signature invalid → REJECT.",
       "input": {
-        "tamperedField": "kRet"
+        "tamperedField": "encryptedKRet"
       },
       "expected": {
         "ok": false,
@@ -102,6 +115,6 @@
   ],
   "verification": {
     "runner": "ts-vector-runner.ts:verifyCircuitGatewayTemplateVector + py_vector_verifier.py:verify_circuit_gateway_template_vector",
-    "notes": "Fixed seeds (initSk=0x01*32, relay0Sk=0x02*32, relay1Sk=0x03*32, kRet=0xAA*32, initEd25519Sk=0x04*32). The GatewayReturnTemplate is the authenticated transfer wire object — the initiator signs it, the gateway verifies the signature + checks its own NodeId + expiry. Only the intended terminal gateway can accept the template."
+    "notes": "Fixed seeds for reproducibility. K_ret is ENCRYPTED to the gateway's X25519 public key — NOT plaintext. The wire object carries encryptedKRet (48 bytes) + kRetNonce (12 bytes). The gateway decrypts K_ret via ECDH(gateway_x25519_secret, initiator_x25519_public) + HKDF + ChaCha20-Poly1305."
   }
 }

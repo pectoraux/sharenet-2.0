@@ -10,6 +10,7 @@
 
 import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { x25519 } from "@noble/curves/ed25519.js";
 import {
   keypairFromSecretKey,
   deriveNodeId,
@@ -1491,11 +1492,14 @@ function verifyCircuitGatewayTemplateVector(data: any): VectorResult {
 
   const commitmentRoot = hexToBytes(shared.commitmentRootHex);
   const initPub = hexToBytes(shared.initiatorX25519PubHex);
+  const initSk = hexToBytes(shared.initiatorX25519SecretKeyHex);
   const noncePrefix = deriveNoncePrefix(commitmentRoot, initPub);
   const circuitId = deriveCircuitId(commitmentRoot, initPub);
   const retKey0 = hexToBytes(shared.returnKey0Hex);
   const retKey1 = hexToBytes(shared.returnKey1Hex);
   const kRet = hexToBytes(shared.kRetHex);
+  const gwX25519Sk = hexToBytes(shared.gatewayX25519SecretKeyHex);
+  const gwX25519Pk = hexToBytes(shared.gatewayX25519PubHex);
   const initEd25519Sk = hexToBytes(shared.initiatorEd25519SecretKeyHex);
   const initEd25519Pk = hexToBytes(shared.initiatorEd25519PubHex);
   const gatewayNodeId = shared.gatewayNodeId;
@@ -1510,12 +1514,17 @@ function verifyCircuitGatewayTemplateVector(data: any): VectorResult {
       { hopIndex: 0, nodeId: "", forwardingKey: new Uint8Array(32), returnKey: retKey0, relayX25519PublicKey: new Uint8Array(32) },
       { hopIndex: 1, nodeId: "", forwardingKey: new Uint8Array(32), returnKey: retKey1, relayX25519PublicKey: new Uint8Array(32) },
     ],
+    initiatorX25519SecretKey: initSk,
+    initiatorX25519PublicKey: initPub,
   } as any;
 
-  // Construct the template + sign it once (shared across vectors).
+  // Construct the template + sign it (with confidential kRet encryption).
   const template = constructReturnOnionTemplate(circuit, kRet);
   const gatewayTemplate = signGatewayReturnTemplate(
-    template, expiry, gatewayNodeId, initEd25519Sk, initEd25519Pk,
+    template, expiry, gatewayNodeId,
+    gwX25519Pk,
+    initSk, initPub,
+    initEd25519Sk, initEd25519Pk,
   );
   const encoded = encodeGatewayReturnTemplate(gatewayTemplate);
 
@@ -1528,34 +1537,43 @@ function verifyCircuitGatewayTemplateVector(data: any): VectorResult {
       if (v.name === "sign-gateway-template") {
         if (gatewayTemplate.gatewayNodeId !== expected.gatewayNodeId) { caseOk = false; failures.push(`${v.name}: gatewayNodeId mismatch`); }
         if (gatewayTemplate.expiry !== expected.expiry) { caseOk = false; failures.push(`${v.name}: expiry mismatch`); }
-        if (toHex(gatewayTemplate.initiatorEd25519PublicKey) !== expected.initiatorEd25519PubHex) { caseOk = false; failures.push(`${v.name}: initiatorPub mismatch`); }
-        if (toHex(gatewayTemplate.initiatorSignature) !== expected.signatureHex) { caseOk = false; failures.push(`${v.name}: signature mismatch`); }
-        if (toHex(encoded) !== expected.encodedHex) { caseOk = false; failures.push(`${v.name}: encoded mismatch`); }
+        if (toHex(gatewayTemplate.initiatorEd25519PublicKey) !== expected.initiatorEd25519PubHex) { caseOk = false; failures.push(`${v.name}: initiatorEd25519Pub mismatch`); }
+        if (toHex(gatewayTemplate.gatewayX25519PublicKey) !== expected.gatewayX25519PubHex) { caseOk = false; failures.push(`${v.name}: gatewayX25519Pub mismatch`); }
+        if (toHex(gatewayTemplate.initiatorX25519PublicKey) !== expected.initiatorX25519PubHex) { caseOk = false; failures.push(`${v.name}: initiatorX25519Pub mismatch`); }
+        if (gatewayTemplate.encryptedKRet.length !== expected.encryptedKRetLen) { caseOk = false; failures.push(`${v.name}: encryptedKRetLen mismatch`); }
+        if (gatewayTemplate.kRetNonce.length !== expected.kRetNonceLen) { caseOk = false; failures.push(`${v.name}: kRetNonceLen mismatch`); }
         if (encoded.length !== expected.encodedLen) { caseOk = false; failures.push(`${v.name}: encodedLen ${encoded.length} != ${expected.encodedLen}`); }
       } else if (v.name === "decode-gateway-template") {
         const decoded = decodeGatewayReturnTemplate(hexToBytes(input.encodedHex));
         if (decoded.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${decoded.ok} != ${expected.ok}`); }
       } else if (v.name === "verify-gateway-template") {
-        const r = verifyGatewayReturnTemplate(gatewayTemplate, gatewayNodeId, now);
+        const r = verifyGatewayReturnTemplate(gatewayTemplate, gatewayNodeId, gwX25519Sk, gwX25519Pk, now);
         if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
       } else if (v.name === "wrong-gateway-rejected") {
-        const r = verifyGatewayReturnTemplate(gatewayTemplate, input.expectedGatewayNodeId, now);
+        const r = verifyGatewayReturnTemplate(gatewayTemplate, input.expectedGatewayNodeId, gwX25519Sk, gwX25519Pk, now);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+        else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
+      } else if (v.name === "wrong-gateway-key-rejected") {
+        // Use a different X25519 keypair for the gateway.
+        const wrongSk = new Uint8Array(32).fill(0x06);
+        const wrongPk = x25519.getPublicKey(wrongSk);
+        const r = verifyGatewayReturnTemplate(gatewayTemplate, gatewayNodeId, wrongSk, wrongPk, now);
         if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
         else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
       } else if (v.name === "expired-template-rejected") {
-        const r = verifyGatewayReturnTemplate(gatewayTemplate, gatewayNodeId, input.now);
+        const r = verifyGatewayReturnTemplate(gatewayTemplate, gatewayNodeId, gwX25519Sk, gwX25519Pk, input.now);
         if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
         else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
-      } else if (v.name === "tampered-kret-rejected") {
-        const tampered: GatewayReturnTemplate = { ...gatewayTemplate, kRet: new Uint8Array(32).fill(0xFF) };
-        const r = verifyGatewayReturnTemplate(tampered, gatewayNodeId, now);
+      } else if (v.name === "tampered-encrypted-kret-rejected") {
+        const tampered: GatewayReturnTemplate = { ...gatewayTemplate, encryptedKRet: new Uint8Array(48).fill(0xFF) };
+        const r = verifyGatewayReturnTemplate(tampered, gatewayNodeId, gwX25519Sk, gwX25519Pk, now);
         if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
         else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
       } else if (v.name === "tampered-signature-rejected") {
         const tamperedSig = new Uint8Array(gatewayTemplate.initiatorSignature);
         tamperedSig[0] ^= 0x01;
         const tampered: GatewayReturnTemplate = { ...gatewayTemplate, initiatorSignature: tamperedSig };
-        const r = verifyGatewayReturnTemplate(tampered, gatewayNodeId, now);
+        const r = verifyGatewayReturnTemplate(tampered, gatewayNodeId, gwX25519Sk, gwX25519Pk, now);
         if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
         else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
       } else {

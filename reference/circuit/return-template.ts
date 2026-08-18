@@ -60,7 +60,11 @@
  */
 
 import { randomBytes } from "@noble/hashes/utils.js";
-import { canonicalEncode, canonicalDecode, toHex } from "../encoding/cbor";
+import { x25519 } from "@noble/curves/ed25519.js";
+import { extract as hkdfExtract, expand as hkdfExpand } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
+import { canonicalEncode, canonicalDecode, toHex, bytesEqual } from "../encoding/cbor";
 import { signMessage, verifySignature } from "../identity/keys";
 import {
   buildNonce,
@@ -88,39 +92,51 @@ export const RETURN_PAYLOAD_DOMAIN = "SHARENET/CIRCUIT/RETURN/PAYLOAD/1";
 /** Domain tag for the GatewayReturnTemplate signing (binds the transfer to the gateway). */
 export const GATEWAY_RETURN_TEMPLATE_DOMAIN = "SHARENET/CIRCUIT/RETURN/TEMPLATE/1";
 
+/** Domain tag for the K_ret encryption (confidential delivery to the gateway). */
+export const GATEWAY_KRET_ENCRYPTION_DOMAIN = "SHARENET/CIRCUIT/RETURN/KRET/1";
+
 // -----------------------------------------------------------------------
-// GatewayReturnTemplate — authenticated transfer wire object (R-009 Stage 2)
+// GatewayReturnTemplate — confidential + authenticated transfer (R-009 Stage 2)
 // -----------------------------------------------------------------------
 
 /**
- * The authenticated gateway-template transfer wire object.
+ * The confidential + authenticated gateway-template transfer wire object.
  *
- * Per the re-audit of 67deef6: the ReturnOnionTemplate was constructed locally
- * but never crossed the network as an authenticated setup artifact. This wire
- * object solves that — it's the canonical message the initiator sends to the
- * gateway during setup, carrying the ReturnOnionTemplate + an Ed25519 signature
- * binding it to the terminal gateway's NodeId + the circuit identity.
+ * Per the re-audit of ca8736f: the previous GatewayReturnTemplate carried
+ * `kRet` in plaintext — any relay that intercepted the setup message could
+ * read it and decrypt return traffic. The signature provided authenticity
+ * but NOT confidentiality.
  *
- * The gateway calls verifyGatewayReturnTemplate() to authenticate the transfer:
- *   - Verify the initiator's Ed25519 signature over (circuitId, commitmentRoot,
- *     noncePrefix, kRet, envelope, expiry, gatewayNodeId).
- *   - Check gatewayNodeId matches its own NodeId (wrong gateway → reject).
- *   - Check the circuitId/commitmentRoot binding (wrong circuit → reject).
- *   - Check expiry (expired → reject).
+ * This wire object encrypts `kRet` to the gateway's X25519 public key:
+ *   sharedSecret = X25519(initiator_x25519_secret, gateway_x25519_public)
+ *   kRetKey = HKDF-SHA256(salt=commitment_root, ikm=sharedSecret,
+ *              info="SHARENET/CIRCUIT/RETURN/KRET/1" || circuitId)
+ *   encryptedKRet = ChaCha20-Poly1305(kRetKey, nonce, kRet, AD)
+ *
+ * The gateway decrypts `kRet` using its X25519 secret key:
+ *   sharedSecret = X25519(gateway_x25519_secret, initiator_x25519_public)
+ *   (same ECDH → same sharedSecret → same kRetKey → decrypts encryptedKRet)
  *
  * Security properties:
- *   - Only the INTENDED gateway (terminal hop, identified by gatewayNodeId)
- *     can trust the template. A relay that intercepts the transfer cannot use
- *     it (its NodeId won't match).
- *   - The signature prevents tampering with kRet or the envelope.
- *   - The circuitId/commitmentRoot binding prevents template replay onto a
- *     different circuit.
- *   - The expiry prevents stale-template reuse.
+ *   - CONFIDENTIALITY: a relay that intercepts the wire object sees
+ *     `encryptedKRet` but cannot recover `kRet` (it doesn't have the
+ *     gateway's X25519 secret key or the initiator's X25519 secret key).
+ *   - AUTHENTICITY: the initiator's Ed25519 signature binds the complete
+ *     transfer (circuitId, commitmentRoot, noncePrefix, encryptedKRet,
+ *     kRetNonce, envelope, expiry, gatewayNodeId, gatewayX25519PublicKey).
+ *   - GATEWAY AUTHORIZATION: the transfer is bound to (gatewayNodeId +
+ *     gatewayX25519PublicKey). The gateway must control BOTH the NodeId
+ *     AND the X25519 secret key to accept the template — preventing
+ *     identity-to-key substitution.
+ *   - NO CROSS-CIRCUIT REPLAY: the circuitId/commitmentRoot binding prevents
+ *     replaying the template onto a different circuit.
+ *   - NO STALE-TEMPLATE REUSE: the expiry check rejects expired templates.
  *
  * Wire format (canonical CBOR, integer-keyed map per ADR-0004):
- *   { 1: circuitId, 2: commitmentRoot, 3: noncePrefix, 4: kRet, 5: envelope,
- *     6: expiry, 7: gatewayNodeId, 8: initiatorEd25519PublicKey,
- *     9: initiatorSignature }
+ *   { 1: circuitId, 2: commitmentRoot, 3: noncePrefix, 4: encryptedKRet,
+ *     5: kRetNonce, 6: envelope, 7: expiry, 8: gatewayNodeId,
+ *     9: gatewayX25519PublicKey, 10: initiatorX25519PublicKey,
+ *     11: initiatorEd25519PublicKey, 12: initiatorSignature }
  */
 export interface GatewayReturnTemplate {
   /** The 32-byte CircuitId (binds to the circuit instance). */
@@ -129,17 +145,23 @@ export interface GatewayReturnTemplate {
   commitmentRoot: Uint8Array;
   /** The 64-bit nonce prefix (bound to the circuit instance per ADR-0020). */
   noncePrefix: Uint8Array;
-  /** The circuit-scoped return key K_ret (32 bytes). Held by the gateway. */
-  kRet: Uint8Array;
+  /** The encrypted K_ret (48 bytes = 32-byte K_ret + 16-byte AEAD tag). */
+  encryptedKRet: Uint8Array;
+  /** The 12-byte AEAD nonce used for the K_ret encryption. */
+  kRetNonce: Uint8Array;
   /** The outermost envelope layer (opaque to the gateway). N AEAD layers deep. */
   envelope: Uint8Array;
   /** Circuit expiry (unix seconds). The gateway rejects expired templates. */
   expiry: number;
   /** The terminal gateway's NodeId (binds the template to the intended gateway). */
   gatewayNodeId: string;
+  /** The terminal gateway's X25519 public key (the ECDH partner for K_ret decryption). */
+  gatewayX25519PublicKey: Uint8Array;
+  /** The initiator's X25519 public key (the ECDH partner — the gateway uses this). */
+  initiatorX25519PublicKey: Uint8Array;
   /** The initiator's Ed25519 public key (verifies the signature). */
   initiatorEd25519PublicKey: Uint8Array;
-  /** The initiator's Ed25519 signature over the binding payload. */
+  /** The initiator's Ed25519 signature over the complete binding payload. */
   initiatorSignature: Uint8Array;
 }
 
@@ -531,40 +553,74 @@ function decodeReturnFramePayload(bytes: Uint8Array): ReturnFramePayload {
 const GT_KEY_CIRCUIT_ID = 1;
 const GT_KEY_COMMITMENT_ROOT = 2;
 const GT_KEY_NONCE_PREFIX = 3;
-const GT_KEY_K_RET = 4;
-const GT_KEY_ENVELOPE = 5;
-const GT_KEY_EXPIRY = 6;
-const GT_KEY_GATEWAY_NODE_ID = 7;
-const GT_KEY_INITIATOR_PUBKEY = 8;
-const GT_KEY_INITIATOR_SIGNATURE = 9;
+const GT_KEY_ENCRYPTED_K_RET = 4;
+const GT_KEY_K_RET_NONCE = 5;
+const GT_KEY_ENVELOPE = 6;
+const GT_KEY_EXPIRY = 7;
+const GT_KEY_GATEWAY_NODE_ID = 8;
+const GT_KEY_GATEWAY_X25519_PUBKEY = 9;
+const GT_KEY_INITIATOR_X25519_PUBKEY = 10;
+const GT_KEY_INITIATOR_ED25519_PUBKEY = 11;
+const GT_KEY_INITIATOR_SIGNATURE = 12;
+
+/**
+ * Derive the K_ret encryption key from the ECDH shared secret.
+ *
+ * kRetKey = HKDF-SHA256(salt=commitment_root, ikm=sharedSecret,
+ *   info="SHARENET/CIRCUIT/RETURN/KRET/1" || circuitId)
+ *
+ * The initiator uses X25519(initiator_x25519_secret, gateway_x25519_public).
+ * The gateway uses X25519(gateway_x25519_secret, initiator_x25519_public).
+ * Both produce the same sharedSecret → same kRetKey.
+ */
+function deriveKRetEncryptionKey(
+  sharedSecret: Uint8Array,
+  commitmentRoot: Uint8Array,
+  circuitId: Uint8Array,
+): Uint8Array {
+  const prk = hkdfExtract(sha256, sharedSecret, commitmentRoot);
+  const domain = new TextEncoder().encode(GATEWAY_KRET_ENCRYPTION_DOMAIN);
+  const info = new Uint8Array(domain.length + circuitId.length);
+  info.set(domain, 0);
+  info.set(circuitId, domain.length);
+  return hkdfExpand(sha256, prk, info, 32);
+}
 
 /**
  * Compute the signing payload for a GatewayReturnTemplate.
  *
  * The payload binds: domain || circuitId || commitmentRoot || noncePrefix ||
- * kRet || envelope || expiry || gatewayNodeId.
+ * encryptedKRet || kRetNonce || envelope || expiry || gatewayNodeId ||
+ * gatewayX25519PublicKey || initiatorX25519PublicKey.
  *
- * The initiator signs this with its Ed25519 key. The gateway verifies the
- * signature to authenticate the transfer (the initiator is who it claims to
- * be + the template has not been tampered with).
+ * NOTE: the payload signs the ENCRYPTED kRet (encryptedKRet), NOT the plaintext
+ * kRet. This means the signature is verifiable by anyone (it doesn't require
+ * decrypting kRet), but it binds the encrypted ciphertext to the circuit identity
+ * — preventing substitution of a different encryptedKRet.
  */
 export function gatewayReturnTemplateSigningPayload(
   circuitId: Uint8Array,
   commitmentRoot: Uint8Array,
   noncePrefix: Uint8Array,
-  kRet: Uint8Array,
+  encryptedKRet: Uint8Array,
+  kRetNonce: Uint8Array,
   envelope: Uint8Array,
   expiry: number,
   gatewayNodeId: string,
+  gatewayX25519PublicKey: Uint8Array,
+  initiatorX25519PublicKey: Uint8Array,
 ): Uint8Array {
   const m = new Map<number, unknown>([
     [1, circuitId],
     [2, commitmentRoot],
     [3, noncePrefix],
-    [4, kRet],
-    [5, envelope],
-    [6, expiry],
-    [7, gatewayNodeId],
+    [4, encryptedKRet],
+    [5, kRetNonce],
+    [6, envelope],
+    [7, expiry],
+    [8, gatewayNodeId],
+    [9, gatewayX25519PublicKey],
+    [10, initiatorX25519PublicKey],
   ]);
   const body = canonicalEncode(m);
   const domain = new TextEncoder().encode(GATEWAY_RETURN_TEMPLATE_DOMAIN);
@@ -575,44 +631,75 @@ export function gatewayReturnTemplateSigningPayload(
 }
 
 /**
- * Construct a signed GatewayReturnTemplate.
+ * Construct a signed + confidential GatewayReturnTemplate.
  *
- * The INITIATOR calls this after `constructReturnOnionTemplate()` — it wraps
- * the template + signs the binding payload with the initiator's Ed25519 key.
+ * The INITIATOR calls this after `constructReturnOnionTemplate()`. It:
+ *   1. Derives the ECDH shared secret: X25519(initiator_x25519_secret, gateway_x25519_public).
+ *   2. Derives the K_ret encryption key via HKDF.
+ *   3. Encrypts K_ret with ChaCha20-Poly1305 → encryptedKRet.
+ *   4. Signs the complete binding (including encryptedKRet + gatewayX25519PublicKey).
+ *
  * The result is the canonical wire object sent to the gateway during setup.
+ * K_ret is NOT carried in plaintext — only the intended gateway can decrypt it.
  *
  * @param template - the ReturnOnionTemplate (from constructReturnOnionTemplate)
  * @param expiry - the circuit expiry (unix seconds)
- * @param gatewayNodeId - the terminal gateway's NodeId (from the route's last hop)
- * @param initiatorEd25519SecretKey - the initiator's Ed25519 secret key
- * @param initiatorEd25519PublicKey - the initiator's Ed25519 public key
- * @returns the signed GatewayReturnTemplate wire object
+ * @param gatewayNodeId - the terminal gateway's NodeId
+ * @param gatewayX25519PublicKey - the gateway's X25519 public key (from CircuitSetupAck)
+ * @param initiatorX25519SecretKey - the initiator's X25519 ephemeral secret key
+ * @param initiatorX25519PublicKey - the initiator's X25519 ephemeral public key
+ * @param initiatorEd25519SecretKey - the initiator's Ed25519 node identity secret key
+ * @param initiatorEd25519PublicKey - the initiator's Ed25519 node identity public key
+ * @returns the signed + confidential GatewayReturnTemplate wire object
  */
 export function signGatewayReturnTemplate(
   template: ReturnOnionTemplate,
   expiry: number,
   gatewayNodeId: string,
+  gatewayX25519PublicKey: Uint8Array,
+  initiatorX25519SecretKey: Uint8Array,
+  initiatorX25519PublicKey: Uint8Array,
   initiatorEd25519SecretKey: Uint8Array,
   initiatorEd25519PublicKey: Uint8Array,
 ): GatewayReturnTemplate {
+  // 1. Derive the ECDH shared secret (initiator ↔ gateway).
+  const sharedSecret = x25519.getSharedSecret(initiatorX25519SecretKey, gatewayX25519PublicKey);
+
+  // 2. Derive the K_ret encryption key.
+  const kRetKey = deriveKRetEncryptionKey(sharedSecret, template.commitmentRoot, template.circuitId);
+
+  // 3. Encrypt K_ret with ChaCha20-Poly1305.
+  const kRetNonce = randomBytes(AEAD_NONCE_BYTES);
+  const kRetAD = new TextEncoder().encode(GATEWAY_KRET_ENCRYPTION_DOMAIN);
+  const cipher = chacha20poly1305(kRetKey, kRetNonce, kRetAD);
+  const encryptedKRet = cipher.encrypt(template.kRet);
+
+  // 4. Sign the complete binding (including encryptedKRet + gatewayX25519PublicKey).
   const payload = gatewayReturnTemplateSigningPayload(
     template.circuitId,
     template.commitmentRoot,
     template.noncePrefix,
-    template.kRet,
+    encryptedKRet,
+    kRetNonce,
     template.envelope,
     expiry,
     gatewayNodeId,
+    gatewayX25519PublicKey,
+    initiatorX25519PublicKey,
   );
   const signature = signMessage(initiatorEd25519SecretKey, payload);
+
   return {
     circuitId: template.circuitId,
     commitmentRoot: template.commitmentRoot,
     noncePrefix: template.noncePrefix,
-    kRet: template.kRet,
+    encryptedKRet,
+    kRetNonce,
     envelope: template.envelope,
     expiry,
     gatewayNodeId,
+    gatewayX25519PublicKey,
+    initiatorX25519PublicKey,
     initiatorEd25519PublicKey,
     initiatorSignature: signature,
   };
@@ -624,26 +711,35 @@ export type VerifyGatewayReturnTemplateResult =
   | { ok: false; reason: string };
 
 /**
- * Verify a GatewayReturnTemplate at the gateway.
+ * Verify + decrypt a GatewayReturnTemplate at the gateway.
  *
  * The GATEWAY calls this when it receives the template transfer. It:
- *   1. Verifies the initiator's Ed25519 signature (authenticates the transfer).
- *   2. Checks gatewayNodeId matches the gateway's own NodeId (wrong gateway → reject).
+ *   1. Checks gatewayNodeId matches the gateway's own NodeId (wrong gateway → reject).
+ *   2. Checks gatewayX25519PublicKey matches the gateway's own X25519 public key
+ *      (prevents identity-to-key substitution).
  *   3. Checks expiry (expired → reject).
+ *   4. Verifies the initiator's Ed25519 signature over the complete binding
+ *      (tampered → reject).
+ *   5. Derives the ECDH shared secret: X25519(gateway_x25519_secret, initiator_x25519_public).
+ *   6. Decrypts encryptedKRet → recovers K_ret.
  *
  * If all checks pass, it returns the extracted ReturnOnionTemplate (K_ret +
  * envelope) which the gateway stores + uses to seal return responses.
  *
- * @param gatewayTemplate - the signed GatewayReturnTemplate wire object
+ * @param gatewayTemplate - the signed + confidential GatewayReturnTemplate wire object
  * @param expectedGatewayNodeId - the gateway's own NodeId
+ * @param gatewayX25519SecretKey - the gateway's own X25519 secret key (for ECDH decryption)
+ * @param gatewayX25519PublicKey - the gateway's own X25519 public key (for binding check)
  * @param now - the current time (unix seconds)
  */
 export function verifyGatewayReturnTemplate(
   gatewayTemplate: GatewayReturnTemplate,
   expectedGatewayNodeId: string,
+  gatewayX25519SecretKey: Uint8Array,
+  gatewayX25519PublicKey: Uint8Array,
   now: number,
 ): VerifyGatewayReturnTemplateResult {
-  // 1. Check gatewayNodeId — only the intended gateway can accept this template.
+  // 1. Check gatewayNodeId.
   if (gatewayTemplate.gatewayNodeId !== expectedGatewayNodeId) {
     return {
       ok: false,
@@ -651,7 +747,15 @@ export function verifyGatewayReturnTemplate(
     };
   }
 
-  // 2. Check expiry — reject stale templates.
+  // 2. Check gatewayX25519PublicKey (prevents identity-to-key substitution).
+  if (!bytesEqual(gatewayTemplate.gatewayX25519PublicKey, gatewayX25519PublicKey)) {
+    return {
+      ok: false,
+      reason: "gateway X25519 public key mismatch (identity-to-key substitution attempt)",
+    };
+  }
+
+  // 3. Check expiry.
   if (gatewayTemplate.expiry <= now) {
     return {
       ok: false,
@@ -659,26 +763,43 @@ export function verifyGatewayReturnTemplate(
     };
   }
 
-  // 3. Verify the initiator's Ed25519 signature (authenticates the transfer).
+  // 4. Verify the initiator's Ed25519 signature.
   const payload = gatewayReturnTemplateSigningPayload(
     gatewayTemplate.circuitId,
     gatewayTemplate.commitmentRoot,
     gatewayTemplate.noncePrefix,
-    gatewayTemplate.kRet,
+    gatewayTemplate.encryptedKRet,
+    gatewayTemplate.kRetNonce,
     gatewayTemplate.envelope,
     gatewayTemplate.expiry,
     gatewayTemplate.gatewayNodeId,
+    gatewayTemplate.gatewayX25519PublicKey,
+    gatewayTemplate.initiatorX25519PublicKey,
   );
   if (!verifySignature(gatewayTemplate.initiatorEd25519PublicKey, payload, gatewayTemplate.initiatorSignature)) {
     return { ok: false, reason: "initiator signature invalid (tampered template or wrong initiator)" };
   }
 
-  // 4. Extract the ReturnOnionTemplate (K_ret + envelope).
+  // 5. Derive the ECDH shared secret (gateway ↔ initiator).
+  const sharedSecret = x25519.getSharedSecret(gatewayX25519SecretKey, gatewayTemplate.initiatorX25519PublicKey);
+
+  // 6. Derive the K_ret encryption key + decrypt.
+  const kRetKey = deriveKRetEncryptionKey(sharedSecret, gatewayTemplate.commitmentRoot, gatewayTemplate.circuitId);
+  const kRetAD = new TextEncoder().encode(GATEWAY_KRET_ENCRYPTION_DOMAIN);
+  const cipher = chacha20poly1305(kRetKey, gatewayTemplate.kRetNonce, kRetAD);
+  let kRet: Uint8Array;
+  try {
+    kRet = cipher.decrypt(gatewayTemplate.encryptedKRet);
+  } catch (e) {
+    return { ok: false, reason: `K_ret decryption failed: ${(e as Error).message} (wrong gateway key or tampered ciphertext)` };
+  }
+
+  // 7. Extract the ReturnOnionTemplate.
   const template: ReturnOnionTemplate = {
     circuitId: gatewayTemplate.circuitId,
     commitmentRoot: gatewayTemplate.commitmentRoot,
     noncePrefix: gatewayTemplate.noncePrefix,
-    kRet: gatewayTemplate.kRet,
+    kRet,
     envelope: gatewayTemplate.envelope,
   };
   return { ok: true, template };
@@ -687,21 +808,25 @@ export function verifyGatewayReturnTemplate(
 /**
  * Encode a GatewayReturnTemplate to canonical CBOR for the wire.
  *
- * Per ADR-0004: integer-keyed map. The 9-field structure is:
- *   { 1: circuitId, 2: commitmentRoot, 3: noncePrefix, 4: kRet, 5: envelope,
- *     6: expiry, 7: gatewayNodeId, 8: initiatorEd25519PublicKey,
- *     9: initiatorSignature }
+ * Per ADR-0004: integer-keyed map. The 12-field structure is:
+ *   { 1: circuitId, 2: commitmentRoot, 3: noncePrefix, 4: encryptedKRet,
+ *     5: kRetNonce, 6: envelope, 7: expiry, 8: gatewayNodeId,
+ *     9: gatewayX25519PublicKey, 10: initiatorX25519PublicKey,
+ *     11: initiatorEd25519PublicKey, 12: initiatorSignature }
  */
 export function encodeGatewayReturnTemplate(gt: GatewayReturnTemplate): Uint8Array {
   const m = new Map<number, unknown>([
     [GT_KEY_CIRCUIT_ID, gt.circuitId],
     [GT_KEY_COMMITMENT_ROOT, gt.commitmentRoot],
     [GT_KEY_NONCE_PREFIX, gt.noncePrefix],
-    [GT_KEY_K_RET, gt.kRet],
+    [GT_KEY_ENCRYPTED_K_RET, gt.encryptedKRet],
+    [GT_KEY_K_RET_NONCE, gt.kRetNonce],
     [GT_KEY_ENVELOPE, gt.envelope],
     [GT_KEY_EXPIRY, gt.expiry],
     [GT_KEY_GATEWAY_NODE_ID, gt.gatewayNodeId],
-    [GT_KEY_INITIATOR_PUBKEY, gt.initiatorEd25519PublicKey],
+    [GT_KEY_GATEWAY_X25519_PUBKEY, gt.gatewayX25519PublicKey],
+    [GT_KEY_INITIATOR_X25519_PUBKEY, gt.initiatorX25519PublicKey],
+    [GT_KEY_INITIATOR_ED25519_PUBKEY, gt.initiatorEd25519PublicKey],
     [GT_KEY_INITIATOR_SIGNATURE, gt.initiatorSignature],
   ]);
   return canonicalEncode(m);
@@ -728,11 +853,14 @@ export function decodeGatewayReturnTemplate(bytes: Uint8Array): { ok: true; gate
   const circuitId = m.get(GT_KEY_CIRCUIT_ID);
   const commitmentRoot = m.get(GT_KEY_COMMITMENT_ROOT);
   const noncePrefix = m.get(GT_KEY_NONCE_PREFIX);
-  const kRet = m.get(GT_KEY_K_RET);
+  const encryptedKRet = m.get(GT_KEY_ENCRYPTED_K_RET);
+  const kRetNonce = m.get(GT_KEY_K_RET_NONCE);
   const envelope = m.get(GT_KEY_ENVELOPE);
   const expiry = m.get(GT_KEY_EXPIRY);
   const gatewayNodeId = m.get(GT_KEY_GATEWAY_NODE_ID);
-  const initiatorPub = m.get(GT_KEY_INITIATOR_PUBKEY);
+  const gatewayX25519Pub = m.get(GT_KEY_GATEWAY_X25519_PUBKEY);
+  const initiatorX25519Pub = m.get(GT_KEY_INITIATOR_X25519_PUBKEY);
+  const initiatorEd25519Pub = m.get(GT_KEY_INITIATOR_ED25519_PUBKEY);
   const signature = m.get(GT_KEY_INITIATOR_SIGNATURE);
 
   if (!(circuitId instanceof Uint8Array) || circuitId.length !== 32) {
@@ -744,8 +872,12 @@ export function decodeGatewayReturnTemplate(bytes: Uint8Array): { ok: true; gate
   if (!(noncePrefix instanceof Uint8Array) || noncePrefix.length !== 8) {
     return { ok: false, reason: "noncePrefix must be an 8-byte bstr" };
   }
-  if (!(kRet instanceof Uint8Array) || kRet.length !== 32) {
-    return { ok: false, reason: "kRet must be a 32-byte bstr" };
+  // encryptedKRet = 32-byte K_ret + 16-byte AEAD tag = 48 bytes.
+  if (!(encryptedKRet instanceof Uint8Array) || encryptedKRet.length !== 48) {
+    return { ok: false, reason: "encryptedKRet must be a 48-byte bstr (32 + 16 AEAD tag)" };
+  }
+  if (!(kRetNonce instanceof Uint8Array) || kRetNonce.length !== 12) {
+    return { ok: false, reason: "kRetNonce must be a 12-byte bstr" };
   }
   if (!(envelope instanceof Uint8Array) || envelope.length < 16) {
     return { ok: false, reason: "envelope must be a bstr of at least 16 bytes" };
@@ -756,7 +888,13 @@ export function decodeGatewayReturnTemplate(bytes: Uint8Array): { ok: true; gate
   if (typeof gatewayNodeId !== "string") {
     return { ok: false, reason: "gatewayNodeId must be a text string" };
   }
-  if (!(initiatorPub instanceof Uint8Array) || initiatorPub.length !== 32) {
+  if (!(gatewayX25519Pub instanceof Uint8Array) || gatewayX25519Pub.length !== 32) {
+    return { ok: false, reason: "gatewayX25519PublicKey must be a 32-byte bstr" };
+  }
+  if (!(initiatorX25519Pub instanceof Uint8Array) || initiatorX25519Pub.length !== 32) {
+    return { ok: false, reason: "initiatorX25519PublicKey must be a 32-byte bstr" };
+  }
+  if (!(initiatorEd25519Pub instanceof Uint8Array) || initiatorEd25519Pub.length !== 32) {
     return { ok: false, reason: "initiatorEd25519PublicKey must be a 32-byte bstr" };
   }
   if (!(signature instanceof Uint8Array) || signature.length !== 64) {
@@ -769,11 +907,14 @@ export function decodeGatewayReturnTemplate(bytes: Uint8Array): { ok: true; gate
       circuitId,
       commitmentRoot,
       noncePrefix,
-      kRet,
+      encryptedKRet,
+      kRetNonce,
       envelope,
       expiry,
       gatewayNodeId,
-      initiatorEd25519PublicKey: initiatorPub,
+      gatewayX25519PublicKey: gatewayX25519Pub,
+      initiatorX25519PublicKey: initiatorX25519Pub,
+      initiatorEd25519PublicKey: initiatorEd25519Pub,
       initiatorSignature: signature,
     },
   };

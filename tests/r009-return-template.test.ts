@@ -400,15 +400,23 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const template = constructReturnOnionTemplate(circuit);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
+    // Fresh gateway X25519 keypair (the gateway's own ECDH keypair — NOT the
+    // circuit's per-hop relayX25519 keys, which are owned by the relays).
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
 
-    // Initiator signs the gateway template.
+    // Initiator signs the gateway template (encrypting K_ret under the ECDH
+    // shared secret with the gateway's X25519 public key).
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
-    // Gateway verifies — matches its own NodeId + valid signature + not expired.
-    const result = verifyGatewayReturnTemplate(gt, gatewayNodeId, NOW);
+    // Gateway verifies — matches its own NodeId + own X25519 pubkey + valid signature + not expired.
+    // The gateway decrypts K_ret using its own X25519 secret key.
+    const result = verifyGatewayReturnTemplate(gt, gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     // The recovered template has the correct K_ret + envelope.
@@ -424,9 +432,13 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const template = constructReturnOnionTemplate(circuit);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
 
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
     const encoded = encodeGatewayReturnTemplate(gt);
@@ -434,6 +446,10 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
     expect(toHex(decoded.gatewayTemplate.circuitId)).toBe(toHex(gt.circuitId));
+    expect(toHex(decoded.gatewayTemplate.encryptedKRet)).toBe(toHex(gt.encryptedKRet));
+    expect(toHex(decoded.gatewayTemplate.kRetNonce)).toBe(toHex(gt.kRetNonce));
+    expect(toHex(decoded.gatewayTemplate.gatewayX25519PublicKey)).toBe(toHex(gt.gatewayX25519PublicKey));
+    expect(toHex(decoded.gatewayTemplate.initiatorX25519PublicKey)).toBe(toHex(gt.initiatorX25519PublicKey));
     expect(toHex(decoded.gatewayTemplate.initiatorSignature)).toBe(toHex(gt.initiatorSignature));
     expect(decoded.gatewayTemplate.gatewayNodeId).toBe(gt.gatewayNodeId);
   });
@@ -446,15 +462,20 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const template = constructReturnOnionTemplate(circuit);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
 
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
-    // A different node (e.g., relay 0) tries to accept → REJECTED.
+    // A different node (e.g., relay 0) tries to accept → REJECTED at the
+    // gatewayNodeId binding check (before any signature / decryption check).
     const wrongNodeId = route.branded.hops[0]!.nodeId;
-    const result = verifyGatewayReturnTemplate(gt, wrongNodeId, NOW);
+    const result = verifyGatewayReturnTemplate(gt, wrongNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("gateway NodeId mismatch");
   });
@@ -467,19 +488,25 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const template = constructReturnOnionTemplate(circuit);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
 
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
     // now > expiry → REJECTED.
-    const result = verifyGatewayReturnTemplate(gt, gatewayNodeId, route.branded.expiry + 1);
+    const result = verifyGatewayReturnTemplate(
+      gt, gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, route.branded.expiry + 1,
+    );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("expired");
   });
 
-  test("tampered K_ret → signature invalid → REJECT", () => {
+  test("tampered encryptedKRet → signature invalid → REJECT", () => {
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
@@ -487,15 +514,22 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const template = constructReturnOnionTemplate(circuit);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
 
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
-    // Tamper K_ret.
-    const tampered = { ...gt, kRet: new Uint8Array(32).fill(0xFF) };
-    const result = verifyGatewayReturnTemplate(tampered, gatewayNodeId, NOW);
+    // Tamper encryptedKRet (48 bytes = 32-byte K_ret + 16-byte AEAD tag).
+    // The signature was over the ORIGINAL encryptedKRet — replacing it with
+    // a different value breaks the signature check (caught BEFORE the gateway
+    // ever attempts to decrypt the tampered ciphertext).
+    const tampered = { ...gt, encryptedKRet: new Uint8Array(48).fill(0xFF) };
+    const result = verifyGatewayReturnTemplate(tampered, gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("signature invalid");
   });
@@ -508,9 +542,13 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const template = constructReturnOnionTemplate(circuit);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
 
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
@@ -518,7 +556,7 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const tamperedSig = new Uint8Array(gt.initiatorSignature);
     tamperedSig[0] ^= 0x01;
     const tampered = { ...gt, initiatorSignature: tamperedSig };
-    const result = verifyGatewayReturnTemplate(tampered, gatewayNodeId, NOW);
+    const result = verifyGatewayReturnTemplate(tampered, gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("signature invalid");
   });
@@ -534,27 +572,38 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const initiatorKp = generateNodeKeypair();
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    // The gateway's own X25519 keypair (ECDH partner for K_ret decryption).
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
 
     // 1. Initiator constructs the template + signs the gateway transfer.
+    //    K_ret is encrypted under ECDH(initiator X25519, gateway X25519) →
+    //    the wire object carries encryptedKRet + kRetNonce, NOT plaintext kRet.
     const template = constructReturnOnionTemplate(circuit);
     const gatewayTemplate = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
     // 2. "Network transfer": encode → decode (simulating the wire).
+    //    A relay intercepting the wire bytes sees encryptedKRet (48 bytes) +
+    //    kRetNonce (12 bytes) but CANNOT recover K_ret without the gateway's
+    //    X25519 secret key (proven by the adversarial tests below).
     const wireBytes = encodeGatewayReturnTemplate(gatewayTemplate);
     const decoded = decodeGatewayReturnTemplate(wireBytes);
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
 
     // 3. Gateway verifies the transfer — accepts the template.
+    //    The gateway uses its OWN X25519 secret key to decrypt K_ret.
     const verifyResult = verifyGatewayReturnTemplate(
-      decoded.gatewayTemplate, gatewayNodeId, NOW,
+      decoded.gatewayTemplate, gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
     );
     expect(verifyResult.ok).toBe(true);
     if (!verifyResult.ok) return;
-    const gatewayTemplate_ = verifyResult.template; // K_ret + envelope
+    const gatewayTemplate_ = verifyResult.template; // K_ret + envelope (decrypted)
 
     // 4. Gateway seals a real response using the accepted template.
     const httpResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
@@ -577,5 +626,143 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     expect(r0.ok).toBe(true);
     if (!r0.ok) return;
     expect(new TextDecoder().decode(r0.plaintext)).toBe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+  });
+
+  test("relay intercepts template → cannot recover K_ret (wire object carries encryptedKRet, NOT plaintext kRet)", () => {
+    // Adversarial test: a relay (or any network observer) that intercepts the
+    // GatewayReturnTemplate wire object sees encryptedKRet + kRetNonce but
+    // has NO way to recover K_ret without the gateway's X25519 secret key.
+    // The wire object MUST NOT carry a plaintext `kRet` field.
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // The wire object carries encryptedKRet (48 bytes = 32 K_ret + 16 AEAD tag).
+    expect(gt.encryptedKRet).toBeDefined();
+    expect(gt.encryptedKRet.length).toBe(48);
+    expect(gt.kRetNonce).toBeDefined();
+    expect(gt.kRetNonce.length).toBe(12);
+    expect(gt.gatewayX25519PublicKey).toBeDefined();
+    expect(gt.gatewayX25519PublicKey.length).toBe(32);
+    expect(gt.initiatorX25519PublicKey).toBeDefined();
+    expect(gt.initiatorX25519PublicKey.length).toBe(32);
+
+    // The wire object MUST NOT carry a plaintext `kRet` field.
+    expect((gt as any).kRet).toBeUndefined();
+
+    // Even after encode → decode, the wire bytes do not expose plaintext K_ret:
+    // the only K_ret-bearing field is the AEAD-encrypted encryptedKRet.
+    const wireBytes = encodeGatewayReturnTemplate(gt);
+    expect(wireBytes.length).toBeGreaterThan(0);
+    const decoded = decodeGatewayReturnTemplate(wireBytes);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect((decoded.gatewayTemplate as any).kRet).toBeUndefined();
+    expect(decoded.gatewayTemplate.encryptedKRet.length).toBe(48);
+
+    // The encryptedKRet must NOT start with the plaintext K_ret bytes —
+    // ChaCha20-Poly1305 is a stream cipher, but it generates a keystream that
+    // is XORed with the plaintext, so the ciphertext bytes do not equal the
+    // plaintext. (The real confidentiality proof is the wrong-ECDH-secret
+    // test below: without the matching gateway X25519 secret, decryption
+    // fails entirely.)
+    const encryptedFirst32 = toHex(decoded.gatewayTemplate.encryptedKRet.slice(0, 32));
+    const plaintextKRet = toHex(template.kRet);
+    expect(encryptedFirst32).not.toBe(plaintextKRet);
+  });
+
+  test("wrong gateway X25519 key → REJECT (identity-to-key substitution attempt)", () => {
+    // Adversarial test: an attacker who controls the right NodeId (or a relay
+    // trying to spoof the gateway) but does NOT control the gateway's X25519
+    // secret key cannot accept the template — the gatewayX25519PublicKey
+    // binding check fails before any signature / decryption is attempted.
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // An attacker presents a DIFFERENT X25519 keypair to the verifier (e.g.,
+    // a relay that controls the gateway's NodeId through registry compromise
+    // but doesn't control the gateway's actual X25519 secret key). The
+    // gatewayX25519PublicKey binding check fails FIRST → REJECT.
+    const wrongGatewayX25519Sk = randomBytes(32);
+    const wrongGatewayX25519Pk = x25519.getPublicKey(wrongGatewayX25519Sk);
+    const result = verifyGatewayReturnTemplate(
+      gt, gatewayNodeId, wrongGatewayX25519Sk, wrongGatewayX25519Pk, NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("gateway X25519 public key mismatch");
+  });
+
+  test("valid signature + matching gateway pubkey but wrong ECDH secret → K_ret decryption fails → REJECT", () => {
+    // Adversarial test: the deepest defense layer. Imagine the gateway's
+    // stored `gatewayX25519PublicKey` matches the template (so the
+    // gatewayX25519PublicKey binding check at step 2 PASSES) AND the
+    // initiator's signature verifies (step 4 PASSES — the attacker has a
+    // genuinely-initiator-signed template they captured earlier). The only
+    // way to reach the AEAD decryption step is to supply a `gatewayX25519SecretKey`
+    // that does NOT correspond to the `gatewayX25519PublicKey` the template
+    // was encrypted under (simulating a key-storage corruption / key-rotation
+    // mismatch / VM-migration key drift). The ECDH then yields a different
+    // shared secret than what the initiator used to derive kRetKey → AEAD
+    // decryption fails → REJECT with "K_ret decryption failed".
+    //
+    // This proves that the gateway's actual possession of the matching X25519
+    // SECRET key (not just the public key) is enforced at decryption time —
+    // closing the defense-in-depth chain: NodeId → pubkey binding → expiry →
+    // signature → ECDH decryption.
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    // Sign with the REAL gateway pubkey + REAL initiator X25519 keypair.
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // Verifier: pass the ORIGINAL gatewayX25519PublicKey (so the binding check
+    // at step 2 passes + signature at step 4 passes — the signature covers
+    // gatewayX25519PublicKey), but pass a DIFFERENT secret key — so ECDH at
+    // step 5 yields a wrong shared secret → step 6 AEAD decrypt fails.
+    const corruptedGatewaySk = randomBytes(32);
+    const result = verifyGatewayReturnTemplate(
+      gt, gatewayNodeId, corruptedGatewaySk, gatewayX25519Pk, NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("K_ret decryption failed");
   });
 });

@@ -775,10 +775,15 @@ export async function establishDistributedCircuit(
   //    See ADR-0021.
   const returnTemplate = constructReturnOnionTemplate(circuit);
   const gatewayNodeId = route.hops[route.hops.length - 1]!.nodeId;
+  // The gateway's X25519 public key is from the LAST ack (the terminal hop).
+  const gatewayX25519PublicKey = acks[acks.length - 1]!.relayX25519PublicKey;
   const gatewayReturnTemplate = signGatewayReturnTemplate(
     returnTemplate,
     route.expiry,
     gatewayNodeId,
+    gatewayX25519PublicKey,
+    initiatorX25519SecretKey,
+    initiatorX25519PublicKey,
     initiatorEd25519SecretKey,
     initiatorEd25519PublicKey,
   );

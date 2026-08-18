@@ -33,6 +33,11 @@ import blake3
 import cbor2
 from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
+from cryptography.hazmat.primitives.asymmetric.x25519 import (
+    X25519PrivateKey,
+    X25519PublicKey,
+)
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.exceptions import InvalidTag
 
@@ -2857,39 +2862,101 @@ def verify_circuit_return_template_vector(data: dict) -> dict:
 # -----------------------------------------------------------------------
 
 GATEWAY_RETURN_TEMPLATE_DOMAIN = b"SHARENET/CIRCUIT/RETURN/TEMPLATE/1"
+GATEWAY_KRET_ENCRYPTION_DOMAIN = b"SHARENET/CIRCUIT/RETURN/KRET/1"
+GATEWAY_KRET_AEAD_KEY_BYTES = 32
+GATEWAY_KRET_AEAD_NONCE_BYTES = 12
+GATEWAY_KRET_AEAD_TAG_BYTES = 16  # ChaCha20-Poly1305 tag
 
 # CBOR integer keys for GatewayReturnTemplate (matches TS reference
-# GT_KEY_* constants in reference/circuit/return-template.ts:531-539).
+# GT_KEY_* constants in reference/circuit/return-template.ts:552-564).
+# The wire object is a 12-field canonical CBOR map per ADR-0004.
 GT_KEY_CIRCUIT_ID = 1
 GT_KEY_COMMITMENT_ROOT = 2
 GT_KEY_NONCE_PREFIX = 3
-GT_KEY_K_RET = 4
-GT_KEY_ENVELOPE = 5
-GT_KEY_EXPIRY = 6
-GT_KEY_GATEWAY_NODE_ID = 7
-GT_KEY_INITIATOR_PUBKEY = 8
-GT_KEY_INITIATOR_SIGNATURE = 9
+GT_KEY_ENCRYPTED_K_RET = 4
+GT_KEY_K_RET_NONCE = 5
+GT_KEY_ENVELOPE = 6
+GT_KEY_EXPIRY = 7
+GT_KEY_GATEWAY_NODE_ID = 8
+GT_KEY_GATEWAY_X25519_PUBKEY = 9
+GT_KEY_INITIATOR_X25519_PUBKEY = 10
+GT_KEY_INITIATOR_ED25519_PUBKEY = 11
+GT_KEY_INITIATOR_SIGNATURE = 12
+
+
+def _x25519_shared_secret(my_secret: bytes, peer_public: bytes) -> bytes:
+    """X25519 ECDH shared secret derivation.
+
+    Uses the cryptography library's X25519 implementation (independent of
+    the TS reference's @noble/curves x25519). The shared secret is
+    symmetric: X25519(a, B) == X25519(b, A).
+    """
+    if len(my_secret) != 32:
+        raise ValueError(f"X25519 secret must be 32 bytes, got {len(my_secret)}")
+    if len(peer_public) != 32:
+        raise ValueError(f"X25519 public must be 32 bytes, got {len(peer_public)}")
+    sk = X25519PrivateKey.from_private_bytes(bytes(my_secret))
+    pk = X25519PublicKey.from_public_bytes(bytes(peer_public))
+    return sk.exchange(pk)
+
+
+def _x25519_public_from_secret(secret: bytes) -> bytes:
+    """Derive the X25519 public key from a 32-byte secret key."""
+    if len(secret) != 32:
+        raise ValueError(f"X25519 secret must be 32 bytes, got {len(secret)}")
+    sk = X25519PrivateKey.from_private_bytes(bytes(secret))
+    return sk.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+
+
+def _derive_kret_encryption_key(shared_secret: bytes,
+                                commitment_root: bytes,
+                                circuit_id: bytes) -> bytes:
+    """Derive the K_ret encryption key from the ECDH shared secret.
+
+    Mirrors reference/circuit/return-template.ts:deriveKRetEncryptionKey.
+
+      prk     = HKDF-Extract(salt=commitment_root, ikm=sharedSecret)
+      info    = "SHARENET/CIRCUIT/RETURN/KRET/1" || circuitId
+      kRetKey = HKDF-Expand(prk, info, 32)
+    """
+    prk = _hkdf_extract(commitment_root, shared_secret)
+    info = GATEWAY_KRET_ENCRYPTION_DOMAIN + bytes(circuit_id)
+    return _hkdf_expand(prk, info, GATEWAY_KRET_AEAD_KEY_BYTES)
 
 
 def gateway_return_template_signing_payload(
     circuit_id: bytes, commitment_root: bytes, nonce_prefix: bytes,
-    k_ret: bytes, envelope: bytes, expiry: int, gateway_node_id: str,
+    encrypted_k_ret: bytes, k_ret_nonce: bytes, envelope: bytes,
+    expiry: int, gateway_node_id: str,
+    gateway_x25519_public_key: bytes,
+    initiator_x25519_public_key: bytes,
 ) -> bytes:
     """Compute the signing payload for a GatewayReturnTemplate.
+
+    Mirrors reference/circuit/return-template.ts:gatewayReturnTemplateSigningPayload.
 
     Payload = "SHARENET/CIRCUIT/RETURN/TEMPLATE/1"
               || canonicalCBOR(map{
                   1: circuitId (32-byte bstr),
                   2: commitmentRoot (32-byte bstr),
                   3: noncePrefix (8-byte bstr),
-                  4: kRet (32-byte bstr),
-                  5: envelope (bstr ≥ 16 bytes),
-                  6: expiry (u32),
-                  7: gatewayNodeId (tstr),
+                  4: encryptedKRet (48-byte bstr = 32 + 16 AEAD tag),
+                  5: kRetNonce (12-byte bstr),
+                  6: envelope (bstr ≥ 16 bytes),
+                  7: expiry (u32),
+                  8: gatewayNodeId (tstr),
+                  9: gatewayX25519PublicKey (32-byte bstr),
+                  10: initiatorX25519PublicKey (32-byte bstr),
               })
 
-    The initiator signs this with its Ed25519 key. The gateway verifies
-    the signature to authenticate the transfer.
+    NOTE: the payload signs the ENCRYPTED kRet (encryptedKRet), NOT the
+    plaintext kRet. This means the signature is verifiable by anyone (it
+    doesn't require decrypting kRet), but it binds the encrypted ciphertext
+    to the circuit identity — preventing substitution of a different
+    encryptedKRet.
     """
     if not isinstance(expiry, int) or isinstance(expiry, bool) \
             or expiry < 0 or expiry > 0xffffffff:
@@ -2900,10 +2967,13 @@ def gateway_return_template_signing_payload(
         GT_KEY_CIRCUIT_ID: bytes(circuit_id),
         GT_KEY_COMMITMENT_ROOT: bytes(commitment_root),
         GT_KEY_NONCE_PREFIX: bytes(nonce_prefix),
-        GT_KEY_K_RET: bytes(k_ret),
+        GT_KEY_ENCRYPTED_K_RET: bytes(encrypted_k_ret),
+        GT_KEY_K_RET_NONCE: bytes(k_ret_nonce),
         GT_KEY_ENVELOPE: bytes(envelope),
         GT_KEY_EXPIRY: expiry,
         GT_KEY_GATEWAY_NODE_ID: gateway_node_id,
+        GT_KEY_GATEWAY_X25519_PUBKEY: bytes(gateway_x25519_public_key),
+        GT_KEY_INITIATOR_X25519_PUBKEY: bytes(initiator_x25519_public_key),
     }
     body = canonical_cbor_encode(m)
     return GATEWAY_RETURN_TEMPLATE_DOMAIN + body
@@ -2911,26 +2981,57 @@ def gateway_return_template_signing_payload(
 
 def sign_gateway_return_template(template: dict, expiry: int,
                                  gateway_node_id: str,
+                                 gateway_x25519_public_key: bytes,
+                                 initiator_x25519_secret_key: bytes,
+                                 initiator_x25519_public_key: bytes,
                                  initiator_ed25519_secret_key: bytes,
                                  initiator_ed25519_public_key: bytes) -> dict:
-    """Construct a signed GatewayReturnTemplate (initiator-side).
+    """Construct a signed + confidential GatewayReturnTemplate (initiator-side).
 
     Mirrors reference/circuit/return-template.ts:signGatewayReturnTemplate.
 
     `template` is a ReturnOnionTemplate dict with keys: circuitId,
     commitmentRoot, noncePrefix, kRet, envelope.
 
-    Returns the wire dict with 9 fields: the 5 template fields + expiry +
-    gatewayNodeId + initiatorEd25519PublicKey + initiatorSignature.
+    Steps:
+      1. Derive the ECDH shared secret: X25519(initiator_sk, gateway_pk).
+      2. Derive the K_ret encryption key via HKDF.
+      3. Encrypt K_ret with ChaCha20-Poly1305 → encryptedKRet (48 bytes).
+      4. Sign the 10-field binding payload (includes encryptedKRet +
+         gatewayX25519PublicKey + initiatorX25519PublicKey).
+
+    Returns the 12-field wire dict: the 5 template fields + encryptedKRet +
+    kRetNonce + expiry + gatewayNodeId + gatewayX25519PublicKey +
+    initiatorX25519PublicKey + initiatorEd25519PublicKey + initiatorSignature.
     """
+    # 1. Derive the ECDH shared secret (initiator ↔ gateway).
+    shared_secret = _x25519_shared_secret(
+        initiator_x25519_secret_key, gateway_x25519_public_key)
+
+    # 2. Derive the K_ret encryption key.
+    k_ret_key = _derive_kret_encryption_key(
+        shared_secret, template["commitmentRoot"], template["circuitId"])
+
+    # 3. Encrypt K_ret with ChaCha20-Poly1305.
+    # The kRetNonce is fresh per signing (12 random bytes). The wire object
+    # carries it alongside encryptedKRet so the gateway can decrypt.
+    k_ret_nonce = os.urandom(GATEWAY_KRET_AEAD_NONCE_BYTES)
+    k_ret_ad = GATEWAY_KRET_ENCRYPTION_DOMAIN
+    encrypted_k_ret = ChaCha20Poly1305(k_ret_key).encrypt(
+        k_ret_nonce, bytes(template["kRet"]), k_ret_ad)
+
+    # 4. Sign the complete binding (including encryptedKRet + gatewayX25519PublicKey).
     payload = gateway_return_template_signing_payload(
         template["circuitId"],
         template["commitmentRoot"],
         template["noncePrefix"],
-        template["kRet"],
+        encrypted_k_ret,
+        k_ret_nonce,
         template["envelope"],
         expiry,
         gateway_node_id,
+        gateway_x25519_public_key,
+        initiator_x25519_public_key,
     )
     signing_key = SigningKey(bytes(initiator_ed25519_secret_key))
     signature = signing_key.sign(payload).signature
@@ -2938,10 +3039,13 @@ def sign_gateway_return_template(template: dict, expiry: int,
         "circuitId": bytes(template["circuitId"]),
         "commitmentRoot": bytes(template["commitmentRoot"]),
         "noncePrefix": bytes(template["noncePrefix"]),
-        "kRet": bytes(template["kRet"]),
+        "encryptedKRet": bytes(encrypted_k_ret),
+        "kRetNonce": bytes(k_ret_nonce),
         "envelope": bytes(template["envelope"]),
         "expiry": expiry,
         "gatewayNodeId": gateway_node_id,
+        "gatewayX25519PublicKey": bytes(gateway_x25519_public_key),
+        "initiatorX25519PublicKey": bytes(initiator_x25519_public_key),
         "initiatorEd25519PublicKey": bytes(initiator_ed25519_public_key),
         "initiatorSignature": signature,
     }
@@ -2949,18 +3053,25 @@ def sign_gateway_return_template(template: dict, expiry: int,
 
 def verify_gateway_return_template(gateway_template: dict,
                                    expected_gateway_node_id: str,
+                                   gateway_x25519_secret_key: bytes,
+                                   gateway_x25519_public_key: bytes,
                                    now: int) -> dict:
-    """Verify a GatewayReturnTemplate at the gateway.
+    """Verify + decrypt a GatewayReturnTemplate at the gateway.
 
     Mirrors reference/circuit/return-template.ts:verifyGatewayReturnTemplate.
 
     Steps:
       1. Check gatewayNodeId — only the intended gateway can accept.
-      2. Check expiry — reject stale templates (expiry <= now).
-      3. Verify the initiator's Ed25519 signature over the 7-field
-         binding payload.
+      2. Check gatewayX25519PublicKey matches the gateway's own public key
+         (prevents identity-to-key substitution).
+      3. Check expiry — reject stale templates (expiry <= now).
+      4. Verify the initiator's Ed25519 signature over the 10-field
+         binding payload (authenticates the transfer).
+      5. Derive the ECDH shared secret: X25519(gateway_sk, initiator_pk).
+      6. Decrypt encryptedKRet → recover K_ret.
 
-    Returns {"ok": True, "template": {...}} on success, or
+    Returns {"ok": True, "template": {...}} on success (the template
+    contains the recovered K_ret + envelope), or
     {"ok": False, "reason": str} on failure.
     """
     # 1. Check gatewayNodeId — only the intended gateway can accept.
@@ -2972,7 +3083,17 @@ def verify_gateway_return_template(gateway_template: dict,
                       f"{expected_gateway_node_id}, got {actual_node_id}",
         }
 
-    # 2. Check expiry — reject stale templates (expiry <= now).
+    # 2. Check gatewayX25519PublicKey (prevents identity-to-key substitution).
+    actual_gw_pub = gateway_template.get("gatewayX25519PublicKey")
+    if not isinstance(actual_gw_pub, (bytes, bytearray)) or \
+            bytes(actual_gw_pub) != bytes(gateway_x25519_public_key):
+        return {
+            "ok": False,
+            "reason": "gateway X25519 public key mismatch "
+                      "(identity-to-key substitution attempt)",
+        }
+
+    # 3. Check expiry — reject stale templates (expiry <= now).
     expiry = gateway_template.get("expiry")
     if not isinstance(expiry, int) or isinstance(expiry, bool):
         return {"ok": False, "reason": f"expiry not an integer: {expiry!r}"}
@@ -2982,16 +3103,21 @@ def verify_gateway_return_template(gateway_template: dict,
             "reason": f"template expired: expiry {expiry} ≤ now {now}",
         }
 
-    # 3. Verify the initiator's Ed25519 signature (authenticates the
-    #    transfer — proves the initiator signed THIS template binding).
+    # 4. Verify the initiator's Ed25519 signature over the 10-field
+    #    binding payload (covers encryptedKRet + gatewayX25519PublicKey +
+    #    initiatorX25519PublicKey — any tampering with these fields fails
+    #    the signature check BEFORE the gateway attempts AEAD decryption).
     payload = gateway_return_template_signing_payload(
         gateway_template["circuitId"],
         gateway_template["commitmentRoot"],
         gateway_template["noncePrefix"],
-        gateway_template["kRet"],
+        gateway_template["encryptedKRet"],
+        gateway_template["kRetNonce"],
         gateway_template["envelope"],
         expiry,
         actual_node_id,
+        gateway_template["gatewayX25519PublicKey"],
+        gateway_template["initiatorX25519PublicKey"],
     )
     pub = gateway_template["initiatorEd25519PublicKey"]
     sig = gateway_template["initiatorSignature"]
@@ -3006,19 +3132,48 @@ def verify_gateway_return_template(gateway_template: dict,
         return {"ok": False,
                 "reason": f"initiator signature invalid: {e}"}
 
-    # 4. Extract the ReturnOnionTemplate (K_ret + envelope).
+    # 5. Derive the ECDH shared secret (gateway ↔ initiator).
+    try:
+        shared_secret = _x25519_shared_secret(
+            gateway_x25519_secret_key,
+            gateway_template["initiatorX25519PublicKey"])
+    except Exception as e:
+        return {"ok": False,
+                "reason": f"K_ret decryption failed: {e} "
+                          f"(wrong gateway key or tampered ciphertext)"}
+
+    # 6. Derive the K_ret encryption key + decrypt.
+    k_ret_key = _derive_kret_encryption_key(
+        shared_secret, gateway_template["commitmentRoot"],
+        gateway_template["circuitId"])
+    k_ret_ad = GATEWAY_KRET_ENCRYPTION_DOMAIN
+    try:
+        k_ret = ChaCha20Poly1305(k_ret_key).decrypt(
+            gateway_template["kRetNonce"],
+            gateway_template["encryptedKRet"],
+            k_ret_ad)
+    except InvalidTag as e:
+        return {"ok": False,
+                "reason": f"K_ret decryption failed: {e} "
+                          f"(wrong gateway key or tampered ciphertext)"}
+    except Exception as e:
+        return {"ok": False,
+                "reason": f"K_ret decryption failed: {e} "
+                          f"(wrong gateway key or tampered ciphertext)"}
+
+    # 7. Extract the ReturnOnionTemplate (with the recovered K_ret).
     template = {
         "circuitId": gateway_template["circuitId"],
         "commitmentRoot": gateway_template["commitmentRoot"],
         "noncePrefix": gateway_template["noncePrefix"],
-        "kRet": gateway_template["kRet"],
+        "kRet": bytes(k_ret),
         "envelope": gateway_template["envelope"],
     }
     return {"ok": True, "template": template}
 
 
 def encode_gateway_return_template(gt: dict) -> bytes:
-    """Encode a GatewayReturnTemplate to canonical CBOR (9-field map).
+    """Encode a GatewayReturnTemplate to canonical CBOR (12-field map).
 
     Mirrors reference/circuit/return-template.ts:encodeGatewayReturnTemplate.
     """
@@ -3026,11 +3181,14 @@ def encode_gateway_return_template(gt: dict) -> bytes:
         GT_KEY_CIRCUIT_ID: bytes(gt["circuitId"]),
         GT_KEY_COMMITMENT_ROOT: bytes(gt["commitmentRoot"]),
         GT_KEY_NONCE_PREFIX: bytes(gt["noncePrefix"]),
-        GT_KEY_K_RET: bytes(gt["kRet"]),
+        GT_KEY_ENCRYPTED_K_RET: bytes(gt["encryptedKRet"]),
+        GT_KEY_K_RET_NONCE: bytes(gt["kRetNonce"]),
         GT_KEY_ENVELOPE: bytes(gt["envelope"]),
         GT_KEY_EXPIRY: gt["expiry"],
         GT_KEY_GATEWAY_NODE_ID: gt["gatewayNodeId"],
-        GT_KEY_INITIATOR_PUBKEY: bytes(gt["initiatorEd25519PublicKey"]),
+        GT_KEY_GATEWAY_X25519_PUBKEY: bytes(gt["gatewayX25519PublicKey"]),
+        GT_KEY_INITIATOR_X25519_PUBKEY: bytes(gt["initiatorX25519PublicKey"]),
+        GT_KEY_INITIATOR_ED25519_PUBKEY: bytes(gt["initiatorEd25519PublicKey"]),
         GT_KEY_INITIATOR_SIGNATURE: bytes(gt["initiatorSignature"]),
     }
     return canonical_cbor_encode(m)
@@ -3075,7 +3233,12 @@ def decode_gateway_return_template(data: bytes) -> dict:
     nonce_prefix, err = get_bstr(GT_KEY_NONCE_PREFIX, "noncePrefix", length=8)
     if err is not None:
         return {"ok": False, "reason": err}
-    k_ret, err = get_bstr(GT_KEY_K_RET, "kRet", length=32)
+    # encryptedKRet = 32-byte K_ret + 16-byte AEAD tag = 48 bytes.
+    encrypted_k_ret, err = get_bstr(GT_KEY_ENCRYPTED_K_RET, "encryptedKRet",
+                                    length=48)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    k_ret_nonce, err = get_bstr(GT_KEY_K_RET_NONCE, "kRetNonce", length=12)
     if err is not None:
         return {"ok": False, "reason": err}
     envelope, err = get_bstr(GT_KEY_ENVELOPE, "envelope", min_length=16)
@@ -3090,8 +3253,17 @@ def decode_gateway_return_template(data: bytes) -> dict:
     if not isinstance(gateway_node_id, str):
         return {"ok": False, "reason": "gatewayNodeId must be a text string"}
 
-    initiator_pub, err = get_bstr(GT_KEY_INITIATOR_PUBKEY,
-                                  "initiatorEd25519PublicKey", length=32)
+    gateway_x25519_pub, err = get_bstr(GT_KEY_GATEWAY_X25519_PUBKEY,
+                                       "gatewayX25519PublicKey", length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    initiator_x25519_pub, err = get_bstr(GT_KEY_INITIATOR_X25519_PUBKEY,
+                                         "initiatorX25519PublicKey", length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    initiator_ed25519_pub, err = get_bstr(GT_KEY_INITIATOR_ED25519_PUBKEY,
+                                          "initiatorEd25519PublicKey",
+                                          length=32)
     if err is not None:
         return {"ok": False, "reason": err}
     signature, err = get_bstr(GT_KEY_INITIATOR_SIGNATURE,
@@ -3105,11 +3277,14 @@ def decode_gateway_return_template(data: bytes) -> dict:
             "circuitId": circuit_id,
             "commitmentRoot": commitment_root,
             "noncePrefix": nonce_prefix,
-            "kRet": k_ret,
+            "encryptedKRet": encrypted_k_ret,
+            "kRetNonce": k_ret_nonce,
             "envelope": envelope,
             "expiry": expiry,
             "gatewayNodeId": gateway_node_id,
-            "initiatorEd25519PublicKey": initiator_pub,
+            "gatewayX25519PublicKey": gateway_x25519_pub,
+            "initiatorX25519PublicKey": initiator_x25519_pub,
+            "initiatorEd25519PublicKey": initiator_ed25519_pub,
             "initiatorSignature": signature,
         },
     }
@@ -3118,20 +3293,27 @@ def decode_gateway_return_template(data: bytes) -> dict:
 def verify_circuit_gateway_template_vector(data: dict) -> dict:
     """Verify a V-CIRCUIT-GATEWAY-TEMPLATE-* vector (GatewayReturnTemplate).
 
-    Handles the 7 cases defined in V-CIRCUIT-GATEWAY-TEMPLATE-001:
-      1. sign-gateway-template        — initiator signs the 7-field binding.
-      2. decode-gateway-template      — decode canonical CBOR wire bytes.
-      3. verify-gateway-template      — gateway verifies signature + NodeId
-                                        + expiry → accepts.
-      4. wrong-gateway-rejected       — wrong gatewayNodeId → reject.
-      5. expired-template-rejected    — now > expiry → reject.
-      6. tampered-kret-rejected       — tampered kRet → signature invalid.
-      7. tampered-signature-rejected  — flipped signature bit → reject.
+    Handles the 8 cases defined in V-CIRCUIT-GATEWAY-TEMPLATE-001
+    (R-009 Stage 2 — confidential kRet via X25519 ECDH + ChaCha20-Poly1305):
+      1. sign-gateway-template            — initiator encrypts K_ret to the
+                                            gateway's X25519 key + signs.
+      2. decode-gateway-template          — decode canonical CBOR wire bytes.
+      3. verify-gateway-template         — gateway verifies signature + NodeId
+                                            + X25519 key + expiry → decrypts
+                                            K_ret → accepts.
+      4. wrong-gateway-rejected           — wrong gatewayNodeId → reject.
+      5. wrong-gateway-key-rejected       — wrong gatewayX25519PublicKey →
+                                            reject (identity-to-key substitution).
+      6. expired-template-rejected        — now > expiry → reject.
+      7. tampered-encrypted-kret-rejected — tampered encryptedKRet → signature
+                                            invalid → reject.
+      8. tampered-signature-rejected      — flipped signature bit → reject.
 
     The implementation is INDEPENDENT of the TS runner — it reproduces
     every byte from spec/08 §4.8a + ADR-0021 using only the FROZEN
     R-008/R-009 crypto substrate (BLAKE3, HKDF-SHA256, Ed25519 via
-    nacl.signing, canonical CBOR via cbor2).
+    nacl.signing, X25519 ECDH via cryptography.hazmat, ChaCha20-Poly1305
+    via cryptography.hazmat, canonical CBOR via cbor2).
     """
     vid = data.get("id", "unknown")
     vectors = data.get("vectors", [])
@@ -3141,11 +3323,38 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
     ret_key_0 = bytes.fromhex(shared["returnKey0Hex"])
     ret_key_1 = bytes.fromhex(shared["returnKey1Hex"])
     k_ret = bytes.fromhex(shared["kRetHex"])
+    init_x25519_sk = bytes.fromhex(shared["initiatorX25519SecretKeyHex"])
+    init_x25519_pub = bytes.fromhex(shared["initiatorX25519PubHex"])
+    gw_x25519_sk = bytes.fromhex(shared["gatewayX25519SecretKeyHex"])
+    gw_x25519_pk = bytes.fromhex(shared["gatewayX25519PubHex"])
     init_ed25519_sk = bytes.fromhex(shared["initiatorEd25519SecretKeyHex"])
     init_ed25519_pk = bytes.fromhex(shared["initiatorEd25519PubHex"])
     gateway_node_id = shared["gatewayNodeId"]
     expiry = shared["expiry"]
     now = shared["referenceNow"]
+
+    # Cross-check: derive the gateway's X25519 public key from its secret
+    # key + assert byte-equality with the value committed in the vector
+    # file. Proves the gateway's X25519 keypair is consistent.
+    derived_gw_pk = _x25519_public_from_secret(gw_x25519_sk)
+    if derived_gw_pk != gw_x25519_pk:
+        return {
+            "id": vid,
+            "passed": False,
+            "expected": f"gateway X25519 pub {gw_x25519_pk.hex()}",
+            "actual": f"derived {derived_gw_pk.hex()} (mismatch)",
+        }
+
+    # Cross-check: derive the initiator's X25519 public key from its secret
+    # key + assert byte-equality with the vector.
+    derived_init_pub = _x25519_public_from_secret(init_x25519_sk)
+    if derived_init_pub != init_x25519_pub:
+        return {
+            "id": vid,
+            "passed": False,
+            "expected": f"initiator X25519 pub {init_x25519_pub.hex()}",
+            "actual": f"derived {derived_init_pub.hex()} (mismatch)",
+        }
 
     # Re-derive the nonce prefix + circuitId from the circuit instance
     # (root + initiator X25519 ephemeral pubkey) per ADR-0020, then assert
@@ -3153,10 +3362,9 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
     # proves the GatewayReturnTemplate is bound to the SAME circuit
     # instance the return-onion template is (the binding is to circuitId
     # + commitmentRoot + noncePrefix, all derived from the circuit setup).
-    initiator_x25519_pub = bytes.fromhex(shared["initiatorX25519PubHex"])
     expected_nonce_prefix = bytes.fromhex(shared["noncePrefixHex"])
     derived_prefix = derive_circuit_nonce_prefix(
-        commitment_root, initiator_x25519_pub)
+        commitment_root, init_x25519_pub)
     if derived_prefix != expected_nonce_prefix:
         return {
             "id": vid,
@@ -3166,7 +3374,7 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
         }
     nonce_prefix = derived_prefix
 
-    circuit_id = derive_circuit_id(commitment_root, initiator_x25519_pub)
+    circuit_id = derive_circuit_id(commitment_root, init_x25519_pub)
     if "circuitIdHex" in shared and circuit_id.hex() != shared["circuitIdHex"]:
         return {
             "id": vid,
@@ -3189,9 +3397,18 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
     }
 
     # Construct the template + sign it once (shared across cases).
+    # NOTE: the kRetNonce is freshly random per sign call (12 bytes), so
+    # the encryptedKRet + signature + encoded wire bytes differ each run.
+    # The `sign-gateway-template` case therefore asserts LENGTHS (not exact
+    # bytes) for encryptedKRet / kRetNonce / encodedLen — matching the TS
+    # runner's behavior at ts-vector-runner.ts:1537-1545.
     template = construct_return_onion_template(circuit, k_ret_for_test=k_ret)
     gateway_template = sign_gateway_return_template(
-        template, expiry, gateway_node_id, init_ed25519_sk, init_ed25519_pk)
+        template, expiry, gateway_node_id,
+        gw_x25519_pk,
+        init_x25519_sk, init_x25519_pub,
+        init_ed25519_sk, init_ed25519_pk,
+    )
     encoded = encode_gateway_return_template(gateway_template)
 
     failures = []
@@ -3203,6 +3420,9 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
             case_ok = True
 
             if name == "sign-gateway-template":
+                # Assert the bound identity fields (deterministic across
+                # runs — these come from the shared inputs, not from any
+                # per-sign randomness).
                 if gateway_template["gatewayNodeId"] != expected["gatewayNodeId"]:
                     case_ok = False
                     failures.append(f"{name}: gatewayNodeId mismatch")
@@ -3212,16 +3432,33 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
                 if gateway_template["initiatorEd25519PublicKey"].hex() != \
                         expected["initiatorEd25519PubHex"]:
                     case_ok = False
-                    failures.append(f"{name}: initiatorPub mismatch")
-                if gateway_template["initiatorSignature"].hex() != \
-                        expected["signatureHex"]:
+                    failures.append(f"{name}: initiatorEd25519Pub mismatch")
+                if gateway_template["gatewayX25519PublicKey"].hex() != \
+                        expected["gatewayX25519PubHex"]:
                     case_ok = False
-                    failures.append(f"{name}: signature mismatch")
-                if encoded.hex() != expected["encodedHex"]:
+                    failures.append(f"{name}: gatewayX25519Pub mismatch")
+                if gateway_template["initiatorX25519PublicKey"].hex() != \
+                        expected["initiatorX25519PubHex"]:
+                    case_ok = False
+                    failures.append(f"{name}: initiatorX25519Pub mismatch")
+                # Assert LENGTHS (not exact bytes — the kRetNonce is
+                # random per sign call, so the encryptedKRet ciphertext +
+                # signature + encoded wire bytes differ each run).
+                if len(gateway_template["encryptedKRet"]) != \
+                        expected["encryptedKRetLen"]:
                     case_ok = False
                     failures.append(
-                        f"{name}: encoded {encoded.hex()} != "
-                        f"{expected['encodedHex']}"
+                        f"{name}: encryptedKRetLen "
+                        f"{len(gateway_template['encryptedKRet'])} != "
+                        f"{expected['encryptedKRetLen']}"
+                    )
+                if len(gateway_template["kRetNonce"]) != \
+                        expected["kRetNonceLen"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: kRetNonceLen "
+                        f"{len(gateway_template['kRetNonce'])} != "
+                        f"{expected['kRetNonceLen']}"
                     )
                 if len(encoded) != expected["encodedLen"]:
                     case_ok = False
@@ -3241,7 +3478,8 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
 
             elif name == "verify-gateway-template":
                 r = verify_gateway_return_template(
-                    gateway_template, gateway_node_id, now)
+                    gateway_template, gateway_node_id,
+                    gw_x25519_sk, gw_x25519_pk, now)
                 if r["ok"] != expected["ok"]:
                     case_ok = False
                     failures.append(
@@ -3250,7 +3488,30 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
 
             elif name == "wrong-gateway-rejected":
                 r = verify_gateway_return_template(
-                    gateway_template, inp["expectedGatewayNodeId"], now)
+                    gateway_template, inp["expectedGatewayNodeId"],
+                    gw_x25519_sk, gw_x25519_pk, now)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                    )
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'"
+                    )
+
+            elif name == "wrong-gateway-key-rejected":
+                # Use a different X25519 keypair for the gateway — the
+                # gatewayX25519PublicKey binding check at step 2 fails
+                # BEFORE any signature / decryption check.
+                wrong_sk = bytes([0x06] * 32)
+                wrong_pk = _x25519_public_from_secret(wrong_sk)
+                r = verify_gateway_return_template(
+                    gateway_template, gateway_node_id,
+                    wrong_sk, wrong_pk, now)
                 if r["ok"] != expected["ok"]:
                     case_ok = False
                     failures.append(
@@ -3266,7 +3527,8 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
 
             elif name == "expired-template-rejected":
                 r = verify_gateway_return_template(
-                    gateway_template, gateway_node_id, inp["now"])
+                    gateway_template, gateway_node_id,
+                    gw_x25519_sk, gw_x25519_pk, inp["now"])
                 if r["ok"] != expected["ok"]:
                     case_ok = False
                     failures.append(
@@ -3280,11 +3542,15 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
                         f"'{expected['reasonContains']}'"
                     )
 
-            elif name == "tampered-kret-rejected":
+            elif name == "tampered-encrypted-kret-rejected":
+                # Replace encryptedKRet with 0xFF × 48. The signature was
+                # over the ORIGINAL encryptedKRet, so the signature check
+                # at step 4 fails BEFORE any decryption attempt.
                 tampered = dict(gateway_template)
-                tampered["kRet"] = bytes([0xFF] * 32)
+                tampered["encryptedKRet"] = bytes([0xFF] * 48)
                 r = verify_gateway_return_template(
-                    tampered, gateway_node_id, now)
+                    tampered, gateway_node_id,
+                    gw_x25519_sk, gw_x25519_pk, now)
                 if r["ok"] != expected["ok"]:
                     case_ok = False
                     failures.append(
@@ -3304,7 +3570,8 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
                 bad_sig[0] ^= 0x01
                 tampered["initiatorSignature"] = bytes(bad_sig)
                 r = verify_gateway_return_template(
-                    tampered, gateway_node_id, now)
+                    tampered, gateway_node_id,
+                    gw_x25519_sk, gw_x25519_pk, now)
                 if r["ok"] != expected["ok"]:
                     case_ok = False
                     failures.append(
