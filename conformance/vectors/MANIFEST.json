@@ -267,6 +267,13 @@
       "schema_version": "1",
       "expected_result": "ReturnOnionTemplate: construct + seal from template + peel envelope + decrypt return + tamper rejection",
       "file": "V-CIRCUIT-RETURN-TEMPLATE-001.json"
+    },
+    {
+      "id": "V-CIRCUIT-GATEWAY-TEMPLATE-001",
+      "protocol": "circuit",
+      "schema_version": "1",
+      "expected_result": "GatewayReturnTemplate: sign + verify + decode + wrong-gateway/expired/tampered rejection",
+      "file": "V-CIRCUIT-GATEWAY-TEMPLATE-001.json"
     }
   ]
 }

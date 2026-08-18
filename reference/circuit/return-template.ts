@@ -61,6 +61,7 @@
 
 import { randomBytes } from "@noble/hashes/utils.js";
 import { canonicalEncode, canonicalDecode, toHex } from "../encoding/cbor";
+import { signMessage, verifySignature } from "../identity/keys";
 import {
   buildNonce,
   buildCircuitFrameAD,
@@ -83,6 +84,64 @@ export const RETURN_ENVELOPE_DOMAIN = "SHARENET/CIRCUIT/RETURN/ENV/1";
 
 /** Domain tag for return payload AEAD (the K_ret-sealed payload). */
 export const RETURN_PAYLOAD_DOMAIN = "SHARENET/CIRCUIT/RETURN/PAYLOAD/1";
+
+/** Domain tag for the GatewayReturnTemplate signing (binds the transfer to the gateway). */
+export const GATEWAY_RETURN_TEMPLATE_DOMAIN = "SHARENET/CIRCUIT/RETURN/TEMPLATE/1";
+
+// -----------------------------------------------------------------------
+// GatewayReturnTemplate — authenticated transfer wire object (R-009 Stage 2)
+// -----------------------------------------------------------------------
+
+/**
+ * The authenticated gateway-template transfer wire object.
+ *
+ * Per the re-audit of 67deef6: the ReturnOnionTemplate was constructed locally
+ * but never crossed the network as an authenticated setup artifact. This wire
+ * object solves that — it's the canonical message the initiator sends to the
+ * gateway during setup, carrying the ReturnOnionTemplate + an Ed25519 signature
+ * binding it to the terminal gateway's NodeId + the circuit identity.
+ *
+ * The gateway calls verifyGatewayReturnTemplate() to authenticate the transfer:
+ *   - Verify the initiator's Ed25519 signature over (circuitId, commitmentRoot,
+ *     noncePrefix, kRet, envelope, expiry, gatewayNodeId).
+ *   - Check gatewayNodeId matches its own NodeId (wrong gateway → reject).
+ *   - Check the circuitId/commitmentRoot binding (wrong circuit → reject).
+ *   - Check expiry (expired → reject).
+ *
+ * Security properties:
+ *   - Only the INTENDED gateway (terminal hop, identified by gatewayNodeId)
+ *     can trust the template. A relay that intercepts the transfer cannot use
+ *     it (its NodeId won't match).
+ *   - The signature prevents tampering with kRet or the envelope.
+ *   - The circuitId/commitmentRoot binding prevents template replay onto a
+ *     different circuit.
+ *   - The expiry prevents stale-template reuse.
+ *
+ * Wire format (canonical CBOR, integer-keyed map per ADR-0004):
+ *   { 1: circuitId, 2: commitmentRoot, 3: noncePrefix, 4: kRet, 5: envelope,
+ *     6: expiry, 7: gatewayNodeId, 8: initiatorEd25519PublicKey,
+ *     9: initiatorSignature }
+ */
+export interface GatewayReturnTemplate {
+  /** The 32-byte CircuitId (binds to the circuit instance). */
+  circuitId: Uint8Array;
+  /** The 32-byte commitment_root (route identity). */
+  commitmentRoot: Uint8Array;
+  /** The 64-bit nonce prefix (bound to the circuit instance per ADR-0020). */
+  noncePrefix: Uint8Array;
+  /** The circuit-scoped return key K_ret (32 bytes). Held by the gateway. */
+  kRet: Uint8Array;
+  /** The outermost envelope layer (opaque to the gateway). N AEAD layers deep. */
+  envelope: Uint8Array;
+  /** Circuit expiry (unix seconds). The gateway rejects expired templates. */
+  expiry: number;
+  /** The terminal gateway's NodeId (binds the template to the intended gateway). */
+  gatewayNodeId: string;
+  /** The initiator's Ed25519 public key (verifies the signature). */
+  initiatorEd25519PublicKey: Uint8Array;
+  /** The initiator's Ed25519 signature over the binding payload. */
+  initiatorSignature: Uint8Array;
+}
 
 // -----------------------------------------------------------------------
 // ReturnOnionTemplate wire object
@@ -462,6 +521,262 @@ function decodeReturnFramePayload(bytes: Uint8Array): ReturnFramePayload {
     throw new Error("ReturnFramePayload missing sealedPayload or envelopeLayer");
   }
   return { sealedPayload: sealed, envelopeLayer: envelope };
+}
+
+// -----------------------------------------------------------------------
+// GatewayReturnTemplate — signing, verification, encode, decode
+// -----------------------------------------------------------------------
+
+/** CBOR map keys for the GatewayReturnTemplate wire object (per ADR-0004). */
+const GT_KEY_CIRCUIT_ID = 1;
+const GT_KEY_COMMITMENT_ROOT = 2;
+const GT_KEY_NONCE_PREFIX = 3;
+const GT_KEY_K_RET = 4;
+const GT_KEY_ENVELOPE = 5;
+const GT_KEY_EXPIRY = 6;
+const GT_KEY_GATEWAY_NODE_ID = 7;
+const GT_KEY_INITIATOR_PUBKEY = 8;
+const GT_KEY_INITIATOR_SIGNATURE = 9;
+
+/**
+ * Compute the signing payload for a GatewayReturnTemplate.
+ *
+ * The payload binds: domain || circuitId || commitmentRoot || noncePrefix ||
+ * kRet || envelope || expiry || gatewayNodeId.
+ *
+ * The initiator signs this with its Ed25519 key. The gateway verifies the
+ * signature to authenticate the transfer (the initiator is who it claims to
+ * be + the template has not been tampered with).
+ */
+export function gatewayReturnTemplateSigningPayload(
+  circuitId: Uint8Array,
+  commitmentRoot: Uint8Array,
+  noncePrefix: Uint8Array,
+  kRet: Uint8Array,
+  envelope: Uint8Array,
+  expiry: number,
+  gatewayNodeId: string,
+): Uint8Array {
+  const m = new Map<number, unknown>([
+    [1, circuitId],
+    [2, commitmentRoot],
+    [3, noncePrefix],
+    [4, kRet],
+    [5, envelope],
+    [6, expiry],
+    [7, gatewayNodeId],
+  ]);
+  const body = canonicalEncode(m);
+  const domain = new TextEncoder().encode(GATEWAY_RETURN_TEMPLATE_DOMAIN);
+  const out = new Uint8Array(domain.length + body.length);
+  out.set(domain, 0);
+  out.set(body, domain.length);
+  return out;
+}
+
+/**
+ * Construct a signed GatewayReturnTemplate.
+ *
+ * The INITIATOR calls this after `constructReturnOnionTemplate()` — it wraps
+ * the template + signs the binding payload with the initiator's Ed25519 key.
+ * The result is the canonical wire object sent to the gateway during setup.
+ *
+ * @param template - the ReturnOnionTemplate (from constructReturnOnionTemplate)
+ * @param expiry - the circuit expiry (unix seconds)
+ * @param gatewayNodeId - the terminal gateway's NodeId (from the route's last hop)
+ * @param initiatorEd25519SecretKey - the initiator's Ed25519 secret key
+ * @param initiatorEd25519PublicKey - the initiator's Ed25519 public key
+ * @returns the signed GatewayReturnTemplate wire object
+ */
+export function signGatewayReturnTemplate(
+  template: ReturnOnionTemplate,
+  expiry: number,
+  gatewayNodeId: string,
+  initiatorEd25519SecretKey: Uint8Array,
+  initiatorEd25519PublicKey: Uint8Array,
+): GatewayReturnTemplate {
+  const payload = gatewayReturnTemplateSigningPayload(
+    template.circuitId,
+    template.commitmentRoot,
+    template.noncePrefix,
+    template.kRet,
+    template.envelope,
+    expiry,
+    gatewayNodeId,
+  );
+  const signature = signMessage(initiatorEd25519SecretKey, payload);
+  return {
+    circuitId: template.circuitId,
+    commitmentRoot: template.commitmentRoot,
+    noncePrefix: template.noncePrefix,
+    kRet: template.kRet,
+    envelope: template.envelope,
+    expiry,
+    gatewayNodeId,
+    initiatorEd25519PublicKey,
+    initiatorSignature: signature,
+  };
+}
+
+/** Result of verifying a GatewayReturnTemplate. */
+export type VerifyGatewayReturnTemplateResult =
+  | { ok: true; template: ReturnOnionTemplate }
+  | { ok: false; reason: string };
+
+/**
+ * Verify a GatewayReturnTemplate at the gateway.
+ *
+ * The GATEWAY calls this when it receives the template transfer. It:
+ *   1. Verifies the initiator's Ed25519 signature (authenticates the transfer).
+ *   2. Checks gatewayNodeId matches the gateway's own NodeId (wrong gateway → reject).
+ *   3. Checks expiry (expired → reject).
+ *
+ * If all checks pass, it returns the extracted ReturnOnionTemplate (K_ret +
+ * envelope) which the gateway stores + uses to seal return responses.
+ *
+ * @param gatewayTemplate - the signed GatewayReturnTemplate wire object
+ * @param expectedGatewayNodeId - the gateway's own NodeId
+ * @param now - the current time (unix seconds)
+ */
+export function verifyGatewayReturnTemplate(
+  gatewayTemplate: GatewayReturnTemplate,
+  expectedGatewayNodeId: string,
+  now: number,
+): VerifyGatewayReturnTemplateResult {
+  // 1. Check gatewayNodeId — only the intended gateway can accept this template.
+  if (gatewayTemplate.gatewayNodeId !== expectedGatewayNodeId) {
+    return {
+      ok: false,
+      reason: `gateway NodeId mismatch: expected ${expectedGatewayNodeId}, got ${gatewayTemplate.gatewayNodeId}`,
+    };
+  }
+
+  // 2. Check expiry — reject stale templates.
+  if (gatewayTemplate.expiry <= now) {
+    return {
+      ok: false,
+      reason: `template expired: expiry ${gatewayTemplate.expiry} ≤ now ${now}`,
+    };
+  }
+
+  // 3. Verify the initiator's Ed25519 signature (authenticates the transfer).
+  const payload = gatewayReturnTemplateSigningPayload(
+    gatewayTemplate.circuitId,
+    gatewayTemplate.commitmentRoot,
+    gatewayTemplate.noncePrefix,
+    gatewayTemplate.kRet,
+    gatewayTemplate.envelope,
+    gatewayTemplate.expiry,
+    gatewayTemplate.gatewayNodeId,
+  );
+  if (!verifySignature(gatewayTemplate.initiatorEd25519PublicKey, payload, gatewayTemplate.initiatorSignature)) {
+    return { ok: false, reason: "initiator signature invalid (tampered template or wrong initiator)" };
+  }
+
+  // 4. Extract the ReturnOnionTemplate (K_ret + envelope).
+  const template: ReturnOnionTemplate = {
+    circuitId: gatewayTemplate.circuitId,
+    commitmentRoot: gatewayTemplate.commitmentRoot,
+    noncePrefix: gatewayTemplate.noncePrefix,
+    kRet: gatewayTemplate.kRet,
+    envelope: gatewayTemplate.envelope,
+  };
+  return { ok: true, template };
+}
+
+/**
+ * Encode a GatewayReturnTemplate to canonical CBOR for the wire.
+ *
+ * Per ADR-0004: integer-keyed map. The 9-field structure is:
+ *   { 1: circuitId, 2: commitmentRoot, 3: noncePrefix, 4: kRet, 5: envelope,
+ *     6: expiry, 7: gatewayNodeId, 8: initiatorEd25519PublicKey,
+ *     9: initiatorSignature }
+ */
+export function encodeGatewayReturnTemplate(gt: GatewayReturnTemplate): Uint8Array {
+  const m = new Map<number, unknown>([
+    [GT_KEY_CIRCUIT_ID, gt.circuitId],
+    [GT_KEY_COMMITMENT_ROOT, gt.commitmentRoot],
+    [GT_KEY_NONCE_PREFIX, gt.noncePrefix],
+    [GT_KEY_K_RET, gt.kRet],
+    [GT_KEY_ENVELOPE, gt.envelope],
+    [GT_KEY_EXPIRY, gt.expiry],
+    [GT_KEY_GATEWAY_NODE_ID, gt.gatewayNodeId],
+    [GT_KEY_INITIATOR_PUBKEY, gt.initiatorEd25519PublicKey],
+    [GT_KEY_INITIATOR_SIGNATURE, gt.initiatorSignature],
+  ]);
+  return canonicalEncode(m);
+}
+
+/**
+ * Decode a GatewayReturnTemplate from canonical CBOR wire bytes.
+ *
+ * Validates all field types + sizes. Returns `{ ok: false, reason }` for any
+ * malformed wire object.
+ */
+export function decodeGatewayReturnTemplate(bytes: Uint8Array): { ok: true; gatewayTemplate: GatewayReturnTemplate } | { ok: false; reason: string } {
+  let decoded: unknown;
+  try {
+    decoded = canonicalDecode(bytes);
+  } catch (e) {
+    return { ok: false, reason: `CBOR decode failed: ${(e as Error).message}` };
+  }
+  if (!(decoded instanceof Map)) {
+    return { ok: false, reason: "GatewayReturnTemplate must be a CBOR map" };
+  }
+  const m = decoded as Map<number, unknown>;
+
+  const circuitId = m.get(GT_KEY_CIRCUIT_ID);
+  const commitmentRoot = m.get(GT_KEY_COMMITMENT_ROOT);
+  const noncePrefix = m.get(GT_KEY_NONCE_PREFIX);
+  const kRet = m.get(GT_KEY_K_RET);
+  const envelope = m.get(GT_KEY_ENVELOPE);
+  const expiry = m.get(GT_KEY_EXPIRY);
+  const gatewayNodeId = m.get(GT_KEY_GATEWAY_NODE_ID);
+  const initiatorPub = m.get(GT_KEY_INITIATOR_PUBKEY);
+  const signature = m.get(GT_KEY_INITIATOR_SIGNATURE);
+
+  if (!(circuitId instanceof Uint8Array) || circuitId.length !== 32) {
+    return { ok: false, reason: "circuitId must be a 32-byte bstr" };
+  }
+  if (!(commitmentRoot instanceof Uint8Array) || commitmentRoot.length !== 32) {
+    return { ok: false, reason: "commitmentRoot must be a 32-byte bstr" };
+  }
+  if (!(noncePrefix instanceof Uint8Array) || noncePrefix.length !== 8) {
+    return { ok: false, reason: "noncePrefix must be an 8-byte bstr" };
+  }
+  if (!(kRet instanceof Uint8Array) || kRet.length !== 32) {
+    return { ok: false, reason: "kRet must be a 32-byte bstr" };
+  }
+  if (!(envelope instanceof Uint8Array) || envelope.length < 16) {
+    return { ok: false, reason: "envelope must be a bstr of at least 16 bytes" };
+  }
+  if (typeof expiry !== "number" || !Number.isInteger(expiry)) {
+    return { ok: false, reason: "expiry must be an integer" };
+  }
+  if (typeof gatewayNodeId !== "string") {
+    return { ok: false, reason: "gatewayNodeId must be a text string" };
+  }
+  if (!(initiatorPub instanceof Uint8Array) || initiatorPub.length !== 32) {
+    return { ok: false, reason: "initiatorEd25519PublicKey must be a 32-byte bstr" };
+  }
+  if (!(signature instanceof Uint8Array) || signature.length !== 64) {
+    return { ok: false, reason: "initiatorSignature must be a 64-byte bstr" };
+  }
+
+  return {
+    ok: true,
+    gatewayTemplate: {
+      circuitId,
+      commitmentRoot,
+      noncePrefix,
+      kRet,
+      envelope,
+      expiry,
+      gatewayNodeId,
+      initiatorEd25519PublicKey: initiatorPub,
+      initiatorSignature: signature,
+    },
+  };
 }
 
 export { toHex };

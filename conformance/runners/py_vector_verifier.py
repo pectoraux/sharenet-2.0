@@ -31,7 +31,7 @@ from typing import Any
 # Third-party libraries (independent of the TypeScript implementation)
 import blake3
 import cbor2
-from nacl.signing import VerifyKey
+from nacl.signing import SigningKey, VerifyKey
 from nacl.exceptions import BadSignatureError
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.exceptions import InvalidTag
@@ -409,6 +409,9 @@ def verify_vector(data: dict) -> dict:
 
     elif vid.startswith("V-CIRCUIT-RETURN-TEMPLATE-"):
         return verify_circuit_return_template_vector(data)
+
+    elif vid.startswith("V-CIRCUIT-GATEWAY-TEMPLATE-"):
+        return verify_circuit_gateway_template_vector(data)
 
     elif vid.startswith("V-CIRCUIT-"):
         return verify_circuit_vector(data)
@@ -2828,6 +2831,507 @@ def verify_circuit_return_template_vector(data: dict) -> dict:
         "passed": passed,
         "expected": f"{len(vectors)} return-template cases match",
         "actual": f"{len(vectors)} return-template cases match" if passed
+                  else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# GatewayReturnTemplate (added for R-009 Stage 2 —
+# V-CIRCUIT-GATEWAY-TEMPLATE-001)
+#
+# INDEPENDENT implementation of the authenticated transfer wire object.
+# The GatewayReturnTemplate is what the INITIATOR sends to the terminal
+# gateway during setup: it wraps the ReturnOnionTemplate (K_ret +
+# envelope) + binds it to (circuitId, commitmentRoot, noncePrefix, kRet,
+# envelope, expiry, gatewayNodeId) by signing the canonical CBOR map of
+# those 7 fields with the initiator's Ed25519 key. The gateway verifies
+# the signature + checks its own NodeId + checks expiry before accepting
+# the template (only the intended terminal gateway can accept it).
+#
+# Per spec/08 §4.8a + ADR-0021 + reference/circuit/return-template.ts:
+#   - Domain: SHARENET/CIRCUIT/RETURN/TEMPLATE/1
+#   - Signing payload = domain || canonicalCBOR(map{1..7})
+#   - Wire object = canonicalCBOR(map{1..9})  -- 9 = pubkey + signature
+#
+# CBOR integer keys (ADR-0004) — see GT_KEY_* below.
+# -----------------------------------------------------------------------
+
+GATEWAY_RETURN_TEMPLATE_DOMAIN = b"SHARENET/CIRCUIT/RETURN/TEMPLATE/1"
+
+# CBOR integer keys for GatewayReturnTemplate (matches TS reference
+# GT_KEY_* constants in reference/circuit/return-template.ts:531-539).
+GT_KEY_CIRCUIT_ID = 1
+GT_KEY_COMMITMENT_ROOT = 2
+GT_KEY_NONCE_PREFIX = 3
+GT_KEY_K_RET = 4
+GT_KEY_ENVELOPE = 5
+GT_KEY_EXPIRY = 6
+GT_KEY_GATEWAY_NODE_ID = 7
+GT_KEY_INITIATOR_PUBKEY = 8
+GT_KEY_INITIATOR_SIGNATURE = 9
+
+
+def gateway_return_template_signing_payload(
+    circuit_id: bytes, commitment_root: bytes, nonce_prefix: bytes,
+    k_ret: bytes, envelope: bytes, expiry: int, gateway_node_id: str,
+) -> bytes:
+    """Compute the signing payload for a GatewayReturnTemplate.
+
+    Payload = "SHARENET/CIRCUIT/RETURN/TEMPLATE/1"
+              || canonicalCBOR(map{
+                  1: circuitId (32-byte bstr),
+                  2: commitmentRoot (32-byte bstr),
+                  3: noncePrefix (8-byte bstr),
+                  4: kRet (32-byte bstr),
+                  5: envelope (bstr ≥ 16 bytes),
+                  6: expiry (u32),
+                  7: gatewayNodeId (tstr),
+              })
+
+    The initiator signs this with its Ed25519 key. The gateway verifies
+    the signature to authenticate the transfer.
+    """
+    if not isinstance(expiry, int) or isinstance(expiry, bool) \
+            or expiry < 0 or expiry > 0xffffffff:
+        raise ValueError(f"expiry must be a u32, got {expiry}")
+    if not isinstance(gateway_node_id, str):
+        raise ValueError("gatewayNodeId must be a text string")
+    m = {
+        GT_KEY_CIRCUIT_ID: bytes(circuit_id),
+        GT_KEY_COMMITMENT_ROOT: bytes(commitment_root),
+        GT_KEY_NONCE_PREFIX: bytes(nonce_prefix),
+        GT_KEY_K_RET: bytes(k_ret),
+        GT_KEY_ENVELOPE: bytes(envelope),
+        GT_KEY_EXPIRY: expiry,
+        GT_KEY_GATEWAY_NODE_ID: gateway_node_id,
+    }
+    body = canonical_cbor_encode(m)
+    return GATEWAY_RETURN_TEMPLATE_DOMAIN + body
+
+
+def sign_gateway_return_template(template: dict, expiry: int,
+                                 gateway_node_id: str,
+                                 initiator_ed25519_secret_key: bytes,
+                                 initiator_ed25519_public_key: bytes) -> dict:
+    """Construct a signed GatewayReturnTemplate (initiator-side).
+
+    Mirrors reference/circuit/return-template.ts:signGatewayReturnTemplate.
+
+    `template` is a ReturnOnionTemplate dict with keys: circuitId,
+    commitmentRoot, noncePrefix, kRet, envelope.
+
+    Returns the wire dict with 9 fields: the 5 template fields + expiry +
+    gatewayNodeId + initiatorEd25519PublicKey + initiatorSignature.
+    """
+    payload = gateway_return_template_signing_payload(
+        template["circuitId"],
+        template["commitmentRoot"],
+        template["noncePrefix"],
+        template["kRet"],
+        template["envelope"],
+        expiry,
+        gateway_node_id,
+    )
+    signing_key = SigningKey(bytes(initiator_ed25519_secret_key))
+    signature = signing_key.sign(payload).signature
+    return {
+        "circuitId": bytes(template["circuitId"]),
+        "commitmentRoot": bytes(template["commitmentRoot"]),
+        "noncePrefix": bytes(template["noncePrefix"]),
+        "kRet": bytes(template["kRet"]),
+        "envelope": bytes(template["envelope"]),
+        "expiry": expiry,
+        "gatewayNodeId": gateway_node_id,
+        "initiatorEd25519PublicKey": bytes(initiator_ed25519_public_key),
+        "initiatorSignature": signature,
+    }
+
+
+def verify_gateway_return_template(gateway_template: dict,
+                                   expected_gateway_node_id: str,
+                                   now: int) -> dict:
+    """Verify a GatewayReturnTemplate at the gateway.
+
+    Mirrors reference/circuit/return-template.ts:verifyGatewayReturnTemplate.
+
+    Steps:
+      1. Check gatewayNodeId — only the intended gateway can accept.
+      2. Check expiry — reject stale templates (expiry <= now).
+      3. Verify the initiator's Ed25519 signature over the 7-field
+         binding payload.
+
+    Returns {"ok": True, "template": {...}} on success, or
+    {"ok": False, "reason": str} on failure.
+    """
+    # 1. Check gatewayNodeId — only the intended gateway can accept.
+    actual_node_id = gateway_template.get("gatewayNodeId")
+    if actual_node_id != expected_gateway_node_id:
+        return {
+            "ok": False,
+            "reason": f"gateway NodeId mismatch: expected "
+                      f"{expected_gateway_node_id}, got {actual_node_id}",
+        }
+
+    # 2. Check expiry — reject stale templates (expiry <= now).
+    expiry = gateway_template.get("expiry")
+    if not isinstance(expiry, int) or isinstance(expiry, bool):
+        return {"ok": False, "reason": f"expiry not an integer: {expiry!r}"}
+    if expiry <= now:
+        return {
+            "ok": False,
+            "reason": f"template expired: expiry {expiry} ≤ now {now}",
+        }
+
+    # 3. Verify the initiator's Ed25519 signature (authenticates the
+    #    transfer — proves the initiator signed THIS template binding).
+    payload = gateway_return_template_signing_payload(
+        gateway_template["circuitId"],
+        gateway_template["commitmentRoot"],
+        gateway_template["noncePrefix"],
+        gateway_template["kRet"],
+        gateway_template["envelope"],
+        expiry,
+        actual_node_id,
+    )
+    pub = gateway_template["initiatorEd25519PublicKey"]
+    sig = gateway_template["initiatorSignature"]
+    try:
+        verify_key = VerifyKey(pub)
+        verify_key.verify(payload, sig)
+    except BadSignatureError:
+        return {"ok": False,
+                "reason": "initiator signature invalid "
+                          "(tampered template or wrong initiator)"}
+    except Exception as e:
+        return {"ok": False,
+                "reason": f"initiator signature invalid: {e}"}
+
+    # 4. Extract the ReturnOnionTemplate (K_ret + envelope).
+    template = {
+        "circuitId": gateway_template["circuitId"],
+        "commitmentRoot": gateway_template["commitmentRoot"],
+        "noncePrefix": gateway_template["noncePrefix"],
+        "kRet": gateway_template["kRet"],
+        "envelope": gateway_template["envelope"],
+    }
+    return {"ok": True, "template": template}
+
+
+def encode_gateway_return_template(gt: dict) -> bytes:
+    """Encode a GatewayReturnTemplate to canonical CBOR (9-field map).
+
+    Mirrors reference/circuit/return-template.ts:encodeGatewayReturnTemplate.
+    """
+    m = {
+        GT_KEY_CIRCUIT_ID: bytes(gt["circuitId"]),
+        GT_KEY_COMMITMENT_ROOT: bytes(gt["commitmentRoot"]),
+        GT_KEY_NONCE_PREFIX: bytes(gt["noncePrefix"]),
+        GT_KEY_K_RET: bytes(gt["kRet"]),
+        GT_KEY_ENVELOPE: bytes(gt["envelope"]),
+        GT_KEY_EXPIRY: gt["expiry"],
+        GT_KEY_GATEWAY_NODE_ID: gt["gatewayNodeId"],
+        GT_KEY_INITIATOR_PUBKEY: bytes(gt["initiatorEd25519PublicKey"]),
+        GT_KEY_INITIATOR_SIGNATURE: bytes(gt["initiatorSignature"]),
+    }
+    return canonical_cbor_encode(m)
+
+
+def decode_gateway_return_template(data: bytes) -> dict:
+    """Decode a GatewayReturnTemplate from canonical CBOR wire bytes.
+
+    Mirrors reference/circuit/return-template.ts:decodeGatewayReturnTemplate.
+
+    Validates all field types + sizes. Returns
+    {"ok": True, "gatewayTemplate": {...}} on success, or
+    {"ok": False, "reason": str} on any malformed wire object.
+    """
+    try:
+        decoded = canonical_cbor_decode(data)
+    except Exception as e:
+        return {"ok": False, "reason": f"CBOR decode failed: {e}"}
+
+    if not isinstance(decoded, dict):
+        return {"ok": False,
+                "reason": "GatewayReturnTemplate must be a CBOR map"}
+
+    def get_bstr(key, name, length=None, min_length=None):
+        v = decoded.get(key)
+        if not isinstance(v, (bytes, bytearray)):
+            return None, f"{name} must be a bstr"
+        v = bytes(v)
+        if length is not None and len(v) != length:
+            return None, f"{name} must be a {length}-byte bstr"
+        if min_length is not None and len(v) < min_length:
+            return None, f"{name} must be a bstr of at least {min_length} bytes"
+        return v, None
+
+    circuit_id, err = get_bstr(GT_KEY_CIRCUIT_ID, "circuitId", length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    commitment_root, err = get_bstr(GT_KEY_COMMITMENT_ROOT, "commitmentRoot",
+                                    length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    nonce_prefix, err = get_bstr(GT_KEY_NONCE_PREFIX, "noncePrefix", length=8)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    k_ret, err = get_bstr(GT_KEY_K_RET, "kRet", length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    envelope, err = get_bstr(GT_KEY_ENVELOPE, "envelope", min_length=16)
+    if err is not None:
+        return {"ok": False, "reason": err}
+
+    expiry = decoded.get(GT_KEY_EXPIRY)
+    if not isinstance(expiry, int) or isinstance(expiry, bool):
+        return {"ok": False, "reason": "expiry must be an integer"}
+
+    gateway_node_id = decoded.get(GT_KEY_GATEWAY_NODE_ID)
+    if not isinstance(gateway_node_id, str):
+        return {"ok": False, "reason": "gatewayNodeId must be a text string"}
+
+    initiator_pub, err = get_bstr(GT_KEY_INITIATOR_PUBKEY,
+                                  "initiatorEd25519PublicKey", length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    signature, err = get_bstr(GT_KEY_INITIATOR_SIGNATURE,
+                             "initiatorSignature", length=64)
+    if err is not None:
+        return {"ok": False, "reason": err}
+
+    return {
+        "ok": True,
+        "gatewayTemplate": {
+            "circuitId": circuit_id,
+            "commitmentRoot": commitment_root,
+            "noncePrefix": nonce_prefix,
+            "kRet": k_ret,
+            "envelope": envelope,
+            "expiry": expiry,
+            "gatewayNodeId": gateway_node_id,
+            "initiatorEd25519PublicKey": initiator_pub,
+            "initiatorSignature": signature,
+        },
+    }
+
+
+def verify_circuit_gateway_template_vector(data: dict) -> dict:
+    """Verify a V-CIRCUIT-GATEWAY-TEMPLATE-* vector (GatewayReturnTemplate).
+
+    Handles the 7 cases defined in V-CIRCUIT-GATEWAY-TEMPLATE-001:
+      1. sign-gateway-template        — initiator signs the 7-field binding.
+      2. decode-gateway-template      — decode canonical CBOR wire bytes.
+      3. verify-gateway-template      — gateway verifies signature + NodeId
+                                        + expiry → accepts.
+      4. wrong-gateway-rejected       — wrong gatewayNodeId → reject.
+      5. expired-template-rejected    — now > expiry → reject.
+      6. tampered-kret-rejected       — tampered kRet → signature invalid.
+      7. tampered-signature-rejected  — flipped signature bit → reject.
+
+    The implementation is INDEPENDENT of the TS runner — it reproduces
+    every byte from spec/08 §4.8a + ADR-0021 using only the FROZEN
+    R-008/R-009 crypto substrate (BLAKE3, HKDF-SHA256, Ed25519 via
+    nacl.signing, canonical CBOR via cbor2).
+    """
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    shared = data.get("sharedInputs", {}) or {}
+
+    commitment_root = bytes.fromhex(shared["commitmentRootHex"])
+    ret_key_0 = bytes.fromhex(shared["returnKey0Hex"])
+    ret_key_1 = bytes.fromhex(shared["returnKey1Hex"])
+    k_ret = bytes.fromhex(shared["kRetHex"])
+    init_ed25519_sk = bytes.fromhex(shared["initiatorEd25519SecretKeyHex"])
+    init_ed25519_pk = bytes.fromhex(shared["initiatorEd25519PubHex"])
+    gateway_node_id = shared["gatewayNodeId"]
+    expiry = shared["expiry"]
+    now = shared["referenceNow"]
+
+    # Re-derive the nonce prefix + circuitId from the circuit instance
+    # (root + initiator X25519 ephemeral pubkey) per ADR-0020, then assert
+    # byte-equality against the values committed in the vector file. This
+    # proves the GatewayReturnTemplate is bound to the SAME circuit
+    # instance the return-onion template is (the binding is to circuitId
+    # + commitmentRoot + noncePrefix, all derived from the circuit setup).
+    initiator_x25519_pub = bytes.fromhex(shared["initiatorX25519PubHex"])
+    expected_nonce_prefix = bytes.fromhex(shared["noncePrefixHex"])
+    derived_prefix = derive_circuit_nonce_prefix(
+        commitment_root, initiator_x25519_pub)
+    if derived_prefix != expected_nonce_prefix:
+        return {
+            "id": vid,
+            "passed": False,
+            "expected": f"derived noncePrefix {expected_nonce_prefix.hex()}",
+            "actual": f"derived {derived_prefix.hex()} (mismatch)",
+        }
+    nonce_prefix = derived_prefix
+
+    circuit_id = derive_circuit_id(commitment_root, initiator_x25519_pub)
+    if "circuitIdHex" in shared and circuit_id.hex() != shared["circuitIdHex"]:
+        return {
+            "id": vid,
+            "passed": False,
+            "expected": f"circuitId {shared['circuitIdHex']}",
+            "actual": f"circuitId {circuit_id.hex()} (mismatch)",
+        }
+
+    # Minimal ActiveCircuit for construct_return_onion_template (the
+    # GatewayReturnTemplate wraps a ReturnOnionTemplate; the envelope is
+    # built the same way as in V-CIRCUIT-RETURN-TEMPLATE-001).
+    circuit = {
+        "circuitId": circuit_id,
+        "commitmentRoot": commitment_root,
+        "noncePrefix": nonce_prefix,
+        "hops": [
+            {"hopIndex": 0, "returnKey": ret_key_0},
+            {"hopIndex": 1, "returnKey": ret_key_1},
+        ],
+    }
+
+    # Construct the template + sign it once (shared across cases).
+    template = construct_return_onion_template(circuit, k_ret_for_test=k_ret)
+    gateway_template = sign_gateway_return_template(
+        template, expiry, gateway_node_id, init_ed25519_sk, init_ed25519_pk)
+    encoded = encode_gateway_return_template(gateway_template)
+
+    failures = []
+    for v in vectors:
+        try:
+            name = v["name"]
+            inp = v.get("input", {}) or {}
+            expected = v.get("expected", {}) or {}
+            case_ok = True
+
+            if name == "sign-gateway-template":
+                if gateway_template["gatewayNodeId"] != expected["gatewayNodeId"]:
+                    case_ok = False
+                    failures.append(f"{name}: gatewayNodeId mismatch")
+                if gateway_template["expiry"] != expected["expiry"]:
+                    case_ok = False
+                    failures.append(f"{name}: expiry mismatch")
+                if gateway_template["initiatorEd25519PublicKey"].hex() != \
+                        expected["initiatorEd25519PubHex"]:
+                    case_ok = False
+                    failures.append(f"{name}: initiatorPub mismatch")
+                if gateway_template["initiatorSignature"].hex() != \
+                        expected["signatureHex"]:
+                    case_ok = False
+                    failures.append(f"{name}: signature mismatch")
+                if encoded.hex() != expected["encodedHex"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: encoded {encoded.hex()} != "
+                        f"{expected['encodedHex']}"
+                    )
+                if len(encoded) != expected["encodedLen"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: encodedLen {len(encoded)} != "
+                        f"{expected['encodedLen']}"
+                    )
+
+            elif name == "decode-gateway-template":
+                wire = bytes.fromhex(inp["encodedHex"])
+                r = decode_gateway_return_template(wire)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                    )
+
+            elif name == "verify-gateway-template":
+                r = verify_gateway_return_template(
+                    gateway_template, gateway_node_id, now)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                    )
+
+            elif name == "wrong-gateway-rejected":
+                r = verify_gateway_return_template(
+                    gateway_template, inp["expectedGatewayNodeId"], now)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                    )
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'"
+                    )
+
+            elif name == "expired-template-rejected":
+                r = verify_gateway_return_template(
+                    gateway_template, gateway_node_id, inp["now"])
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                    )
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'"
+                    )
+
+            elif name == "tampered-kret-rejected":
+                tampered = dict(gateway_template)
+                tampered["kRet"] = bytes([0xFF] * 32)
+                r = verify_gateway_return_template(
+                    tampered, gateway_node_id, now)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                    )
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'"
+                    )
+
+            elif name == "tampered-signature-rejected":
+                tampered = dict(gateway_template)
+                bad_sig = bytearray(gateway_template["initiatorSignature"])
+                bad_sig[0] ^= 0x01
+                tampered["initiatorSignature"] = bytes(bad_sig)
+                r = verify_gateway_return_template(
+                    tampered, gateway_node_id, now)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                    )
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'"
+                    )
+
+            else:
+                case_ok = False
+                failures.append(
+                    f"{name}: unknown gateway-template case name")
+
+        except Exception as e:
+            failures.append(f"{v.get('name', '?')}: threw {e}")
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} gateway-template cases match",
+        "actual": f"{len(vectors)} gateway-template cases match" if passed
                   else f"FAILED: {'; '.join(failures)}",
     }
 

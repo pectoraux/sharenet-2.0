@@ -58,7 +58,12 @@ import {
   AEAD_KEY_BYTES,
 } from "./circuit";
 import type { CircuitAckReplayStore, CircuitSequenceFloorStore } from "./replay-stores";
-import { constructReturnOnionTemplate, type ReturnOnionTemplate } from "./return-template";
+import {
+  constructReturnOnionTemplate,
+  signGatewayReturnTemplate,
+  type ReturnOnionTemplate,
+  type GatewayReturnTemplate,
+} from "./return-template";
 
 // -----------------------------------------------------------------------
 // Constants (FROZEN per spec/14 §4 + ADR-0017)
@@ -656,7 +661,22 @@ export async function establishDistributedCircuit(
    * `processCircuitFrame` does atomic durable AEAD→commit ordering.
    */
   floorStore: CircuitSequenceFloorStore,
-): Promise<{ ok: true; circuit: ActiveCircuit; returnTemplate: ReturnOnionTemplate } | { ok: false; reason: string }> {
+  /**
+   * REQUIRED: the initiator's Ed25519 secret key (node identity key).
+   * Used to sign the GatewayReturnTemplate — the authenticated transfer
+   * artifact that carries the ReturnOnionTemplate to the terminal gateway
+   * during setup. Per ADR-0021 + the re-audit of 67deef6: the template
+   * must cross the network as an authenticated setup message, not merely
+   * be returned in memory.
+   */
+  initiatorEd25519SecretKey: Uint8Array,
+  /**
+   * REQUIRED: the initiator's Ed25519 public key (node identity key).
+   * Included in the GatewayReturnTemplate so the gateway can verify the
+   * signature.
+   */
+  initiatorEd25519PublicKey: Uint8Array,
+): Promise<{ ok: true; circuit: ActiveCircuit; returnTemplate: ReturnOnionTemplate; gatewayReturnTemplate: GatewayReturnTemplate } | { ok: false; reason: string }> {
   // 1. Verify the route is genuine
   if (!isBrandedCommittedRoute(route)) {
     return { ok: false, reason: "route is not a genuine BrandedCommittedRoute" };
@@ -743,13 +763,25 @@ export async function establishDistributedCircuit(
     floorStore,
   };
 
-  // 6. R-009 Stage 2: construct the ReturnOnionTemplate.
-  //    The initiator (who holds all returnKeys from the ECDH setup) constructs
-  //    the layered encrypted envelope wrapping K_ret. The template is sent to
-  //    the gateway (the terminal hop) during setup — the gateway holds K_ret +
-  //    the opaque envelope, NOT the per-hop returnKeys. The gateway uses
-  //    sealReturnFrameFromTemplate() to seal return responses. See ADR-0021.
+  // 6. R-009 Stage 2: construct the ReturnOnionTemplate + sign the
+  //    GatewayReturnTemplate (the authenticated transfer wire object).
+  //    The initiator constructs the layered encrypted envelope wrapping K_ret,
+  //    then signs the GatewayReturnTemplate binding it to the terminal gateway's
+  //    NodeId + the circuit identity. The signed wire object is sent to the
+  //    gateway during setup — the gateway calls verifyGatewayReturnTemplate()
+  //    to authenticate the transfer before storing K_ret + the envelope.
+  //    Per the re-audit of 67deef6: the template must cross the network as an
+  //    authenticated setup message, not merely be returned in memory.
+  //    See ADR-0021.
   const returnTemplate = constructReturnOnionTemplate(circuit);
+  const gatewayNodeId = route.hops[route.hops.length - 1]!.nodeId;
+  const gatewayReturnTemplate = signGatewayReturnTemplate(
+    returnTemplate,
+    route.expiry,
+    gatewayNodeId,
+    initiatorEd25519SecretKey,
+    initiatorEd25519PublicKey,
+  );
 
-  return { ok: true, circuit, returnTemplate };
+  return { ok: true, circuit, returnTemplate, gatewayReturnTemplate };
 }

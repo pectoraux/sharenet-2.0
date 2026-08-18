@@ -253,6 +253,13 @@
           "spec_ref": "spec/08-circuits.md \u00a75a (return-onion template distribution)",
           "description": "Distributed return-onion template (R-009 Stage 2): the initiator constructs this during setup and sends it to the gateway. Contains K_ret (circuit-scoped return key) + an N-layer-deep opaque envelope (each layer AEAD under a hop returnKey, wrapping K_ret). The gateway holds K_ret + the envelope but does NOT hold the per-hop returnKeys. To send a return response, the gateway seals the payload with K_ret and attaches the envelope; each relay peels one returnKey layer; the source recovers K_ret and decrypts. Family: V-CIRCUIT-RETURN-TEMPLATE.",
           "conformance_vector_family": "V-CIRCUIT-RETURN-TEMPLATE"
+        },
+        "GatewayReturnTemplate": {
+          "kind": "wire",
+          "maturity": "reference-implemented",
+          "spec_ref": "spec/08-circuits.md \u00a74.8a (authenticated gateway-template transfer)",
+          "description": "Authenticated gateway-template transfer wire object (R-009 Stage 2): the initiator signs the ReturnOnionTemplate binding it to (circuitId, commitmentRoot, noncePrefix, kRet, envelope, expiry, gatewayNodeId). The gateway verifies the signature + checks its own NodeId + expiry. Only the intended terminal gateway can accept the template \u2014 a relay that intercepts the transfer cannot use it (wrong NodeId). The signature prevents tampering with K_ret or the envelope. The circuitId/commitmentRoot binding prevents template replay onto a different circuit. Family: V-CIRCUIT-GATEWAY-TEMPLATE.",
+          "conformance_vector_family": "V-CIRCUIT-GATEWAY-TEMPLATE"
         }
       }
     },

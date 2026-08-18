@@ -12,7 +12,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { randomBytes } from "@reference/identity/keys";
+import { randomBytes, generateNodeKeypair } from "@reference/identity/keys";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { toHex } from "@reference/encoding/cbor";
 import {
@@ -32,6 +32,10 @@ import {
   peelReturnEnvelopeLayer,
   decryptReturnPayload,
   encodeReturnFramePayload,
+  signGatewayReturnTemplate,
+  verifyGatewayReturnTemplate,
+  encodeGatewayReturnTemplate,
+  decodeGatewayReturnTemplate,
 } from "@reference/circuit/return-template";
 import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
@@ -380,3 +384,198 @@ describe("R-009 Stage 2: full distributed integration (production path)", () => 
 function encodeReturnFramePayloadForTest(payload: { sealedPayload: Uint8Array; envelopeLayer: Uint8Array }): Uint8Array {
   return encodeReturnFramePayload(payload);
 }
+
+// =====================================================================
+// R-009 Stage 2: GatewayReturnTemplate — authenticated transfer
+// (per the re-audit of 67deef6: the template must cross the network as an
+//  authenticated setup message, not merely be returned in memory.)
+// =====================================================================
+
+describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () => {
+  test("initiator signs + gateway verifies → accepts template", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+
+    // Initiator signs the gateway template.
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // Gateway verifies — matches its own NodeId + valid signature + not expired.
+    const result = verifyGatewayReturnTemplate(gt, gatewayNodeId, NOW);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    // The recovered template has the correct K_ret + envelope.
+    expect(toHex(result.template.kRet)).toBe(toHex(template.kRet));
+    expect(toHex(result.template.envelope)).toBe(toHex(template.envelope));
+  });
+
+  test("encode → decode round-trip preserves all fields", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const encoded = encodeGatewayReturnTemplate(gt);
+    const decoded = decodeGatewayReturnTemplate(encoded);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(toHex(decoded.gatewayTemplate.circuitId)).toBe(toHex(gt.circuitId));
+    expect(toHex(decoded.gatewayTemplate.initiatorSignature)).toBe(toHex(gt.initiatorSignature));
+    expect(decoded.gatewayTemplate.gatewayNodeId).toBe(gt.gatewayNodeId);
+  });
+
+  test("wrong gateway → REJECT (only the intended terminal gateway can accept)", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // A different node (e.g., relay 0) tries to accept → REJECTED.
+    const wrongNodeId = route.branded.hops[0]!.nodeId;
+    const result = verifyGatewayReturnTemplate(gt, wrongNodeId, NOW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("gateway NodeId mismatch");
+  });
+
+  test("expired template → REJECT", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // now > expiry → REJECTED.
+    const result = verifyGatewayReturnTemplate(gt, gatewayNodeId, route.branded.expiry + 1);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("expired");
+  });
+
+  test("tampered K_ret → signature invalid → REJECT", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // Tamper K_ret.
+    const tampered = { ...gt, kRet: new Uint8Array(32).fill(0xFF) };
+    const result = verifyGatewayReturnTemplate(tampered, gatewayNodeId, NOW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("signature invalid");
+  });
+
+  test("tampered signature → REJECT", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // Flip one bit in the signature.
+    const tamperedSig = new Uint8Array(gt.initiatorSignature);
+    tamperedSig[0] ^= 0x01;
+    const tampered = { ...gt, initiatorSignature: tamperedSig };
+    const result = verifyGatewayReturnTemplate(tampered, gatewayNodeId, NOW);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("signature invalid");
+  });
+
+  test("full distributed flow: establish → sign → transfer → gateway verifies → seals response → source decrypts", async () => {
+    // This is the canonical end-to-end integration test: the initiator
+    // establishes the circuit + signs the gateway template, the gateway
+    // verifies + accepts the template, then seals a real response, and the
+    // return chain delivers it to the source through the production path.
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = generateNodeKeypair();
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // 1. Initiator constructs the template + signs the gateway transfer.
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayTemplate = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // 2. "Network transfer": encode → decode (simulating the wire).
+    const wireBytes = encodeGatewayReturnTemplate(gatewayTemplate);
+    const decoded = decodeGatewayReturnTemplate(wireBytes);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    // 3. Gateway verifies the transfer — accepts the template.
+    const verifyResult = verifyGatewayReturnTemplate(
+      decoded.gatewayTemplate, gatewayNodeId, NOW,
+    );
+    expect(verifyResult.ok).toBe(true);
+    if (!verifyResult.ok) return;
+    const gatewayTemplate_ = verifyResult.template; // K_ret + envelope
+
+    // 4. Gateway seals a real response using the accepted template.
+    const httpResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    const retCiphertext = sealReturnFrameFromTemplate(gatewayTemplate_, 1, httpResponse);
+    const retFrame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 1,
+      direction: DIRECTION_BACKWARD,
+      ciphertext: retCiphertext,
+    } as any;
+    const retWire = encodeCircuitFrame(retFrame);
+
+    // 5. Relay 1 processes the backward frame (production path).
+    const r1 = await processCircuitWireFrame(circuit, 1, retWire);
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+
+    // 6. Source (hop 0) processes — terminal, delivers the response.
+    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes);
+    expect(r0.ok).toBe(true);
+    if (!r0.ok) return;
+    expect(new TextDecoder().decode(r0.plaintext)).toBe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+  });
+});

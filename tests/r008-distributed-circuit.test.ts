@@ -95,6 +95,7 @@ describe("R-008: Distributed circuit establishment", () => {
     const acks = [relay0Result.ack, relay1Result.ack];
     const estResult = await establishDistributedCircuit(
       ctx.branded, initSk, initPk, acks, ctx.hpk, NOW, testAckStore, testFloorStore,
+      ctx.initiator.secretKey, ctx.initiator.publicKey,
     );
     expect(estResult.ok).toBe(true);
     if (!estResult.ok) return;
@@ -220,9 +221,12 @@ describe("R-008: Distributed circuit establishment", () => {
       committedAt: 0,
     };
 
-    // establishDistributedCircuit must reject the fake route
+    // establishDistributedCircuit must reject the fake route. The brand
+    // check throws before the new initiator Ed25519 keypair params are
+    // consulted, so dummy 32-byte keys are acceptable here.
     const result = await establishDistributedCircuit(
       fakeRoute as any, randomBytes(32), randomBytes(32), [], new Map(), NOW, testAckStore, testFloorStore,
+      new Uint8Array(32), new Uint8Array(32),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("not a genuine BrandedCommittedRoute");
@@ -254,6 +258,7 @@ describe("R-008: Distributed circuit establishment", () => {
     const acks = [relay0Result.ack, relay1Result.ack];
     const estResult = await establishDistributedCircuit(
       ctx.branded, initSk, initPk, acks, ctx.hpk, NOW, testAckStore, testFloorStore,
+      ctx.initiator.secretKey, ctx.initiator.publicKey,
     );
     expect(estResult.ok).toBe(true);
     if (!estResult.ok) return;

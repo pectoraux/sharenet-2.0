@@ -81,6 +81,7 @@ function makeRoute(numHops = 1) {
     hpk: ctx.hopPublicKeys,
     commitmentRoot: ctx.branded.commitmentRoot,
     commitDigestHex: toHex(routeCommitmentDigest(ctx.branded)),
+    initiator: ctx.initiator,
   };
 }
 
@@ -412,6 +413,7 @@ describe("R-008 durable integration: establishDistributedCircuit uses both durab
     const est = await establishDistributedCircuit(
       route.branded, initSk, initPk, [relay0.ack], route.hpk, NOW,
       ackStore, floorStore,
+      route.initiator.secretKey, route.initiator.publicKey,
     );
     expect(est.ok).toBe(true);
     if (!est.ok) return;
@@ -468,6 +470,7 @@ describe("R-008 durable integration: establishDistributedCircuit uses both durab
     const est = await establishDistributedCircuit(
       route.branded, initSk, initPk, [relay0.ack], route.hpk, NOW,
       ackStore, floorStore,
+      route.initiator.secretKey, route.initiator.publicKey,
     );
     expect(est.ok).toBe(true);
     if (!est.ok) return;
