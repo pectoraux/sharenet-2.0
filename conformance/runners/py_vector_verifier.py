@@ -1640,14 +1640,21 @@ CIRCUIT_ACK_DOMAIN = b"SHARENET/CIRCUIT/ACK/1"
 
 def circuit_ack_signing_payload(route_id: str, route_commitment_digest_hex: str,
                                 hop_index: int, relay_x25519_pubkey: bytes,
-                                initiator_x25519_pubkey: bytes, ack_nonce: bytes,
+                                initiator_x25519_pubkey: bytes,
+                                possession_proof_ciphertext: bytes,
+                                possession_challenge: bytes,
+                                ack_nonce: bytes,
                                 ack_timestamp: int, ack_expiry: int) -> bytes:
     """Compute the bytes-to-be-signed for a CircuitSetupAck.
 
     Body = canonical CBOR of integer-keyed map:
       1: routeId, 2: routeCommitmentDigestHex, 3: hopIndex,
       4: relayX25519PublicKey, 5: initiatorX25519PublicKey,
-      6: ackNonce, 7: ackTimestamp, 8: ackExpiry
+      6: possessionProofCiphertext (AEAD ciphertext over the relay's
+         possessionChallenge — proves the relay holds the derived
+         forwardingKey),
+      7: possessionChallenge (plaintext challenge encrypted into slot 6),
+      8: ackNonce, 9: ackTimestamp, 10: ackExpiry
     Payload = utf8(SHARENET/CIRCUIT/ACK/1) || body
     """
     m = {
@@ -1656,9 +1663,11 @@ def circuit_ack_signing_payload(route_id: str, route_commitment_digest_hex: str,
         3: hop_index,
         4: relay_x25519_pubkey,
         5: initiator_x25519_pubkey,
-        6: ack_nonce,
-        7: ack_timestamp,
-        8: ack_expiry,
+        6: possession_proof_ciphertext,
+        7: possession_challenge,
+        8: ack_nonce,
+        9: ack_timestamp,
+        10: ack_expiry,
     }
     return CIRCUIT_ACK_DOMAIN + canonical_cbor_encode(m)
 
@@ -1680,6 +1689,8 @@ def verify_circuit_ack_vector(data: dict) -> dict:
                 inp["hopIndex"],
                 bytes.fromhex(inp["relayX25519PublicKeyHex"]),
                 bytes.fromhex(inp["initiatorX25519PublicKeyHex"]),
+                bytes.fromhex(inp["possessionProofCiphertextHex"]),
+                bytes.fromhex(inp["possessionChallengeHex"]),
                 bytes.fromhex(inp["ackNonceHex"]),
                 inp["ackTimestamp"],
                 inp["ackExpiry"],

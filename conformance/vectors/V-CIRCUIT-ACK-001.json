@@ -3,7 +3,7 @@
   "status": "draft",
   "spec": "spec/08-circuits.md §4.4, spec/00 §24, GATE-06, R-008H",
   "adr": "adr/0017-protocol-freeze-reconciliation.md",
-  "description": "CircuitSetupAck signing payload: binds routeId, routeCommitmentDigestHex, hopIndex, relay X25519 pubkey, initiator X25519 pubkey, ackNonce, ackTimestamp, ackExpiry into a canonical CBOR map prefixed by the SHARENET/CIRCUIT/ACK/1 domain tag. Per R-008H: the ack cryptographically binds the relay to the EXACT committed route (routeCommitmentDigest), preventing route substitution. The payload is signed by the relay's Ed25519 key as proof-of-possession + transcript binding.",
+  "description": "CircuitSetupAck signing payload: binds routeId, routeCommitmentDigestHex, hopIndex, relay X25519 pubkey, initiator X25519 pubkey, possessionProofCiphertext, possessionChallenge, ackNonce, ackTimestamp, ackExpiry into a canonical CBOR map prefixed by the SHARENET/CIRCUIT/ACK/1 domain tag. Per R-008H: the ack cryptographically binds the relay to the EXACT committed route (routeCommitmentDigest), preventing route substitution. The possession proof (AEAD ciphertext + plaintext challenge) proves the relay holds the derived forwarding key — see V-CIRCUIT-SETUP-001 for the real possession-proof flow. The payload is signed by the relay's Ed25519 key as proof-of-possession + transcript binding.",
   "constants": {
     "domain": "SHARENET/CIRCUIT/ACK/1",
     "bodyEncoding": "canonical CBOR (RFC 8949 §4.2.2), integer-keyed map per ADR-0004",
@@ -14,9 +14,11 @@
       "3": "hopIndex (uint)",
       "4": "relayX25519PublicKey (bstr .size 32)",
       "5": "initiatorX25519PublicKey (bstr .size 32, transcript binding)",
-      "6": "ackNonce (bstr .size 16)",
-      "7": "ackTimestamp (uint, unix seconds)",
-      "8": "ackExpiry (uint, unix seconds)"
+      "6": "possessionProofCiphertext (bstr .size 48, AEAD ciphertext over the relay's possessionChallenge — proves the relay holds the derived forwardingKey)",
+      "7": "possessionChallenge (bstr .size 32, plaintext challenge encrypted into slot 6)",
+      "8": "ackNonce (bstr .size 16)",
+      "9": "ackTimestamp (uint, unix seconds)",
+      "10": "ackExpiry (uint, unix seconds)"
     },
     "ackMaxAgeSeconds": 120,
     "ackMaxClockSkewSeconds": 60
@@ -34,11 +36,13 @@
         "initiatorX25519PublicKeyHex": "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40",
         "ackNonceHex": "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
         "ackTimestamp": 1786876545,
-        "ackExpiry": 1786880145
+        "ackExpiry": 1786880145,
+        "possessionProofCiphertextHex": "1f9615cf8b6c5d99716532f8810df9c214b2a2ee9e294916a2da72638648816938efd027428e087fd1975b9cc3330b5d",
+        "possessionChallengeHex": "3441ea98166aebe3f4deb21720ff7a5cac5a2166f838be6f8de47cdb02c1f451"
       },
       "intermediate": {
-        "signingPayloadHex": "53484152454e45542f434952435549542f41434b2f31a8017846726f7574653a3565646132643032386330343632326162393732656336663830306463666662356136616239613266373039356530653833326232393232646233326438623902784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400650e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6071a6a819281081a6a81a091",
-        "signingPayloadLengthBytes": 265
+        "signingPayloadHex": "53484152454e45542f434952435549542f41434b2f31aa017846726f7574653a3565646132643032386330343632326162393732656336663830306463666662356136616239613266373039356530653833326232393232646233326438623902784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400658301f9615cf8b6c5d99716532f8810df9c214b2a2ee9e294916a2da72638648816938efd027428e087fd1975b9cc3330b5d0758203441ea98166aebe3f4deb21720ff7a5cac5a2166f838be6f8de47cdb02c1f4510850e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6091a6a8192810a1a6a81a091",
+        "signingPayloadLengthBytes": 351
       },
       "expected": {
         "result": "ok",
@@ -57,11 +61,13 @@
         "ackNonceHex": "e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6",
         "ackTimestamp": 1786876545,
         "ackExpiry": 1786880145,
-        "mutation": "routeId changed to a different 32-byte hex string"
+        "mutation": "routeId changed to a different 32-byte hex string",
+        "possessionProofCiphertextHex": "1f9615cf8b6c5d99716532f8810df9c214b2a2ee9e294916a2da72638648816938efd027428e087fd1975b9cc3330b5d",
+        "possessionChallengeHex": "3441ea98166aebe3f4deb21720ff7a5cac5a2166f838be6f8de47cdb02c1f451"
       },
       "intermediate": {
-        "tamperedSigningPayloadHex": "53484152454e45542f434952435549542f41434b2f31a8017842726f7574653a65656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656502784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400650e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6071a6a819281081a6a81a091",
-        "originalSigningPayloadHex": "53484152454e45542f434952435549542f41434b2f31a8017846726f7574653a3565646132643032386330343632326162393732656336663830306463666662356136616239613266373039356530653833326232393232646233326438623902784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400650e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6071a6a819281081a6a81a091",
+        "tamperedSigningPayloadHex": "53484152454e45542f434952435549542f41434b2f31aa017842726f7574653a65656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656565656502784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400658301f9615cf8b6c5d99716532f8810df9c214b2a2ee9e294916a2da72638648816938efd027428e087fd1975b9cc3330b5d0758203441ea98166aebe3f4deb21720ff7a5cac5a2166f838be6f8de47cdb02c1f4510850e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6091a6a8192810a1a6a81a091",
+        "originalSigningPayloadHex": "53484152454e45542f434952435549542f41434b2f31aa017846726f7574653a3565646132643032386330343632326162393732656336663830306463666662356136616239613266373039356530653833326232393232646233326438623902784061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839030204582011223344556677889900aabbccddeeff11223344556677889900aabbccddeeff0558202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f400658301f9615cf8b6c5d99716532f8810df9c214b2a2ee9e294916a2da72638648816938efd027428e087fd1975b9cc3330b5d0758203441ea98166aebe3f4deb21720ff7a5cac5a2166f838be6f8de47cdb02c1f4510850e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6091a6a8192810a1a6a81a091",
         "bytesDiffer": true
       },
       "expected": {
@@ -70,6 +76,6 @@
       }
     }
   ],
-  "verification": "Reference implementation: reference/circuit/distributed-setup.ts — circuitAckSigningPayload, routeCommitmentDigest.",
+  "verification": "Reference implementation: reference/circuit/distributed-setup.ts — circuitAckSigningPayload, generatePossessionProof, routeCommitmentDigest.",
   "notes": "Per R-008H: the ack binds to BOTH the routeId (identity) AND the routeCommitmentDigest (cryptographic binding to the exact committed route). A relay that signs an ack is committing to forward traffic for THIS exact route — substitution of the underlying route (different hops, different terms) is cryptographically detectable. The ack freshness bounds (ackMaxAgeSeconds=120, ackMaxClockSkewSeconds=60) are enforced by processCircuitSetupAck independently of this payload encoding."
 }

@@ -889,7 +889,8 @@ function verifyCircuitSetupVector(data: any): VectorResult {
 // Payload = utf8(SHARENET/CIRCUIT/ACK/1) || canonicalEncode({
 //   1: routeId, 2: routeCommitmentDigestHex, 3: hopIndex,
 //   4: relayX25519PublicKey, 5: initiatorX25519PublicKey,
-//   6: ackNonce, 7: ackTimestamp, 8: ackExpiry
+//   6: possessionProofCiphertext, 7: possessionChallenge,
+//   8: ackNonce, 9: ackTimestamp, 10: ackExpiry
 // }).
 // ---------------------------------------------------------------------------
 
@@ -901,12 +902,17 @@ function verifyCircuitAckVector(data: any): VectorResult {
   for (const v of vectors) {
     try {
       const input = v.input;
+      // The new circuitAckSigningPayload signature inserts
+      // possessionProofCiphertext + possessionChallenge as the 6th/7th
+      // params, before ackNonce/ackTimestamp/ackExpiry.
       const payload = circuitAckSigningPayload(
         input.routeId,
         input.routeCommitmentDigestHex,
         input.hopIndex,
         hexToBytes(input.relayX25519PublicKeyHex),
         hexToBytes(input.initiatorX25519PublicKeyHex),
+        hexToBytes(input.possessionProofCiphertextHex),
+        hexToBytes(input.possessionChallengeHex),
         hexToBytes(input.ackNonceHex),
         input.ackTimestamp,
         input.ackExpiry,

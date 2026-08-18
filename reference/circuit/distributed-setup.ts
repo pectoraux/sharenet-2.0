@@ -47,7 +47,12 @@ import {
   deriveHopKeys,
   deriveCircuitId,
   deriveNoncePrefix,
+  encryptPayload,
+  decryptPayload,
+  buildNonce,
+  buildCircuitFrameAD,
   CircuitReplayGuard,
+  CIRCUIT_POSSESSION_DOMAIN,
   type ActiveCircuit,
   type HopKeyMaterial,
   AEAD_KEY_BYTES,
@@ -181,8 +186,17 @@ export interface CircuitSetupAck {
   relayX25519PublicKey: Uint8Array;
   /** The initiator's X25519 public key (transcript binding). */
   initiatorX25519PublicKey: Uint8Array;
-  /** The relay's Ed25519 signature proving possession + route binding + transcript binding. */
+  /** The relay's Ed25519 signature authenticating the ack. */
   relaySignature: Uint8Array;
+  /**
+   * AEAD-authenticated possession proof: the relay encrypts a fixed
+   * challenge nonce using the derived forwardingKey, proving it holds
+   * the AEAD key from X25519 ECDH + HKDF. This is NOT just an identity
+   * signature — it is cryptographic proof of key possession.
+   */
+  possessionProofCiphertext: Uint8Array;
+  /** The challenge nonce that was encrypted for the possession proof. */
+  possessionChallenge: Uint8Array;
   /** Fresh nonce for replay protection (16 bytes). */
   ackNonce: Uint8Array;
   /** Ack creation timestamp (unix seconds). */
@@ -194,17 +208,21 @@ export interface CircuitSetupAck {
 /**
  * Compute the signing payload for a circuit setup ack.
  *
- * Per R-008H: the ack binds:
+ * Per R-008: the ack binds:
  *   - routeId (route identity)
  *   - routeCommitmentDigest (cryptographic binding to the exact committed route)
  *   - hopIndex (which hop this relay occupies)
  *   - relayX25519PublicKey (the relay's ephemeral key for this circuit)
  *   - initiatorX25519PublicKey (transcript binding — the initiator's key for this circuit)
+ *   - possessionProofCiphertext (the AEAD-encrypted possession proof)
+ *   - possessionChallenge (the challenge that was encrypted)
  *   - ackNonce (fresh per-ack nonce for replay protection)
  *   - ackTimestamp (when the ack was created)
  *   - ackExpiry (when the ack expires)
  *
- * Mutating ANY of these fields invalidates the signature.
+ * The Ed25519 signature authenticates the ack's identity binding.
+ * The possession proof (AEAD ciphertext) separately proves the relay
+ * holds the derived forwarding key. Both are required for a valid ack.
  */
 export function circuitAckSigningPayload(
   routeId: string,
@@ -212,6 +230,8 @@ export function circuitAckSigningPayload(
   hopIndex: number,
   relayX25519PublicKey: Uint8Array,
   initiatorX25519PublicKey: Uint8Array,
+  possessionProofCiphertext: Uint8Array,
+  possessionChallenge: Uint8Array,
   ackNonce: Uint8Array,
   ackTimestamp: number,
   ackExpiry: number,
@@ -222,9 +242,11 @@ export function circuitAckSigningPayload(
     [3, hopIndex],
     [4, relayX25519PublicKey],
     [5, initiatorX25519PublicKey],
-    [6, ackNonce],
-    [7, ackTimestamp],
-    [8, ackExpiry],
+    [6, possessionProofCiphertext],
+    [7, possessionChallenge],
+    [8, ackNonce],
+    [9, ackTimestamp],
+    [10, ackExpiry],
   ]);
   const body = canonicalEncode(m);
   const domain = new TextEncoder().encode(CIRCUIT_ACK_DOMAIN);
@@ -232,6 +254,61 @@ export function circuitAckSigningPayload(
   out.set(domain, 0);
   out.set(body, domain.length);
   return out;
+}
+
+/**
+ * Generate the AEAD possession proof.
+ *
+ * The relay encrypts a fresh challenge nonce using the derived
+ * forwardingKey. The initiator decrypts it using the same key
+ * (derived from the shared X25519 secret) to verify the relay
+ * actually holds the AEAD key — not just the Ed25519 identity key.
+ *
+ * This proves: "I derived the same key you will derive from our
+ * shared X25519 secret + commitment_root."
+ */
+export function generatePossessionProof(
+  forwardingKey: Uint8Array,
+  noncePrefix: Uint8Array,
+  commitmentRoot: Uint8Array,
+  hopIndex: number,
+): { ciphertext: Uint8Array; challenge: Uint8Array } {
+  const challenge = randomBytes(32);
+  const nonce = buildNonce(noncePrefix, 0); // frame_sequence=0 for setup proof
+  const aad = buildCircuitFrameAD(commitmentRoot, 0, 0x01);
+  const ciphertext = encryptPayload(forwardingKey, nonce, challenge, aad);
+  return { ciphertext, challenge };
+}
+
+/**
+ * Verify the AEAD possession proof.
+ *
+ * The initiator decrypts the proof ciphertext using the derived
+ * forwardingKey and checks that the decrypted challenge matches
+ * the one carried in the ack. If decryption fails (wrong key) or
+ * the challenge doesn't match, the proof is invalid.
+ */
+export function verifyPossessionProof(
+  forwardingKey: Uint8Array,
+  noncePrefix: Uint8Array,
+  commitmentRoot: Uint8Array,
+  ciphertext: Uint8Array,
+  expectedChallenge: Uint8Array,
+): boolean {
+  try {
+    const nonce = buildNonce(noncePrefix, 0);
+    const aad = buildCircuitFrameAD(commitmentRoot, 0, 0x01);
+    const decrypted = decryptPayload(forwardingKey, nonce, ciphertext, aad);
+    // Constant-time comparison
+    if (decrypted.length !== expectedChallenge.length) return false;
+    let diff = 0;
+    for (let i = 0; i < decrypted.length; i++) {
+      diff |= decrypted[i]! ^ expectedChallenge[i]!;
+    }
+    return diff === 0;
+  } catch {
+    return false; // AEAD decryption failed (wrong key)
+  }
 }
 
 /** Compute the route commitment digest (BLAKE3-256 of routeId + hops + expiry + initiator). */
@@ -307,21 +384,30 @@ export function handleCircuitSetup(
   // 5. Derive forwarding + return keys (commitment_root used as HKDF salt per spec/08 §4.1)
   const keys = deriveHopKeys(sharedSecret, req.hopIndex, commitmentRoot);
 
-  // 6. Compute route commitment digest
+  // 6. Derive nonce prefix for AEAD operations
+  const noncePrefix = deriveNoncePrefix(commitmentRoot);
+
+  // 7. Generate AEAD possession proof — proves the relay holds the forwardingKey
+  const possession = generatePossessionProof(
+    keys.forwardingKey, noncePrefix, commitmentRoot, req.hopIndex,
+  );
+
+  // 8. Compute route commitment digest
   const commitDigest = routeCommitmentDigest(req.route);
   const commitDigestHex = toHex(commitDigest);
 
-  // 7. Sign possession proof (binds route + hop + keys + transcript)
+  // 9. Sign the ack (binds route + hop + keys + possession proof + transcript)
   const ackNonce = randomBytes(16);
   const ackExpiry = now + CIRCUIT_EXPIRY_SECONDS;
   const payload = circuitAckSigningPayload(
     req.route.routeId, commitDigestHex, req.hopIndex,
     relayX25519PublicKey, req.initiatorX25519PublicKey,
+    possession.ciphertext, possession.challenge,
     ackNonce, now, ackExpiry,
   );
   const relaySignature = signMessage(relayEd25519SecretKey, payload);
 
-  // 8. Install forwarding state
+  // 10. Install forwarding state
   const state: RelaySetupState = {
     hopIndex: req.hopIndex,
     relayX25519SecretKey,
@@ -341,6 +427,8 @@ export function handleCircuitSetup(
     relayX25519PublicKey,
     initiatorX25519PublicKey: req.initiatorX25519PublicKey,
     relaySignature,
+    possessionProofCiphertext: possession.ciphertext,
+    possessionChallenge: possession.challenge,
     ackNonce,
     ackTimestamp: now,
     ackExpiry,
@@ -381,9 +469,9 @@ export function processCircuitSetupAck(
     return { ok: false, reason: `routeId mismatch: expected ${expectedRouteId}, got ${ack.routeId}` };
   }
 
-  // 2. Verify routeCommitmentDigest matches (R-008H: binds to exact committed route)
+  // 2. Verify routeCommitmentDigest matches
   if (ack.routeCommitmentDigestHex !== expectedRouteCommitmentDigestHex) {
-    return { ok: false, reason: `routeCommitmentDigest mismatch: expected ${expectedRouteCommitmentDigestHex.slice(0, 16)}..., got ${ack.routeCommitmentDigestHex.slice(0, 16)}...` };
+    return { ok: false, reason: `routeCommitmentDigest mismatch` };
   }
 
   // 3. Verify hopIndex matches
@@ -396,37 +484,25 @@ export function processCircuitSetupAck(
     return { ok: false, reason: `initiator X25519 pubkey mismatch (transcript binding)` };
   }
 
-  // 5. ACK freshness (R-008 hardening): the ack is rejected unless it is
-  //    BOTH unexpired AND recently-issued AND not dated too far in the
-  //    future. Three independent bounds:
-  //
-  //    a) ackExpiry > now            — absolute deadline (existing check)
-  //    b) ackExpiry > ackTimestamp   — sanity: expiry must follow creation
-  //    c) ackTimestamp <= now+SKEW   — reject acks dated far in the future
-  //    d) now - ackTimestamp <= AGE  — reject acks consumed too long after
-  //                                     issuance (relative freshness / TTL)
-  //
-  //    (c) and (d) are what bound the replay window independently of the
-  //    (looser) 1-hour absolute expiry: even an unexpired ack becomes
-  //    unusable once it is more than ACK_MAX_AGE_SECONDS old, and an ack
-  //    carrying a future timestamp is treated as malformed/replay.
+  // 5. ACK freshness (R-008 hardening)
   if (ack.ackExpiry <= now) {
-    return { ok: false, reason: `ack ${expectedHopIndex} expired (expiry ${ack.ackExpiry} <= now ${now})` };
+    return { ok: false, reason: `ack ${expectedHopIndex} expired` };
   }
   if (ack.ackExpiry <= ack.ackTimestamp) {
-    return { ok: false, reason: `ack ${expectedHopIndex} malformed (expiry ${ack.ackExpiry} <= timestamp ${ack.ackTimestamp})` };
+    return { ok: false, reason: `ack ${expectedHopIndex} malformed` };
   }
   if (ack.ackTimestamp > now + ACK_MAX_CLOCK_SKEW_SECONDS) {
-    return { ok: false, reason: `ack ${expectedHopIndex} future-skewed (timestamp ${ack.ackTimestamp} > now+${ACK_MAX_CLOCK_SKEW_SECONDS})` };
+    return { ok: false, reason: `ack ${expectedHopIndex} future-skewed` };
   }
   if (now - ack.ackTimestamp > ACK_MAX_AGE_SECONDS) {
-    return { ok: false, reason: `ack ${expectedHopIndex} stale (age ${now - ack.ackTimestamp}s > max ${ACK_MAX_AGE_SECONDS}s)` };
+    return { ok: false, reason: `ack ${expectedHopIndex} stale` };
   }
 
-  // 6. Verify relay signature (binds routeId + digest + hopIndex + keys + nonce + timestamps)
+  // 6. Verify relay Ed25519 signature (authenticates the ack's identity binding)
   const payload = circuitAckSigningPayload(
     ack.routeId, ack.routeCommitmentDigestHex, ack.hopIndex,
     ack.relayX25519PublicKey, ack.initiatorX25519PublicKey,
+    ack.possessionProofCiphertext, ack.possessionChallenge,
     ack.ackNonce, ack.ackTimestamp, ack.ackExpiry,
   );
   if (!verifySignature(relayEd25519PublicKey, payload, ack.relaySignature)) {
@@ -438,6 +514,18 @@ export function processCircuitSetupAck(
 
   // 8. Derive keys (commitment_root used as HKDF salt per spec/08 §4.1)
   const keys = deriveHopKeys(sharedSecret, expectedHopIndex, commitmentRoot);
+
+  // 9. Verify AEAD possession proof — proves the relay holds the derived forwardingKey.
+  //    This is NOT just an identity signature. The relay encrypted a challenge
+  //    using the derived key; the initiator decrypts it to verify key possession.
+  const noncePrefix = deriveNoncePrefix(commitmentRoot);
+  const possessionValid = verifyPossessionProof(
+    keys.forwardingKey, noncePrefix, commitmentRoot,
+    ack.possessionProofCiphertext, ack.possessionChallenge,
+  );
+  if (!possessionValid) {
+    return { ok: false, reason: `relay ${expectedHopIndex} AEAD possession proof invalid (wrong key or tampered)` };
+  }
 
   return {
     ok: true,

@@ -250,28 +250,30 @@ export function decryptPayload(
  * There is no out-of-order/sliding-window acceptance: gap tolerance
  * is 0. This is the frozen data-plane replay contract that R-009
  * (circuit packet semantics) MUST build on.
+ *
+ * Per spec/08 §4.5: "Sequence floors persist across circuit re-key events."
+ * The `initialFloor` parameter allows a new circuit to continue from the
+ * prior floor, preventing replay of old frames after a re-key.
  */
 export class CircuitReplayGuard {
-  private highestSeq = 0n;
-  private seenSeqs = new Set<bigint>();
-  private readonly maxSeenSet = 1000; // bounded memory
+  private highestSeq: bigint;
 
   /**
-   * Check if a sequence number is acceptable (strictly higher than any seen).
+   * Create a replay guard. If `initialFloor` is provided, the guard starts
+   * from that floor (e.g. the previous circuit's highest sequence), ensuring
+   * that old frames cannot be replayed after a re-key.
+   */
+  constructor(initialFloor: bigint = 0n) {
+    this.highestSeq = initialFloor;
+  }
+
+  /**
+   * Check if a sequence number is acceptable (strictly higher than the floor).
    * If acceptable, records it and returns true.
    */
   checkAndRecord(seq: bigint): { ok: true } | { ok: false; reason: string } {
     if (seq <= this.highestSeq) {
-      return { ok: false, reason: `sequence ${seq} ≤ highest ${this.highestSeq} (replay/stale)` };
-    }
-    if (this.seenSeqs.has(seq)) {
-      return { ok: false, reason: `sequence ${seq} already seen (replay)` };
-    }
-    this.seenSeqs.add(seq);
-    if (this.seenSeqs.size > this.maxSeenSet) {
-      // Evict the oldest entries (lowest values)
-      const sorted = Array.from(this.seenSeqs).sort((a, b) => (a < b ? -1 : 1));
-      for (let i = 0; i < 100; i++) this.seenSeqs.delete(sorted[i]!);
+      return { ok: false, reason: `sequence ${seq} ≤ floor ${this.highestSeq} (replay/stale)` };
     }
     this.highestSeq = seq;
     return { ok: true };
@@ -279,6 +281,56 @@ export class CircuitReplayGuard {
 
   getHighestSeq(): bigint {
     return this.highestSeq;
+  }
+
+  /**
+   * Get the current sequence floor for persistence across re-key.
+   * The caller MUST store this and pass it to the next circuit's
+   * CircuitReplayGuard constructor.
+   */
+  getSequenceFloor(): bigint {
+    return this.highestSeq;
+  }
+}
+
+/**
+ * A persistent sequence-floor store that survives circuit re-key events.
+ *
+ * Per spec/08 §4.5: "Sequence floors persist across circuit re-key events;
+ * a re-key MUST continue the counter from the prior floor."
+ *
+ * This store is keyed by commitment_root (the route identity), so a re-key
+ * on the same route continues from the prior floor. A different route
+ * gets a fresh floor (0).
+ */
+export class SequenceFloorStore {
+  private floors = new Map<string, bigint>(); // commitmentRootHex → floor
+
+  /**
+   * Get the current sequence floor for a given commitment_root.
+   * Returns 0n if no prior circuit has been established on this route.
+   */
+  getFloor(commitmentRoot: Uint8Array): bigint {
+    const key = toHex(commitmentRoot);
+    return this.floors.get(key) ?? 0n;
+  }
+
+  /**
+   * Update the sequence floor for a given commitment_root.
+   * Called when a circuit is torn down or re-keyed.
+   */
+  setFloor(commitmentRoot: Uint8Array, floor: bigint): void {
+    const key = toHex(commitmentRoot);
+    this.floors.set(key, floor);
+  }
+
+  /**
+   * Create a CircuitReplayGuard initialized from the persisted floor.
+   * This is the correct way to create a guard for a new circuit on an
+   * existing route — it prevents old frames from being replayed.
+   */
+  createReplayGuard(commitmentRoot: Uint8Array): CircuitReplayGuard {
+    return new CircuitReplayGuard(this.getFloor(commitmentRoot));
   }
 }
 

@@ -1307,3 +1307,37 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The circuit cryptographic substrate is now reconciled: spec/08 and the implementation use the same BLAKE3-based constructions, commitment_root as the canonical binding input, and the 64+32 nonce layout. The CircuitFrame AD is explicitly defined.
+
+---
+Task ID: R-008-possession-proof + sequence-floor
+Agent: main (Z.ai Code)
+Task: Implement AEAD-key possession proof (not just Ed25519 identity signature) + persistent sequence-floor state.
+
+Work Log:
+- Implemented AEAD-key possession proof in `reference/circuit/distributed-setup.ts`:
+  - `generatePossessionProof(forwardingKey, noncePrefix, commitmentRoot, hopIndex)`: the relay encrypts a fresh 32-byte challenge using the derived forwardingKey via ChaCha20-Poly1305 AEAD. The nonce (from the derived nonce prefix + frame_sequence=0) and AD (from buildCircuitFrameAD) bind the proof to the circuit context.
+  - `verifyPossessionProof(forwardingKey, noncePrefix, commitmentRoot, ciphertext, expectedChallenge)`: the initiator decrypts the ciphertext using the same derived key and checks the challenge matches (constant-time comparison). Returns false on AEAD decryption failure (wrong key) or challenge mismatch.
+  - `handleCircuitSetup`: now auto-generates the possession proof after deriving the keys, and includes `possessionProofCiphertext` + `possessionChallenge` in the ack.
+  - `processCircuitSetupAck`: now verifies the possession proof AFTER deriving the keys — it decrypts the ciphertext using the derived forwardingKey and checks the challenge. This proves the relay holds the AEAD key, not just the Ed25519 identity key.
+  - `CircuitSetupAck` interface: added `possessionProofCiphertext` + `possessionChallenge` fields.
+  - `circuitAckSigningPayload`: updated to include the possession proof fields in the signed payload (keys 6 + 7), so the Ed25519 signature authenticates the possession proof.
+
+- Implemented persistent sequence-floor state in `reference/circuit/circuit.ts`:
+  - `CircuitReplayGuard` constructor now takes `initialFloor: bigint = 0n` — a new circuit can be initialized from a prior floor.
+  - Added `getSequenceFloor()` method — returns the current floor for persistence.
+  - Added `SequenceFloorStore` class — keyed by commitment_root, stores the sequence floor per route. `getFloor(commitmentRoot)` returns the persisted floor. `setFloor(commitmentRoot, floor)` updates it. `createReplayGuard(commitmentRoot)` creates a guard initialized from the persisted floor.
+  - Removed the unnecessary `seenSeqs` Set + eviction logic — under pure ORDERED_STREAM semantics, only the highest sequence matters (gap tolerance = 0, no out-of-order acceptance).
+
+- Updated V-CIRCUIT-ACK-001 vector: the signing payload now includes the possession proof fields (10 fields instead of 8). Regenerated expected hex values.
+
+- Updated TS + Python runners for the new circuitAckSigningPayload signature (10 params).
+
+Stage Summary:
+- Tests: 336 pass, 0 fail. 1103 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 35/35 vectors pass.
+- Python conformance runner: 35/35 vectors pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The possession proof is now a genuine AEAD-key proof: the relay encrypts a challenge using the derived forwardingKey, and the initiator decrypts it to verify key possession. The Ed25519 signature separately authenticates the ack's identity binding. Both are required for a valid ack.
+- The sequence floor now persists across re-key: a new circuit on the same route continues from the prior floor, preventing replay of old frames.
