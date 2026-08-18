@@ -2,8 +2,8 @@
   "id": "V-GATEWAY-SVC-001",
   "status": "frozen",
   "spec": "spec/09-internet-gateway.md §3.1",
-  "description": "GatewayServiceAgreement canonical encoding — dual-signed (gateway + source). Spec-frozen: the implementation uses ServiceAgreement (unsigned); this vector freezes the normative dual-signed wire format.",
-  "statusNote": "spec-frozen — no TS implementation of the dual-signed GatewayServiceAgreement exists. The vector freezes the canonical encoding from spec/09 §3.1.",
+  "description": "GatewayServiceAgreement canonical encoding — dual-signed (gateway + source). Implemented in reference/gateway/gateway-service-agreement.ts.",
+  "statusNote": "reference-implemented — the dual-signed GatewayServiceAgreement is implemented in reference/gateway/gateway-service-agreement.ts. The vector is verified against the real implementation by both TS and Python runners.",
   "vectors": [
     {
       "name": "valid-dual-signed-agreement",

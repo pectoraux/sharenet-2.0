@@ -117,7 +117,7 @@ describe("GATE-11: Contribution proofs", () => {
     expect(proofResult.ok).toBe(true);
 
     if (proofResult.ok) {
-      const appendResult = ledger.append(proofResult.proof, gateway.publicKey, peer.publicKey, REFERENCE_NOW);
+      const appendResult = ledger.append(proofResult.proof, gateway.nodeId, gateway.secretKey, REFERENCE_NOW);
       expect(appendResult.ok).toBe(true);
       expect(ledger.size()).toBe(1);
     }
@@ -136,11 +136,11 @@ describe("GATE-11: Contribution proofs", () => {
 
     if (proofResult.ok) {
       // First append — OK
-      ledger.append(proofResult.proof, gateway.publicKey, peer.publicKey, REFERENCE_NOW);
+      ledger.append(proofResult.proof, gateway.nodeId, gateway.secretKey, REFERENCE_NOW);
       expect(ledger.size()).toBe(1);
 
       // Second append of the SAME proof — rejected
-      const dup = ledger.append(proofResult.proof, gateway.publicKey, peer.publicKey, REFERENCE_NOW);
+      const dup = ledger.append(proofResult.proof, gateway.nodeId, gateway.secretKey, REFERENCE_NOW);
       expect(dup.ok).toBe(false);
       if (!dup.ok) expect(dup.reason).toContain("duplicate");
       expect(ledger.size()).toBe(1); // still 1
@@ -173,7 +173,7 @@ describe("GATE-11: Contribution proofs", () => {
 
     // Step 4: Append to ledger
     if (proofResult.ok) {
-      const appendResult = ledger.append(proofResult.proof, gateway.publicKey, peer.publicKey, REFERENCE_NOW);
+      const appendResult = ledger.append(proofResult.proof, gateway.nodeId, gateway.secretKey, REFERENCE_NOW);
       expect(appendResult.ok).toBe(true);
 
       // Step 5: Verify the ledger has the correct contribution
@@ -213,7 +213,7 @@ describe("GATE-11: Contribution proofs", () => {
       const proofResult = createContributionProof(receipt, gateway.publicKey, peer.publicKey, REFERENCE_NOW + i);
       expect(proofResult.ok).toBe(true);
       if (proofResult.ok) {
-        ledger.append(proofResult.proof, gateway.publicKey, peer.publicKey, REFERENCE_NOW + i);
+        ledger.append(proofResult.proof, gateway.nodeId, gateway.secretKey, REFERENCE_NOW + i);
       }
     }
 
@@ -235,7 +235,7 @@ describe("GATE-11: Contribution proofs", () => {
     body1.bytesReceived = 500;
     const r1 = createBilateralReceipt(body1, gw1.secretKey, peer.secretKey);
     const p1 = createContributionProof(r1, gw1.publicKey, peer.publicKey, REFERENCE_NOW);
-    if (p1.ok) ledger.append(p1.proof, gw1.publicKey, peer.publicKey, REFERENCE_NOW);
+    if (p1.ok) ledger.append(p1.proof, gw1.nodeId, gw1.secretKey, REFERENCE_NOW);
 
     // gw2 contributes
     const body2 = makeReceiptBody(gw2.nodeId, peer.nodeId);
@@ -243,7 +243,7 @@ describe("GATE-11: Contribution proofs", () => {
     body2.bytesReceived = 1000;
     const r2 = createBilateralReceipt(body2, gw2.secretKey, peer.secretKey);
     const p2 = createContributionProof(r2, gw2.publicKey, peer.publicKey, REFERENCE_NOW);
-    if (p2.ok) ledger.append(p2.proof, gw2.publicKey, peer.publicKey, REFERENCE_NOW);
+    if (p2.ok) ledger.append(p2.proof, gw2.nodeId, gw2.secretKey, REFERENCE_NOW);
 
     expect(ledger.size()).toBe(2);
     expect(ledger.getTotalBytesForwarded(gw1.nodeId)).toBe(1000);
@@ -273,13 +273,13 @@ describe("GATE-11: Contribution proofs", () => {
     const receipt = createBilateralReceipt(body, gateway.secretKey, peer.secretKey);
     const proofResult = createContributionProof(receipt, gateway.publicKey, peer.publicKey, REFERENCE_NOW);
     if (proofResult.ok) {
-      ledger.append(proofResult.proof, gateway.publicKey, peer.publicKey, REFERENCE_NOW);
+      ledger.append(proofResult.proof, gateway.nodeId, gateway.secretKey, REFERENCE_NOW);
     }
 
     // The ledger has no remove/delete method — entries are permanent
     expect(ledger.size()).toBe(1);
     const entries = ledger.getEntries();
     expect(entries.length).toBe(1);
-    expect(entries[0]!.sequenceNumber).toBe(0);
+    expect(entries[0]!.sequence).toBe(0);
   });
 });

@@ -57,7 +57,7 @@ where the actual verification level is lower than originally claimed.
 | R-004 | P0 | Commitment verifies signatures | ✅ CLOSED — acceptance sig verification, commitment signature over Merkle root, independent verifyRouteCommitment(), immutable artifact, 20/20 TS+Python golden vectors pass |
 | R-005 | P0 | Truthful gate system | ✅ CLOSED — tracker reconciled to HEAD; invariant: no "pending" claim when CI gate passes |
 | R-006 | P1 | Architecture test upgrades | ✅ CLOSED — construction boundaries enforced (ValidatedHop requires AuthenticatedLink, BrandedCommittedRoute requires genuine ValidatedHop[], setupCircuit requires BrandedCommittedRoute) |
-| R-007 | P1 | Vectors as mandatory inputs | ⚠️ OPEN — TS+Python runners pass 20/20; routing vector added; broader expansion (circuit, gateway, contribution) pending |
+| R-007 | P1 | Vectors as mandatory inputs | ✅ CLOSED — 34/34 TS+Python vectors pass; registry v3 with maturity tracking; spec↔registry↔manifest↔TS↔Python self-enforcing chain; GatewayServiceAgreement + LedgerEntry structural divergences reconciled |
 | R-008 | P1 | Distributed circuit setup + hardening | ✅ CLOSED — setupCircuit requires BrandedCommittedRoute exclusively; ACK freshness; forwarding-lifecycle state machine; ORDERED_STREAM replay model frozen |
 
 ## Execution order (per the audit)

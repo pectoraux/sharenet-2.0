@@ -1218,3 +1218,40 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The protocol registry now: classifies every gateway object correctly as wire/sub_object/state/rule, declares maturity for every entry, and requires a vector family for every wire object. GatewayServiceAgreement and GatewayAuthorization are both wire objects with their own dedicated vector families.
+
+---
+Task ID: R-007-structural-reconciliation
+Agent: main (Z.ai Code)
+Task: Reconcile the two explicitly documented structural divergences — GatewayServiceAgreement and LedgerEntry — between normative spec and reference implementation.
+
+Work Log:
+- Reconciled GatewayServiceAgreement:
+  - Created `reference/gateway/gateway-service-agreement.ts` — the dual-signed wire object per spec/09 §3.1.
+  - Implements: GatewayServiceAgreementBody, encodeGatewayServiceAgreementBody (CBOR keys 1-11), gateway/source signing payloads (domain-separated), createGatewayServiceAgreement (dual-sign), verifyGatewayServiceAgreement (both sigs).
+  - This is a DISTINCT protocol object from the routing-internal ServiceAgreement (unsigned digest input). Both coexist: ServiceAgreement for route construction, GatewayServiceAgreement for the wire-level gateway↔source trust boundary.
+  - Updated registry: maturity "spec-frozen" → "reference-implemented". Removed "Structural reconciliation is future work" note.
+  - Updated V-GATEWAY-SVC-001.json: status note changed from "spec-frozen — no TS implementation" to "reference-implemented".
+
+- Reconciled LedgerEntry:
+  - Updated `reference/economics/contribution.ts` LedgerEntry interface to match spec/11 §4:
+    - Added: sequence, verifiedAt, verifierId, verifierSignature, prevHash, entryHash
+    - Removed: appendedAt, sequenceNumber (old simplified fields)
+  - Added LEDGER_ENTRY_DOMAIN = "SHARENET/CONTRIBUTION/LEDGER/1"
+  - Added ledgerEntrySigningPayload() — domain || canonical CBOR (keys 1-6)
+  - Added computeLedgerEntryHash() — BLAKE3-256 of signing payload
+  - Updated ContributionLedger.append(): now takes verifierNodeId + verifierSecretKey, produces hash-chained entries with verifier signatures.
+  - Added ContributionLedger.verifyChain(): verifies hash chain integrity + verifier signatures + entry hashes.
+  - Updated spec/11 §4 LedgerEntry CDDL to match the implementation (added entry_hash field, changed proof to proof_hash, updated hash-chaining description).
+  - Updated registry: LedgerEntry kind "sub_object" → "wire", removed "Structural reconciliation is future work" note.
+  - Updated gate-11 tests: all append() calls use new API (verifierNodeId + verifierSecretKey).
+
+- Updated MILESTONES.md: R-007 → ✅ CLOSED.
+
+Stage Summary:
+- Tests: 336 pass, 0 fail. 1096 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 34/34 vectors pass.
+- Python conformance runner: 34/34 vectors pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- Both structural divergences are now reconciled: the reference implementation matches the normative spec for both GatewayServiceAgreement and LedgerEntry. No registry entry carries an unresolved "Structural reconciliation is future work" note.

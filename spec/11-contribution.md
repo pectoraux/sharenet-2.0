@@ -112,16 +112,20 @@ issuer or by an operator key).
 
 ```
 LedgerEntry = {
-  sequence:         uint,         ; monotonic ledger-wide counter
-  proof:            ContributionProof,
-  verified_at:      uint,
-  verifier_id:      text,         ; NodeId of the verifying node
-  verifier_signature: bstr .size 64, ; Ed25519 by verifier over the rest
+  sequence:           uint,         ; monotonic ledger-wide counter
+  proof_hash:         text,         ; hex of receiptHash from ContributionProof
+  verified_at:        uint,
+  verifier_id:        text,         ; NodeId of the verifying node
+  verifier_signature: bstr .size 64, ; Ed25519 by verifier over (domain || canonical(entry_body))
+  prev_hash:          text,         ; hex of BLAKE3-256(entry_{n-1}); "0"*64 for genesis
+  entry_hash:         text,         ; hex of BLAKE3-256(this entry, excl. entry_hash)
 }
 ```
 
-Ledger entries are hash-chained: `entry_n.prev_hash = SHA-256(entry_{n-1})`.
-Tampering with any entry breaks the chain.
+Ledger entries are hash-chained: `entry_n.prev_hash = entry_{n-1}.entry_hash`.
+Tampering with any entry breaks the chain. The verifier signature is over
+`"SHARENET/CONTRIBUTION/LEDGER/1" || canonicalEncode({sequence, proof_hash,
+verified_at, verifier_id, verifier_signature, prev_hash})`.
 
 ## 5. From Proofs to Civic Points
 

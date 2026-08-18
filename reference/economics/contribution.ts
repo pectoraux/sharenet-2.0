@@ -228,13 +228,47 @@ export function createContributionProof(
 }
 
 // -----------------------------------------------------------------------
-// ContributionLedger (append-only)
+// ContributionLedger (append-only, hash-chained per spec/11 §4)
 // -----------------------------------------------------------------------
 
+export const LEDGER_ENTRY_DOMAIN = "SHARENET/CONTRIBUTION/LEDGER/1";
+
 export interface LedgerEntry {
+  sequence: number;           // monotonic ledger-wide counter
   proof: ContributionProof;
-  appendedAt: number;
-  sequenceNumber: number;
+  verifiedAt: number;         // when the verifier confirmed the proof
+  verifierId: string;         // NodeId of the verifying node
+  verifierSignature: Uint8Array; // Ed25519 by verifier over the entry (excl. prev_hash)
+  prevHash: string;           // hex of BLAKE3-256(entry_{n-1}); "0000...0000" for genesis
+  entryHash: string;          // hex of BLAKE3-256(this entry, excl. entryHash itself)
+}
+
+/**
+ * Compute the canonical encoding of a LedgerEntry body (excl. entryHash).
+ * Keys 1-6 per spec/11 §4.
+ */
+export function ledgerEntrySigningPayload(entry: Omit<LedgerEntry, "entryHash">): Uint8Array {
+  const m = new Map<number, unknown>([
+    [1, entry.sequence],
+    [2, entry.proof.receiptHash], // proof is represented by its hash
+    [3, entry.verifiedAt],
+    [4, entry.verifierId],
+    [5, entry.verifierSignature],
+    [6, entry.prevHash],
+  ]);
+  const body = canonicalEncode(m);
+  const domain = new TextEncoder().encode(LEDGER_ENTRY_DOMAIN);
+  const out = new Uint8Array(domain.length + body.length);
+  out.set(domain, 0);
+  out.set(body, domain.length);
+  return out;
+}
+
+/**
+ * Compute the entry hash: BLAKE3-256 of the signing payload.
+ */
+export function computeLedgerEntryHash(entry: Omit<LedgerEntry, "entryHash">): string {
+  return toHex(blake3(ledgerEntrySigningPayload(entry), { dkLen: 32 }));
 }
 
 /**
@@ -259,56 +293,110 @@ export class ContributionLedger {
   /**
    * Append a verified contribution proof to the ledger.
    *
+   * Per spec/11 §4: entries are hash-chained. The verifier signs each
+   * entry with its Ed25519 key, and the entry's `prevHash` links to
+   * the previous entry's hash. Tampering with any entry breaks the chain.
+   *
    * Returns false if:
    *   - The receipt hash was already seen (duplicate/replay)
-   *   - The proof is invalid (signatures don't verify)
    */
   append(
     proof: ContributionProof,
-    gatewayPublicKey: Uint8Array,
-    peerPublicKey: Uint8Array,
+    verifierNodeId: string,
+    verifierSecretKey: Uint8Array,
     now: number,
-  ): { ok: true; sequenceNumber: number } | { ok: false; reason: string } {
+  ): { ok: true; sequence: number; entryHash: string } | { ok: false; reason: string } {
     // Dedup: check receipt hash
     if (this.seenReceiptHashes.has(proof.receiptHash)) {
       return { ok: false, reason: `receipt hash ${proof.receiptHash.slice(0, 16)}... already in ledger (duplicate/replay)` };
     }
 
-    // Verify the proof's signatures still match
-    // (the proof carries the signatures from the original receipt)
-    const receipt: BilateralReceipt = {
-      receiptId: proof.receiptId,
-      gatewayNodeId: proof.contributorNodeId,
-      peerNodeId: proof.peerNodeId,
-      destination: "", // not needed for signature verification
-      bytesSent: 0, // not needed — the hash covers the full receipt
-      bytesReceived: 0,
-      sessionStart: 0,
-      sessionEnd: 0,
-      httpStatus: 0,
-      gatewaySignature: proof.gatewaySignature,
-      peerSignature: proof.peerSignature,
+    const seq = this.nextSeq++;
+    const prevHash = this.entries.length > 0
+      ? this.entries[this.entries.length - 1]!.entryHash
+      : "0".repeat(64); // genesis entry
+
+    // Build the entry (without entryHash)
+    const entryWithoutHash: Omit<LedgerEntry, "entryHash"> = {
+      sequence: seq,
+      proof,
+      verifiedAt: now,
+      verifierId: verifierNodeId,
+      verifierSignature: new Uint8Array(0), // placeholder — will be replaced
+      prevHash,
     };
 
-    // Actually we need to verify the signatures against the original receipt
-    // body. But the proof only carries the signatures, not the full receipt
-    // body. So we verify by reconstructing the receipt from the proof.
-    // However, the signature payload includes all receipt fields (destination,
-    // bytes, timestamps) which we don't have in the proof.
-    //
-    // For the ledger, we trust that createContributionProof already verified
-    // the signatures. The ledger's job is dedup (by receipt hash) and
-    // append-only storage, not re-verification.
-    //
-    // In a production system, the full receipt would be stored alongside
-    // the proof for audit. Here we store just the proof.
+    // Compute the signing payload and sign it
+    const payload = ledgerEntrySigningPayload(entryWithoutHash);
+    const verifierSignature = signMessage(verifierSecretKey, payload);
 
-    // Append
-    const seq = this.nextSeq++;
-    this.entries.push({ proof, appendedAt: now, sequenceNumber: seq });
+    // Build the final entry with the real signature
+    const entryWithSignature: Omit<LedgerEntry, "entryHash"> = {
+      ...entryWithoutHash,
+      verifierSignature,
+    };
+
+    // Compute the entry hash
+    const entryHash = computeLedgerEntryHash(entryWithSignature);
+
+    const entry: LedgerEntry = {
+      ...entryWithSignature,
+      entryHash,
+    };
+
+    this.entries.push(entry);
     this.seenReceiptHashes.add(proof.receiptHash);
 
-    return { ok: true, sequenceNumber: seq };
+    return { ok: true, sequence: seq, entryHash };
+  }
+
+  /**
+   * Verify the hash chain integrity.
+   *
+   * Returns false if any entry's prevHash doesn't match the previous
+   * entry's entryHash, or if any entry's verifier signature is invalid.
+   */
+  verifyChain(
+    verifierPublicKeys: Map<string, Uint8Array>,
+  ): { ok: true } | { ok: false; reason: string } {
+    let prevHash = "0".repeat(64); // genesis
+
+    for (let i = 0; i < this.entries.length; i++) {
+      const entry = this.entries[i]!;
+
+      // Check prevHash chain
+      if (entry.prevHash !== prevHash) {
+        return { ok: false, reason: `chain broken at entry ${i}: prevHash ${entry.prevHash.slice(0, 16)}... != expected ${prevHash.slice(0, 16)}...` };
+      }
+
+      // Verify verifier signature
+      const entryWithoutHash: Omit<LedgerEntry, "entryHash"> = {
+        sequence: entry.sequence,
+        proof: entry.proof,
+        verifiedAt: entry.verifiedAt,
+        verifierId: entry.verifierId,
+        verifierSignature: entry.verifierSignature,
+        prevHash: entry.prevHash,
+      };
+      const payload = ledgerEntrySigningPayload(entryWithoutHash);
+      const pubKey = verifierPublicKeys.get(entry.verifierId);
+      if (!pubKey) {
+        return { ok: false, reason: `entry ${i}: no public key for verifier ${entry.verifierId}` };
+      }
+      if (!verifySignature(pubKey, payload, entry.verifierSignature)) {
+        return { ok: false, reason: `entry ${i}: verifier signature invalid` };
+      }
+
+      // Verify entryHash
+      const recomputedHash = computeLedgerEntryHash(entryWithoutHash);
+      if (recomputedHash !== entry.entryHash) {
+        return { ok: false, reason: `entry ${i}: entryHash ${entry.entryHash.slice(0, 16)}... != recomputed ${recomputedHash.slice(0, 16)}...` };
+      }
+
+      prevHash = entry.entryHash;
+    }
+
+    return { ok: true };
   }
 
   /** Get all ledger entries (read-only). */

@@ -69,7 +69,7 @@
       "objects": {
         "ServiceAgreement": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-SVC", "description": "Negotiated service terms: capability, bandwidth, expiry, policyVersion" },
         "ServiceRequirement": { "kind": "sub_object", "maturity": "reference-implemented", "conformance_vector_family": "V-SVC", "description": "Input to service negotiation — hashed into requirementDigest, covered by V-SVC" },
-        "GatewayServiceAgreement": { "kind": "wire", "maturity": "spec-frozen", "conformance_vector_family": "V-GATEWAY-SVC", "description": "Spec/09 §3.1 dual-signed agreement with gateway + source signatures. The implementation uses ServiceAgreement (unsigned routing-internal); the spec-frozen vector freezes the normative dual-signed wire format. Structural reconciliation is future work." }
+        "GatewayServiceAgreement": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-GATEWAY-SVC", "description": "Dual-signed agreement with gateway + source signatures (spec/09 §3.1). Implemented in reference/gateway/gateway-service-agreement.ts. Distinct from the routing-internal ServiceAgreement (unsigned digest input)." }
       }
     },
     "circuit": {
@@ -100,7 +100,7 @@
       "objects": {
         "BilateralReceipt": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-RECEIPT", "description": "Dual-signed receipt: gateway + peer signatures over service session" },
         "ContributionProof": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Derived proof from verified receipt: receiptHash, contributor, bytesForwarded" },
-        "LedgerEntry": { "kind": "sub_object", "maturity": "reference-implemented", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Ledger entry wrapping a ContributionProof with sequence + timestamp — covered by V-CONTRIBUTION-PROOF. Note: spec/11 §4 defines a hash-chained variant; the implementation uses a simpler append-only structure. Structural reconciliation is future work." }
+        "LedgerEntry": { "kind": "wire", "maturity": "reference-implemented", "conformance_vector_family": "V-CONTRIBUTION-PROOF", "description": "Hash-chained ledger entry with verifier signature per spec/11 §4. Fields: sequence, proof (by hash), verifiedAt, verifierId, verifierSignature, prevHash, entryHash. Implemented in reference/economics/contribution.ts." }
       }
     }
   }
