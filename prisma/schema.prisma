@@ -54,9 +54,8 @@ generator client {
 }
 
 datasource db {
-  provider  = "postgresql"
-  url       = env("DATABASE_URL")        // Neon pooled (PgBouncer) — runtime queries
-  directUrl = env("DIRECT_DATABASE_URL")  // Neon direct — migrations / db push
+  provider  = "sqlite"
+  url       = env("DATABASE_URL")
 }
 
 // ---------------------------------------------------------------------
@@ -296,6 +295,50 @@ model DemoAccount {
   /// Order on the demo landing page.
   sortOrder   Int      @default(0)
   createdAt   DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------
+// Circuit Sequence Floors (persistent replay protection per route)
+// ---------------------------------------------------------------------
+
+/// Per spec/08 §4.5: "Sequence floors persist across circuit re-key events."
+/// This table stores the sequence floor keyed by commitment_root, so a
+/// re-key on the same route continues from the prior floor. Process
+/// restarts do NOT reset the floor because it is durably persisted.
+model CircuitSequenceFloor {
+  /// Hex of the 32-byte commitment_root (the route identity).
+  commitmentRootHex String   @id
+  /// The current maximum accepted frame_sequence (bigint stored as string).
+  /// n <= floor is rejected (replay/stale). n > floor is accepted.
+  currentMaxSequence String
+  /// Last updated timestamp.
+  lastAdvancedAt   DateTime @default(now()) @updatedAt
+  /// First time this route's floor was created.
+  firstSeenAt     DateTime @default(now())
+}
+
+// ---------------------------------------------------------------------
+// Consumed Circuit Setup Acks (single-use replay protection)
+// ---------------------------------------------------------------------
+
+/// Per R-008 hardening: a setup ack is single-use. Once the initiator
+/// has processed an ack with a given (commitmentRoot, hopIndex, ackNonce),
+/// the same ack MUST NOT be accepted again. This table records consumed
+/// acks for replay detection during the setup window.
+model ConsumedCircuitAck {
+  id                String   @id @default(cuid())
+  /// Hex of the 32-byte commitment_root.
+  commitmentRootHex String
+  /// Which hop this ack was for.
+  hopIndex          Int
+  /// Hex of the 16-byte ackNonce (fresh per ack).
+  ackNonceHex       String
+  /// When the ack was consumed (for TTL-based cleanup).
+  consumedAt        DateTime @default(now())
+
+  /// Unique constraint: (commitmentRoot, hopIndex, ackNonce) is single-use.
+  @@unique([commitmentRootHex, hopIndex, ackNonceHex])
+  @@index([consumedAt])
 }
 
 // ---------------------------------------------------------------------

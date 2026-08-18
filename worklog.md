@@ -1341,3 +1341,50 @@ Stage Summary:
 - Dev server: healthy; browser self-verification zero errors.
 - The possession proof is now a genuine AEAD-key proof: the relay encrypts a challenge using the derived forwardingKey, and the initiator decrypts it to verify key possession. The Ed25519 signature separately authenticates the ack's identity binding. Both are required for a valid ack.
 - The sequence floor now persists across re-key: a new circuit on the same route continues from the prior floor, preventing replay of old frames.
+
+---
+Task ID: R-008-durable-persistence + ack-replay
+Agent: main (Z.ai Code)
+Task: Implement durable sequence-floor persistence + setup-ack single-use consumption. The auditor identified that the in-memory SequenceFloorStore doesn't survive process restart, and acks can be replayed.
+
+Work Log:
+- Added Prisma models:
+  - `CircuitSequenceFloor`: keyed by commitmentRootHex, stores currentMaxSequence as string (bigint). Durably persisted — survives process restart.
+  - `ConsumedCircuitAck`: unique constraint on (commitmentRootHex, hopIndex, ackNonceHex). Single-use replay protection for setup acks.
+
+- Created `src/lib/sharenet/circuit-persistence.ts`:
+  - `getDurableCircuitFloor(commitmentRootHex)`: reads the persisted floor from the DB. Returns 0n if no prior circuit exists.
+  - `updateDurableCircuitFloor(commitmentRootHex, newFloor)`: atomically updates the floor. Fail-closed: returns false on DB error.
+  - `checkAndUpdateDurableCircuitFloor(commitmentRootHex, attemptedSequence)`: atomic check + update in a transaction. Rejects seq ≤ floor (replay/stale). Accepts seq > floor and updates.
+  - `isAckFresh(commitmentRootHex, hopIndex, ackNonceHex)`: checks if an ack has been consumed. Returns true if fresh, false if replayed.
+  - `consumeAck(commitmentRootHex, hopIndex, ackNonceHex)`: marks an ack as consumed. Returns true on first use, false on duplicate (unique constraint violation).
+  - `purgeOldConsumedAcks(ttlSeconds)`: cleanup for TTL-based expiry.
+
+- Created `tests/r008-durable-persistence.test.ts` (14 tests):
+  - Durable sequence floor:
+    - Fresh route starts at floor 0
+    - Sequence 1 accepted on fresh route
+    - Sequence 1 again rejected (replay) — durable persistence
+    - Sequence 0 rejected (lower than floor)
+    - Sequence 5 accepted (higher than floor)
+    - Sequence 3 rejected (lower than floor=5) — simulates process restart (re-reads from DB, floor survived)
+    - Different route has its own floor (independent)
+    - updateDurableCircuitFloor directly sets the floor
+  - Setup-ack single-use consumption:
+    - Fresh ack accepted (first use)
+    - Same ack twice → second rejected (replay)
+    - Same ack on different hop → different key, accepted
+    - Same ack on different route → different key, accepted
+    - Fresh distinct ack → accepted
+    - Purge old consumed acks (TTL cleanup)
+
+- Fixed Prisma schema: reverted from postgresql to sqlite provider (the .env uses SQLite, and the Neon cutover was never actually pushed — see worklog correction banner).
+
+Stage Summary:
+- Tests: 336 → 350 pass, 0 fail (+14 durable persistence + ack replay tests). 1129 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 35/35 vectors pass.
+- Python conformance runner: 35/35 vectors pass.
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The sequence floor now survives process restart via durable Prisma-backed persistence. Setup acks are single-use: (commitmentRoot, hopIndex, ackNonce) is enforced as unique by the database. Both are fail-closed.
