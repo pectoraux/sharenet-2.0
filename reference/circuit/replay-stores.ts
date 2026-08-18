@@ -41,10 +41,12 @@
  *
  * The two store interfaces correspond to the two R-008 replay protections:
  *
- *   1. CircuitSequenceFloorStore — per-circuit ORDERED_STREAM sequence
- *      floor, keyed by commitment_root. Survives process restart + re-key.
- *      Per spec/08 §4.5: "Sequence floors persist across circuit re-key
- *      events; a re-key MUST continue the counter from the prior floor."
+ *   1. CircuitSequenceFloorStore — receiver-local ORDERED_STREAM sequence
+ *      floor, keyed by (commitmentRoot, hopIndex, direction) — the receiving
+ *      security context. Every hop has its own floor (per ADR-0019). Survives
+ *      process restart + re-key (per receiver). Per spec/08 §4.5: "Sequence
+ *      floors persist across circuit re-key events; a re-key MUST continue
+ *      the counter from the prior floor" — this holds per receiver.
  *
  *   2. CircuitAckReplayStore — single-use consumption of setup acks, keyed
  *      by (commitmentRoot, hopIndex, ackNonce). Per R-008 hardening: an
