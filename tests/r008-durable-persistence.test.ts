@@ -23,11 +23,20 @@ import {
   consumeAck,
   purgeOldConsumedAcks,
 } from "@/lib/sharenet/circuit-persistence";
+import { DIRECTION_FORWARD } from "@reference/circuit/frame";
 
 const ROUTE_A = "a".repeat(64); // commitment_root hex
 const ROUTE_B = "b".repeat(64); // different route
 const ACK_NONCE_1 = "01" + "02".repeat(15); // 16 bytes hex
 const ACK_NONCE_2 = "03" + "04".repeat(15); // different nonce
+
+// R-009 Stage 1: the durable floor namespace is now (commitmentRoot,
+// hopIndex, direction) — receiver-local. These tests use hop 0 + FORWARD
+// as the canonical receiver context; the "different route has its own
+// floor" test additionally varies hopIndex/direction to exercise the
+// receiver-local keying.
+const HOP_0 = 0;
+const HOP_1 = 1;
 
 describe("R-008: Durable circuit sequence-floor persistence", () => {
   beforeAll(async () => {
@@ -42,56 +51,67 @@ describe("R-008: Durable circuit sequence-floor persistence", () => {
   });
 
   test("fresh route starts at floor 0", async () => {
-    const floor = await getDurableCircuitFloor(ROUTE_A);
+    const floor = await getDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD);
     expect(floor).toBe(0n);
   });
 
   test("sequence 1 is accepted on fresh route", async () => {
-    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, 1n);
+    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD, 1n);
     expect(result.ok).toBe(true);
   });
 
   test("sequence 1 again is rejected (replay) — durable persistence", async () => {
-    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, 1n);
+    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD, 1n);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("replay/stale");
   });
 
   test("sequence 0 is rejected (lower than floor)", async () => {
-    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, 0n);
+    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD, 0n);
     expect(result.ok).toBe(false);
   });
 
   test("sequence 5 is accepted (higher than floor)", async () => {
-    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, 5n);
+    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD, 5n);
     expect(result.ok).toBe(true);
   });
 
   test("sequence 3 is rejected (lower than floor=5) — simulates process restart", async () => {
     // Simulate process restart: re-read the floor from the DB
-    const floor = await getDurableCircuitFloor(ROUTE_A);
+    const floor = await getDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD);
     expect(floor).toBe(5n); // floor survived (not reset to 0)
 
-    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, 3n);
+    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD, 3n);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("replay/stale");
   });
 
-  test("different route has its own floor", async () => {
-    const floorB = await getDurableCircuitFloor(ROUTE_B);
-    expect(floorB).toBe(0n); // independent floor
+  test("different (route, hop, direction) has its own floor", async () => {
+    // R-009 Stage 1: the namespace is (commitmentRoot, hopIndex, direction).
+    // Different route → independent floor. Also exercise a different
+    // (hop, direction) on ROUTE_A to prove the per-receiver keying.
+    const floorB = await getDurableCircuitFloor(ROUTE_B, HOP_0, DIRECTION_FORWARD);
+    expect(floorB).toBe(0n); // independent floor (different route)
 
-    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_B, 10n);
+    const result = await checkAndUpdateDurableCircuitFloor(ROUTE_B, HOP_0, DIRECTION_FORWARD, 10n);
     expect(result.ok).toBe(true);
 
-    const floorA = await getDurableCircuitFloor(ROUTE_A);
+    // ROUTE_A at (hop 0, FORWARD) is unchanged (5n from the prior test).
+    const floorA = await getDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD);
     expect(floorA).toBe(5n); // route A unchanged
+
+    // ROUTE_A at a DIFFERENT (hop, direction) is also independent — the
+    // receiver-local keying means hop 1's forward floor is its own counter.
+    const floorA_hop1 = await getDurableCircuitFloor(ROUTE_A, HOP_1, DIRECTION_FORWARD);
+    expect(floorA_hop1).toBe(0n); // different (hop) → fresh floor
+    const resultHop1 = await checkAndUpdateDurableCircuitFloor(ROUTE_A, HOP_1, DIRECTION_FORWARD, 7n);
+    expect(resultHop1.ok).toBe(true);
   });
 
   test("updateDurableCircuitFloor directly sets the floor", async () => {
-    const ok = await updateDurableCircuitFloor(ROUTE_A, 100n);
+    const ok = await updateDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD, 100n);
     expect(ok).toBe(true);
-    const floor = await getDurableCircuitFloor(ROUTE_A);
+    const floor = await getDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD);
     expect(floor).toBe(100n);
   });
 });

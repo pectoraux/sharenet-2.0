@@ -51,29 +51,46 @@ import {
 /**
  * Durable SQLite-backed implementation of `CircuitSequenceFloorStore`.
  *
- * Backed by the Prisma `CircuitSequenceFloor` model (keyed by
- * `commitmentRootHex`). Survives process restart because the floor is
- * persisted in the database, not in memory.
+ * Backed by the Prisma `CircuitSequenceFloor` model, keyed by
+ * `(commitmentRootHex, hopIndex, direction)` — the receiving security
+ * context. Survives process restart because the floor is persisted in
+ * the database, not in memory.
  *
  * Per spec/08 §4.5: "Sequence floors persist across circuit re-key events;
- * a re-key MUST continue the counter from the prior floor."
+ * a re-key MUST continue the counter from the prior floor." This holds
+ * per receiver: a re-key on the same (route, hop, direction) continues
+ * from that receiver's prior floor.
  *
  * The `checkAndAdvance` operation is atomic: the check (sequence > floor)
  * and the persist (update floor) happen in a single Prisma transaction
  * (see `checkAndUpdateDurableCircuitFloor`). Fail-closed: if the
  * transaction cannot complete, the frame is rejected.
+ *
+ * R-009 Stage 1 final replay-model correction: the namespace is
+ * (commitmentRoot, hopIndex, direction) — receiver-local, not route-shared.
+ * Every hop has its own floor; a malicious upstream relay replaying an
+ * already-valid inner ciphertext toward a downstream hop is caught by
+ * the downstream hop's own floor. See ADR-0019.
  */
 export class DurableSqliteCircuitSequenceFloorStore implements CircuitSequenceFloorStore {
-  async getFloor(commitmentRoot: Uint8Array): Promise<bigint> {
-    return getDurableCircuitFloor(toHex(commitmentRoot));
+  async getFloor(
+    commitmentRoot: Uint8Array,
+    hopIndex: number,
+    direction: number,
+  ): Promise<bigint> {
+    return getDurableCircuitFloor(toHex(commitmentRoot), hopIndex, direction);
   }
 
   async checkAndAdvance(
     commitmentRoot: Uint8Array,
+    hopIndex: number,
+    direction: number,
     attemptedSequence: bigint,
   ): Promise<SequenceFloorCheckResult> {
     return checkAndUpdateDurableCircuitFloor(
       toHex(commitmentRoot),
+      hopIndex,
+      direction,
       attemptedSequence,
     );
   }

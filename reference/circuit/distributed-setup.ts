@@ -669,13 +669,20 @@ export async function establishDistributedCircuit(
   const noncePrefix = deriveNoncePrefix(route.commitmentRoot);
   const commitDigestHex = toHex(routeCommitmentDigest(route));
 
-  // 3b. Load the prior sequence floor for this route (re-key continuation,
-  //     spec/08 §4.5). If a floorStore is supplied, the floor is durable
-  //     and survives process restart. If absent, the guard starts at 0.
-  let initialFloor = 0n;
-  if (floorStore) {
-    initialFloor = await floorStore.getFloor(route.commitmentRoot);
-  }
+  // 3b. R-009 Stage 1 final replay-model correction: the durable floor is now
+  //     keyed by (commitmentRoot, hopIndex, direction) — receiver-local, not
+  //     route-shared. Each hop loads its OWN floor when it processes frames
+  //     (via processCircuitWireFrame → floorStore.checkAndAdvance). The
+  //     initiator's circuit (created here) is used to SEAL frames, not to
+  //     receive them — so there is no single "initialFloor" to load here.
+  //     The floorStore is attached to the ActiveCircuit so that any relay
+  //     processing path can consult it. The in-memory replayGuard cache is
+  //     seeded at 0 (it's just a fast-path mirror; the store is the source of
+  //     truth).
+  //
+  //     Per spec/08 §4.5: re-key continuation holds PER RECEIVER — a re-key
+  //     on the same (route, hop, direction) continues from that receiver's
+  //     prior floor, which the store persists.
 
   // 4. Process each ack (async — each ack is atomically consumed through
   //    the ackStore before being accepted).
@@ -709,9 +716,8 @@ export async function establishDistributedCircuit(
     });
   }
 
-  // 5. Create the ActiveCircuit — seed the in-memory guard cache from the
-  //    durable floor (re-key continuation) and attach the floorStore so
-  //    processCircuitFrame does durable check+persist.
+  // 5. Create the ActiveCircuit — attach the floorStore so processCircuitWireFrame
+  //    does durable check+persist at each receiver (keyed by (root, hopIndex, direction)).
   const circuit: ActiveCircuit = {
     circuitId,
     circuitIdHex,
@@ -721,7 +727,9 @@ export async function establishDistributedCircuit(
     initiatorX25519SecretKey,
     expiry: route.expiry,
     establishedAt: now,
-    replayGuard: new CircuitReplayGuard(initialFloor),
+    // The in-memory replayGuard is a fast-path cache mirror; the floorStore
+    // is the source of truth. Seeded at 0 — each receiver loads its own floor.
+    replayGuard: new CircuitReplayGuard(),
     noncePrefix,
     commitmentRoot: route.commitmentRoot,
     floorStore,

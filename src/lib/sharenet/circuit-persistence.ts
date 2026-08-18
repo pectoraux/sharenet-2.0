@@ -34,15 +34,28 @@ import { db } from "@/lib/db";
 // -----------------------------------------------------------------------
 
 /**
- * Read the current durable sequence floor for a circuit route.
- * Returns 0n if no prior circuit has been established on this route.
+ * Read the current durable sequence floor for a receiving context.
+ * Returns 0n if no prior frame has been accepted on this (route, hop, direction).
  *
  * Per spec/08 §4.5: survives process restart because it is persisted
  * in the database (not in-memory).
+ *
+ * R-009 Stage 1 final replay-model correction: the namespace is
+ * (commitmentRoot, hopIndex, direction) — receiver-local, not route-shared.
  */
-export async function getDurableCircuitFloor(commitmentRootHex: string): Promise<bigint> {
+export async function getDurableCircuitFloor(
+  commitmentRootHex: string,
+  hopIndex: number,
+  direction: number,
+): Promise<bigint> {
   const row = await db.circuitSequenceFloor.findUnique({
-    where: { commitmentRootHex },
+    where: {
+      commitmentRootHex_hopIndex_direction: {
+        commitmentRootHex,
+        hopIndex,
+        direction,
+      },
+    },
   });
   if (!row) return 0n;
   try {
@@ -53,9 +66,11 @@ export async function getDurableCircuitFloor(commitmentRootHex: string): Promise
 }
 
 /**
- * Atomically update the durable sequence floor for a circuit route.
+ * Atomically update the durable sequence floor for a receiving context.
  *
  * Per spec/08 §4.5: "a re-key MUST continue the counter from the prior floor."
+ * This holds per receiver: a re-key on the same (route, hop, direction)
+ * continues from that receiver's prior floor.
  *
  * This function is fail-closed: if the database write fails, the floor
  * is NOT updated in memory, and the caller MUST treat the circuit as
@@ -65,17 +80,27 @@ export async function getDurableCircuitFloor(commitmentRootHex: string): Promise
  */
 export async function updateDurableCircuitFloor(
   commitmentRootHex: string,
+  hopIndex: number,
+  direction: number,
   newFloor: bigint,
 ): Promise<boolean> {
   try {
     await db.circuitSequenceFloor.upsert({
-      where: { commitmentRootHex },
+      where: {
+        commitmentRootHex_hopIndex_direction: {
+          commitmentRootHex,
+          hopIndex,
+          direction,
+        },
+      },
       update: {
         currentMaxSequence: newFloor.toString(),
         lastAdvancedAt: new Date(),
       },
       create: {
         commitmentRootHex,
+        hopIndex,
+        direction,
         currentMaxSequence: newFloor.toString(),
       },
     });
@@ -86,38 +111,57 @@ export async function updateDurableCircuitFloor(
 }
 
 /**
- * Atomically check + update the durable sequence floor.
+ * Atomically check + update the durable sequence floor for a receiving context.
  *
  * Returns { ok: true } if the sequence is strictly higher than the
  * persisted floor (and the floor was updated), or { ok: false, reason }
  * if the sequence is <= floor (replay/stale) or the database write failed.
+ *
+ * R-009 Stage 1 final replay-model correction: the namespace is
+ * (commitmentRoot, hopIndex, direction) — receiver-local, not route-shared.
  */
 export async function checkAndUpdateDurableCircuitFloor(
   commitmentRootHex: string,
+  hopIndex: number,
+  direction: number,
   attemptedSequence: bigint,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   return await db.$transaction(async (tx) => {
     const current = await tx.circuitSequenceFloor.findUnique({
-      where: { commitmentRootHex },
+      where: {
+        commitmentRootHex_hopIndex_direction: {
+          commitmentRootHex,
+          hopIndex,
+          direction,
+        },
+      },
     });
     const currentFloor = current ? BigInt(current.currentMaxSequence) : 0n;
 
     if (attemptedSequence <= currentFloor) {
       return {
         ok: false,
-        reason: `sequence ${attemptedSequence} ≤ floor ${currentFloor} (replay/stale)`,
+        reason: `sequence ${attemptedSequence} ≤ floor ${currentFloor} (replay/stale) at (hop ${hopIndex}, dir ${direction})`,
       };
     }
 
     // Accept — update the floor atomically
     await tx.circuitSequenceFloor.upsert({
-      where: { commitmentRootHex },
+      where: {
+        commitmentRootHex_hopIndex_direction: {
+          commitmentRootHex,
+          hopIndex,
+          direction,
+        },
+      },
       update: {
         currentMaxSequence: attemptedSequence.toString(),
         lastAdvancedAt: new Date(),
       },
       create: {
         commitmentRootHex,
+        hopIndex,
+        direction,
         currentMaxSequence: attemptedSequence.toString(),
       },
     });

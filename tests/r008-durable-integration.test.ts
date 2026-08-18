@@ -60,6 +60,7 @@ import {
   processCircuitFrame,
   onionEncrypt,
 } from "@reference/circuit/circuit";
+import { DIRECTION_FORWARD } from "@reference/circuit/frame";
 import {
   DurableSqliteCircuitSequenceFloorStore,
   DurableSqliteCircuitAckReplayStore,
@@ -124,7 +125,7 @@ describe("R-008 durable integration: sequence floor survives process restart", (
     const { encryptedPayload } = onionEncrypt(circuit1, 5, plaintext);
 
     // Process the frame — should accept + decrypt (floor was 0, now 5).
-    const result = await processCircuitFrame(circuit1, 0, 5, encryptedPayload);
+    const result = await processCircuitFrame(circuit1, 0, 5, DIRECTION_FORWARD, encryptedPayload);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(new TextDecoder().decode(result.decrypted)).toBe(
@@ -132,16 +133,16 @@ describe("R-008 durable integration: sequence floor survives process restart", (
       );
     }
 
-    // The durable floor is now 5 (persisted to the database).
-    const persistedFloor = await floorStore.getFloor(route.commitmentRoot);
+    // The durable floor is now 5 (persisted to the database) at (root, 0, FORWARD).
+    const persistedFloor = await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD);
     expect(persistedFloor).toBe(5n);
   });
 
   test("2. simulate restart: new engine, same route + same durable store, seq=4 → REJECTED", async () => {
     // Circuit 2 (the "restarted process"): NEW initiator keypair (new hop keys
     // via ECDH), but the SAME route + SAME durable floor store. The floor for
-    // this route is already 5 (persisted by test 1).
-    const priorFloor = await floorStore.getFloor(route.commitmentRoot);
+    // this route is already 5 (persisted by test 1) at (root, 0, FORWARD).
+    const priorFloor = await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD);
     expect(priorFloor).toBe(5n); // survived the "restart"
 
     const circuit2 = setupCircuit(route.branded, relayKeys, NOW, floorStore, priorFloor);
@@ -155,7 +156,7 @@ describe("R-008 durable integration: sequence floor survives process restart", (
     // even checked — that's the DoS fix.)
     const pt = new TextEncoder().encode("stale frame after restart");
     const { encryptedPayload: validStaleFrame } = onionEncrypt(circuit2, 4, pt);
-    const result = await processCircuitFrame(circuit2, 0, 4, validStaleFrame);
+    const result = await processCircuitFrame(circuit2, 0, 4, DIRECTION_FORWARD, validStaleFrame);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toContain("≤ floor");
@@ -163,17 +164,17 @@ describe("R-008 durable integration: sequence floor survives process restart", (
     }
 
     // The floor is UNCHANGED (4 was rejected — not persisted).
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(5n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(5n);
   });
 
   test("3. after restart: seq=6 (strictly higher than floor 5) → ACCEPTED", async () => {
-    const priorFloor = await floorStore.getFloor(route.commitmentRoot);
+    const priorFloor = await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD);
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore, priorFloor);
 
     const plaintext = new TextEncoder().encode("second packet after restart");
     const { encryptedPayload } = onionEncrypt(circuit, 6, plaintext);
 
-    const result = await processCircuitFrame(circuit, 0, 6, encryptedPayload);
+    const result = await processCircuitFrame(circuit, 0, 6, DIRECTION_FORWARD, encryptedPayload);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(new TextDecoder().decode(result.decrypted)).toBe(
@@ -181,8 +182,8 @@ describe("R-008 durable integration: sequence floor survives process restart", (
       );
     }
 
-    // Floor advanced to 6 (durable).
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(6n);
+    // Floor advanced to 6 (durable) at (root, 0, FORWARD).
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(6n);
   });
 });
 
@@ -423,29 +424,36 @@ describe("R-008 durable integration: establishDistributedCircuit uses both durab
     // Process a frame through the established circuit — durable check+persist.
     const plaintext = new TextEncoder().encode("durable circuit payload");
     const { encryptedPayload } = onionEncrypt(circuit, 1, plaintext);
-    const r = await processCircuitFrame(circuit, 0, 1, encryptedPayload);
+    const r = await processCircuitFrame(circuit, 0, 1, DIRECTION_FORWARD, encryptedPayload);
     expect(r.ok).toBe(true);
     if (r.ok) expect(new TextDecoder().decode(r.decrypted)).toBe("durable circuit payload");
 
-    // Floor advanced to 1 (durable).
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    // Floor advanced to 1 (durable) at (root, 0, FORWARD) — the receiver that committed.
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
   });
 
   test("9. re-establish on the SAME route (re-key) → prior floor continued, old seq rejected", async () => {
     // Reuse the SAME route across the re-key so the floor (keyed by
-    // commitmentRoot) persists. Create route + relay keys once.
+    // (commitmentRoot, hopIndex, direction)) persists. Create route + relay keys once.
     const route = makeRoute(1);
     const relayKeys = makeRelayX25519Keys(route.branded);
 
-    // Pre-seed a floor of 10 on this route (simulate a prior circuit that
-    // advanced to seq=10, then was torn down / re-keyed).
+    // Pre-seed a floor of 10 on this (route, hop 0, FORWARD) — simulate a
+    // prior circuit that advanced to seq=10, then was torn down / re-keyed.
+    // R-009 Stage 1 final replay-model correction: the namespace is now
+    // (commitmentRoot, hopIndex, direction) — receiver-local, not route-shared.
+    // For a 1-hop circuit, the only receiver is hop 0 in the forward direction.
     const PRE_SET_FLOOR = 10n;
-    await floorStore.checkAndAdvance(route.commitmentRoot, PRE_SET_FLOOR);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(PRE_SET_FLOOR);
+    await floorStore.checkAndAdvance(route.commitmentRoot, 0, DIRECTION_FORWARD, PRE_SET_FLOOR);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(PRE_SET_FLOOR);
 
     // Re-key: the initiator generates a NEW X25519 keypair and re-establishes
-    // on the same route. establishDistributedCircuit loads the prior floor (10)
-    // so the new circuit continues from there.
+    // on the same route. Per spec/08 §4.5: "Sequence floors persist across
+    // circuit re-key events; a re-key MUST continue the counter from the
+    // prior floor." Under the receiver-local model, this continuation holds
+    // PER RECEIVER (the floorStore is the source of truth; the new circuit's
+    // in-memory replayGuard cache is seeded at 0 and only mirrors the
+    // durable state after each accepted frame).
     const initSk = randomBytes(32);
     const initPk = x25519.getPublicKey(initSk);
 
@@ -464,8 +472,13 @@ describe("R-008 durable integration: establishDistributedCircuit uses both durab
     expect(est.ok).toBe(true);
     if (!est.ok) return;
 
-    // The new circuit's in-memory guard cache was seeded from the durable floor (10).
-    expect(est.circuit.replayGuard.getSequenceFloor()).toBe(PRE_SET_FLOOR);
+    // The new circuit's in-memory replayGuard is seeded at 0 (it's just a
+    // fast-path cache mirror — the durable floorStore is the source of truth
+    // under the receiver-local model). What persists across the re-key is the
+    // durable floor at (root, 0, FORWARD), which the new circuit's floorStore
+    // references. Verify that durable state survived the re-key.
+    expect(est.circuit.floorStore).toBe(floorStore);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(PRE_SET_FLOOR);
 
     // A frame with seq=5 (≤ floor 10) → REJECTED (old frame replay after re-key).
     // R-008 final hardening: AEAD authenticates FIRST. We must send VALID
@@ -473,17 +486,17 @@ describe("R-008 durable integration: establishDistributedCircuit uses both durab
     // passes — then the floor check rejects the stale sequence.
     const stalePt = new TextEncoder().encode("stale after re-key");
     const { encryptedPayload: staleFrame } = onionEncrypt(est.circuit, 5, stalePt);
-    const r = await processCircuitFrame(est.circuit, 0, 5, staleFrame);
+    const r = await processCircuitFrame(est.circuit, 0, 5, DIRECTION_FORWARD, staleFrame);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toContain("≤ floor");
 
     // A frame with seq=11 (> floor 10) → ACCEPTED, floor advances to 11.
     const plaintext = new TextEncoder().encode("post-re-key packet");
     const { encryptedPayload } = onionEncrypt(est.circuit, 11, plaintext);
-    const r2 = await processCircuitFrame(est.circuit, 0, 11, encryptedPayload);
+    const r2 = await processCircuitFrame(est.circuit, 0, 11, DIRECTION_FORWARD, encryptedPayload);
     expect(r2.ok).toBe(true);
     if (r2.ok) expect(new TextDecoder().decode(r2.decrypted)).toBe("post-re-key packet");
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(11n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(11n);
   });
 });
 
@@ -520,14 +533,14 @@ describe("R-008 final hardening: AEAD authenticates BEFORE durable commit (no fl
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
 
     // Floor starts at 0 (fresh route).
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
 
     // Attacker sends seq=100 with INVALID ciphertext (random bytes, not a
     // valid AEAD ciphertext for this circuit's key). Under the frozen order
     // (AEAD → commit), the AEAD tag check fails FIRST, and the floor is
     // NEVER touched.
     const invalidCiphertext = randomBytes(64); // wrong key, wrong tag
-    const result = await processCircuitFrame(circuit, 0, 100, invalidCiphertext);
+    const result = await processCircuitFrame(circuit, 0, 100, DIRECTION_FORWARD, invalidCiphertext);
 
     // The frame is rejected (decryption failure).
     expect(result.ok).toBe(false);
@@ -535,7 +548,7 @@ describe("R-008 final hardening: AEAD authenticates BEFORE durable commit (no fl
 
     // CRITICAL INVARIANT: the floor is STILL 0. The attacker could NOT burn
     // seq=100 by sending invalid ciphertext. This is the DoS fix.
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
   });
 
   test("11. valid ciphertext at seq=1 → floor ADVANCES to 1", async () => {
@@ -547,14 +560,14 @@ describe("R-008 final hardening: AEAD authenticates BEFORE durable commit (no fl
     const plaintext = new TextEncoder().encode("authenticated frame");
     const { encryptedPayload } = onionEncrypt(circuit, 1, plaintext);
 
-    const result = await processCircuitFrame(circuit, 0, 1, encryptedPayload);
+    const result = await processCircuitFrame(circuit, 0, 1, DIRECTION_FORWARD, encryptedPayload);
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(new TextDecoder().decode(result.decrypted)).toBe("authenticated frame");
     }
 
     // The floor advanced to 1 (genuine authenticated frame).
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
   });
 
   test("12. after invalid seq=100 rejected: legitimate seq=2 still accepted (floor not burned)", async () => {
@@ -565,22 +578,22 @@ describe("R-008 final hardening: AEAD authenticates BEFORE durable commit (no fl
     // First: process a valid seq=1 → floor = 1.
     const pt1 = new TextEncoder().encode("first");
     const { encryptedPayload: enc1 } = onionEncrypt(circuit, 1, pt1);
-    const r1 = await processCircuitFrame(circuit, 0, 1, enc1);
+    const r1 = await processCircuitFrame(circuit, 0, 1, DIRECTION_FORWARD, enc1);
     expect(r1.ok).toBe(true);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
 
     // Attacker: send seq=100 with INVALID ciphertext → rejected, floor STAYS 1.
-    const attackResult = await processCircuitFrame(circuit, 0, 100, randomBytes(64));
+    const attackResult = await processCircuitFrame(circuit, 0, 100, DIRECTION_FORWARD, randomBytes(64));
     expect(attackResult.ok).toBe(false);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // UNCHANGED
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n); // UNCHANGED
 
     // Legitimate: seq=2 with VALID ciphertext → accepted (floor was not burned).
     const pt2 = new TextEncoder().encode("second");
     const { encryptedPayload: enc2 } = onionEncrypt(circuit, 2, pt2);
-    const r2 = await processCircuitFrame(circuit, 0, 2, enc2);
+    const r2 = await processCircuitFrame(circuit, 0, 2, DIRECTION_FORWARD, enc2);
     expect(r2.ok).toBe(true);
     if (r2.ok) expect(new TextDecoder().decode(r2.decrypted)).toBe("second");
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(2n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(2n);
   });
 
   test("13. replay of valid captured frame at seq=1 → AEAD succeeds but commit rejects (floor unchanged)", async () => {
@@ -595,17 +608,17 @@ describe("R-008 final hardening: AEAD authenticates BEFORE durable commit (no fl
     // Genuine seq=1 → accepted, floor = 1.
     const pt = new TextEncoder().encode("genuine");
     const { encryptedPayload } = onionEncrypt(circuit, 1, pt);
-    const r1 = await processCircuitFrame(circuit, 0, 1, encryptedPayload);
+    const r1 = await processCircuitFrame(circuit, 0, 1, DIRECTION_FORWARD, encryptedPayload);
     expect(r1.ok).toBe(true);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
 
     // Replay: same ciphertext at seq=1. AEAD succeeds (valid ciphertext,
     // same key+nonce → same plaintext), but the durable commit rejects
     // (1 ≤ floor 1). The frame is rejected, floor stays at 1.
-    const replay = await processCircuitFrame(circuit, 0, 1, encryptedPayload);
+    const replay = await processCircuitFrame(circuit, 0, 1, DIRECTION_FORWARD, encryptedPayload);
     expect(replay.ok).toBe(false);
     if (!replay.ok) expect(replay.reason).toContain("≤ floor");
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // UNCHANGED
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n); // UNCHANGED
   });
 });
 

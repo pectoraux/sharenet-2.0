@@ -162,44 +162,29 @@ export function forwardFrame(
  * Process a raw wire CircuitFrame at a relay: the CANONICAL PRODUCTION
  * entry point that owns the ENTIRE R-008 frozen ordering invariant.
  *
- * Per the R-009 Stage 1 final hardening: the production wire entry point
- * MUST own the durable commit, AND commit ownership MUST be DERIVED FROM
- * PROTOCOL STATE — not supplied as a caller-controlled boolean.
- *
- * COMMIT OWNERSHIP (R-009 Stage 1 — frozen, single ingress replay checkpoint):
- *
- *   The durable sequence floor is committed exactly ONCE per frame per route,
- *   at the single ingress replay checkpoint. For Stage 1 (forward traffic),
- *   this is derived from protocol semantics:
- *
- *     direction == FORWARD && hopIndex == 0
- *         → COMMIT the durable sequence floor (ingress checkpoint)
- *
- *     direction == FORWARD && hopIndex > 0
- *         → forward only (the floor was already committed at hop 0)
- *
- *   This is NOT caller-controlled. There is no `commitFloor` boolean. The
- *   protocol itself determines commit ownership — a bad integration cannot
- *   accidentally disable the commit (hop 0 always commits) or claim it
- *   at the wrong hop (hop 1 never commits). See ADR-0019.
+ * R-009 Stage 1 final replay-model correction: the durable floor is keyed by
+ * (commitmentRoot, hopIndex, direction) — the RECEIVING SECURITY CONTEXT.
+ * EVERY hop commits its own floor. There is no "ingress-only" checkpoint;
+ * every receiver on the circuit enforces replay protection. This is critical
+ * under ShareNet's threat model (malicious relays): a malicious upstream
+ * relay replaying an already-valid inner ciphertext toward a downstream hop
+ * is caught by the downstream hop's own floor. See ADR-0019.
  *
  * BACKWARD DIRECTION REJECTION (Stage 1):
+ *   Stage 1 implements FORWARD traffic only. The return-onion protocol
+ *   (including the replay-floor keying question — though the namespace is
+ *   now (root, hop, direction) so forward + backward are independent) is
+ *   Stage 2 work. The Stage 1 production path REJECTS backward frames.
+ *   The generic CircuitFrame decoder still accepts both enum values (0x01 +
+ *   0x02) so the wire schema stays compatible with Stage 2.
  *
- *   Stage 1 implements FORWARD traffic only. The backward/return-onion
- *   protocol is Stage 2 work. Until Stage 2 freezes the return-onion
- *   semantics (including the replay-floor keying question: per-route vs
- *   per-(route, direction)), the Stage 1 production path REJECTS backward
- *   frames. The generic CircuitFrame decoder still accepts both enum
- *   values (0x01 + 0x02) so the wire schema stays compatible with Stage 2,
- *   but processCircuitWireFrame() fails closed on BACKWARD.
- *
- * Pipeline (R-008 frozen ordering, Stage 1):
+ * Pipeline (R-008 frozen ordering + R-009 Stage 1 receiver-local replay):
  *   1. decode (strict canonical CBOR — rejects non-canonical encodings)
  *   2. reject BACKWARD direction (Stage 1 — fail closed until Stage 2)
  *   3. AEAD authenticate + decrypt one layer (openFrame)
  *      → reject if tag fails (floor UNCHANGED — DoS fix from R-008)
- *   4. atomic durable sequence commit (circuit.floorStore.checkAndAdvance)
- *      → ONLY at the ingress checkpoint (direction==FORWARD && hopIndex==0)
+ *   4. atomic durable sequence commit at THIS RECEIVER's floor
+ *      (circuit.floorStore.checkAndAdvance(root, hopIndex, FORWARD, seq))
  *      → reject if replay/stale (seq ≤ floor) or persistence fails (fail-closed)
  *   5. forward / deliver
  *      → terminal hop: deliver plaintext
@@ -227,9 +212,8 @@ export async function processCircuitWireFrame(
   const frame = decoded.frame;
 
   // Step 2 (R-009 Stage 1): reject BACKWARD direction.
-  // Stage 1 implements FORWARD traffic only. The return-onion protocol
-  // (including the replay-floor keying question) is Stage 2 work. The
-  // production path fails closed on BACKWARD until Stage 2 freezes it.
+  // Stage 1 implements FORWARD traffic only. The return-onion protocol is
+  // Stage 2 work. The production path fails closed on BACKWARD until Stage 2.
   if (frame.direction !== DIRECTION_FORWARD) {
     return {
       ok: false,
@@ -244,28 +228,21 @@ export async function processCircuitWireFrame(
     return { ok: false, reason: forward.reason };
   }
 
-  // Step 4 (R-009 Stage 1 — frozen ingress replay checkpoint):
-  // Commit ownership is DERIVED FROM PROTOCOL STATE, not caller-supplied.
-  //   direction == FORWARD && hopIndex == 0  → COMMIT (ingress checkpoint)
-  //   direction == FORWARD && hopIndex > 0   → forward only (no commit)
-  //
-  // This is the single ingress replay checkpoint per route. A frame with
-  // frameSequence=N is processed by every hop, but the floor is committed
-  // exactly once — at hop 0 (the entry relay). Subsequent hops forward
-  // without re-committing (which would be a self-replay).
-  //
-  // Per ADR-0019: this invariant is protocol-enforced, not caller-enforced.
+  // Step 4 (R-009 Stage 1 receiver-local replay): atomic durable sequence
+  // commit at THIS RECEIVER's floor, keyed by (commitmentRoot, hopIndex, FORWARD).
+  // EVERY hop commits its own floor — not just the ingress. This catches
+  // replays by a malicious upstream relay toward a downstream hop.
+  // Fail-closed: if the sequence is a replay (seq ≤ floor) or the persistence
+  // operation cannot complete, the frame is rejected. Floor UNCHANGED.
   const seq = BigInt(frame.frameSequence);
-  const isIngressCheckpoint = (hopIndex === 0);
-  if (isIngressCheckpoint) {
-    const commitResult = await circuit.floorStore.checkAndAdvance(
-      circuit.commitmentRoot,
-      seq,
-    );
-    if (!commitResult.ok) {
-      // Replay/stale or persistence failure — reject. Floor UNCHANGED.
-      return { ok: false, reason: commitResult.reason };
-    }
+  const commitResult = await circuit.floorStore.checkAndAdvance(
+    circuit.commitmentRoot,
+    hopIndex,
+    DIRECTION_FORWARD,
+    seq,
+  );
+  if (!commitResult.ok) {
+    return { ok: false, reason: commitResult.reason };
   }
 
   // Step 5: forward / deliver. The frame is accepted.

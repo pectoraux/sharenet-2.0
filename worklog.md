@@ -1645,3 +1645,69 @@ Stage Summary:
 - The strict-canonical pipeline now mirrors `reference/circuit/frame.ts:decodeCircuitFrame` step-for-step (Step 1: permissive decode w/ no-trailing-bytes; Step 2: reject unknown keys + exactly-4-keys; Step 3: canonical round-trip; Step 4: field-size + sequence-range validation). Cross-implementation conformance is preserved.
 - The frozen R-008 crypto substrate (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload, deriveNoncePrefix) was NOT modified — R-009 Stage 1 hardening is purely wire-format strictness on top of the frozen substrate.
 - No regressions: all 35 previously-passing Python vectors still pass. The 9 original V-CIRCUIT-FRAME-001 cases still pass (verified the `decode-frame` canonical round-trip is byte-equal and the `encode-frame` canonical encoding is byte-stable).
+
+
+---
+Task ID: 8-test-updates
+Agent: general-purpose (subagent)
+Task: Update the 5 R-008 circuit test files for the R-009 Stage 1 final replay-model correction — the durable replay floor namespace changed from `commitmentRoot` (one shared floor per route) to `(commitmentRoot, hopIndex, direction)` (receiver-local — every hop has its own floor). This is purely a test-side signature update; the protocol core + durable substrate were already updated upstream by the parent task. The 8 affected API signatures are: `CircuitSequenceFloorStore.{getFloor,checkAndAdvance}`, `InMemoryCircuitSequenceFloorStore.setFloorForTest`, `processCircuitFrame` (direction inserted as 4th param), `loadCircuitFloor`, and the durable Prisma helpers `getDurableCircuitFloor`/`updateDurableCircuitFloor`/`checkAndUpdateDurableCircuitFloor`. `DIRECTION_FORWARD = 0x01` is exported from `@reference/circuit/frame`.
+
+Work Log:
+- Read context: worklog.md last 3 sections (R008-final-hardening, 5-python-verifier, 5b-python-negative-vectors) — confirmed the FROZEN R-008 protocol ordering (AEAD → durable commit → accept) that R-009 Stage 1 builds on top of, and confirmed the receiver-local floor namespace correction is the focus of the current Stage 1 finalization.
+
+- Read source to confirm the new signatures (so test edits match exactly):
+  * `reference/circuit/frame.ts` — exports `DIRECTION_FORWARD = 0x01 as const` (line 63) and `DIRECTION_BACKWARD = 0x02 as const` (line 66).
+  * `reference/circuit/replay-stores.ts` — `CircuitSequenceFloorStore.getFloor(commitmentRoot, hopIndex, direction)` (lines 130-134); `checkAndAdvance(commitmentRoot, hopIndex, direction, attemptedSequence)` (lines 156-161); `InMemoryCircuitSequenceFloorStore.setFloorForTest(commitmentRoot, hopIndex, direction, floor)` (lines 271-278). The Map key is now `${toHex(commitmentRoot)}:${hopIndex}:${direction}`.
+  * `reference/circuit/circuit.ts` — `processCircuitFrame(circuit, hopIndex, frameSequence, direction, ciphertext)` (lines 642-648); `loadCircuitFloor(floorStore, commitmentRoot, hopIndex, direction)` (lines 706-713). The internal commit call is `circuit.floorStore.checkAndAdvance(circuit.commitmentRoot, hopIndex, direction, seq)` (lines 679-681).
+  * `reference/circuit/distributed-setup.ts` — `establishDistributedCircuit` (line 652+) no longer loads an `initialFloor` (lines 672-685: the floorStore is attached to the ActiveCircuit so each receiver loads its own floor via `processCircuitFrame`). The in-memory `replayGuard` is seeded at 0 (just a fast-path cache mirror; the durable store is the source of truth). This is a semantic change that affected one assertion in test 9.
+  * `src/lib/sharenet/circuit-persistence.ts` — `getDurableCircuitFloor(commitmentRootHex, hopIndex, direction)` (lines 46-50); `updateDurableCircuitFloor(commitmentRootHex, hopIndex, direction, newFloor)` (lines 81-86); `checkAndUpdateDurableCircuitFloor(commitmentRootHex, hopIndex, direction, attemptedSequence)` (lines 123-128). The Prisma unique constraint is now `commitmentRootHex_hopIndex_direction`.
+
+- Searched the entire `tests/` directory for direct floor-store / processCircuitFrame calls — only TWO files use them directly:
+  * `tests/r008-durable-integration.test.ts` — uses `processCircuitFrame` (13 calls) + `floorStore.getFloor` (17 calls) + `floorStore.checkAndAdvance` (1 call in test 9).
+  * `tests/r008-durable-persistence.test.ts` — uses the durable Prisma helpers directly (`getDurableCircuitFloor` 8 calls, `checkAndUpdateDurableCircuitFloor` 6 calls, `updateDurableCircuitFloor` 1 call).
+  * The other 3 target files (`tests/gate-06-circuits.test.ts`, `tests/r008h-ack-freshness.test.ts`, `tests/r008-distributed-circuit.test.ts`) only use `setupCircuit`/`establishDistributedCircuit` (which still take `floorStore` as the 4th/7th+8th arg — unchanged). They don't call any of the 8 changed methods directly. NO changes needed for those 3 files.
+
+- File 1 (`tests/r008-durable-integration.test.ts`) edits — 15 tests total:
+  * Added `import { DIRECTION_FORWARD } from "@reference/circuit/frame";` to the import block (after the `@reference/circuit/circuit` import).
+  * All 13 `processCircuitFrame(circuit, 0, <seq>, <ciphertext>)` calls → `processCircuitFrame(circuit, 0, <seq>, DIRECTION_FORWARD, <ciphertext>)`. The 4th param (`direction`) goes AFTER `frameSequence` and BEFORE `ciphertext`, per the new signature. All tests use 1-hop circuits processing at hop 0 in the forward direction (matches the test scenario: source → gateway traffic at the terminal hop), so DIRECTION_FORWARD + hopIndex 0 is the correct receiver context throughout.
+  * All 17 `floorStore.getFloor(route.commitmentRoot)` calls → `floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)`. These are post-condition checks after a 1-hop circuit processed a frame at hop 0 (forward direction) — the receiver that committed.
+  * Test 9's pre-seed call `floorStore.checkAndAdvance(route.commitmentRoot, PRE_SET_FLOOR)` → `floorStore.checkAndAdvance(route.commitmentRoot, 0, DIRECTION_FORWARD, PRE_SET_FLOOR)`. This seeds the (root, 0, FORWARD) floor with 10n.
+  * Test 9 assertion update (SEMANTIC FIX): the old assertion `expect(est.circuit.replayGuard.getSequenceFloor()).toBe(PRE_SET_FLOOR);` assumed `establishDistributedCircuit` loaded the prior floor and seeded the in-memory replayGuard. Under the new receiver-local model, `establishDistributedCircuit` no longer loads `initialFloor` (each receiver loads its OWN floor via `processCircuitFrame → floorStore.checkAndAdvance`), so the in-memory replayGuard is seeded at 0. Updated the assertion to query the durable floor directly: `expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(PRE_SET_FLOOR);` — this preserves the original test intent (prove the durable floor survived the re-key on the same (route, hop, direction)) and reflects the new model (the durable floorStore is the source of truth, not the in-memory cache). Updated the surrounding comment to explain the new receiver-local continuation model.
+
+- File 2 (`tests/r008-durable-persistence.test.ts`) edits — 14 tests total:
+  * Added `import { DIRECTION_FORWARD } from "@reference/circuit/frame";` after the `@/lib/sharenet/circuit-persistence` import.
+  * Added 2 module-level constants `HOP_0 = 0` and `HOP_1 = 1` with a comment explaining the new namespace is `(commitmentRoot, hopIndex, direction)`. Used these in all 15 Prisma helper calls for readability.
+  * All 6 `checkAndUpdateDurableCircuitFloor(ROUTE_A, <seq>)` calls → `checkAndUpdateDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD, <seq>)`.
+  * All 8 `getDurableCircuitFloor(ROUTE_A|ROUTE_B)` calls → `getDurableCircuitFloor(ROUTE_A|ROUTE_B, HOP_0, DIRECTION_FORWARD)`.
+  * `updateDurableCircuitFloor(ROUTE_A, 100n)` → `updateDurableCircuitFloor(ROUTE_A, HOP_0, DIRECTION_FORWARD, 100n)`.
+  * Test "different route has its own floor" → renamed to "different (route, hop, direction) has its own floor" and EXTENDED to also exercise a different (hopIndex) on ROUTE_A — proves the receiver-local keying means ROUTE_A's (hop 1, FORWARD) floor is independent of its (hop 0, FORWARD) floor. The original 3 assertions are preserved (ROUTE_B fresh at 0n, ROUTE_B accepts 10n, ROUTE_A unchanged at 5n); 2 new assertions added (ROUTE_A hop 1 fresh at 0n, accepts 7n). The user's task brief explicitly authorized this: "now different (route, hop, direction) has its own floor. You can test with a different hopIndex or direction too."
+
+- File 3 (`tests/gate-06-circuits.test.ts`) — NO edits. Searched the file for `getFloor|setFloorForTest|checkAndAdvance|processCircuitFrame`: zero matches. The file uses `setupCircuit` (passing `testFloorStore` as the 4th arg — unchanged) and `relayDecrypt`/`onionEncrypt` directly (no floor-store calls). All 19 tests pass without changes.
+
+- File 4 (`tests/r008h-ack-freshness.test.ts`) — NO edits. Searched for `getFloor|setFloorForTest|checkAndAdvance|processCircuitFrame|loadCircuitFloor|floorStore`: zero matches. The file uses `establishDistributedCircuit` (passing ackStore + floorStore — unchanged signature) and the ack-store API (which was already keyed by (commitmentRoot, hopIndex, ackNonce) — unchanged). All 21 tests pass without changes.
+
+- File 5 (`tests/r008-distributed-circuit.test.ts`) — NO edits. Searched for the same patterns: zero matches. Uses `establishDistributedCircuit` with both stores (unchanged signature). All 7 tests pass without changes.
+
+- Verification (per-file):
+  * `bun test tests/r008-durable-integration.test.ts` → 15 pass / 0 fail / 68 expect() calls.
+  * `bun test tests/r008-durable-persistence.test.ts` → 14 pass / 0 fail / 28 expect() calls.
+  * `bun test tests/gate-06-circuits.test.ts` → 19 pass / 0 fail / 52 expect() calls.
+  * `bun test tests/r008h-ack-freshness.test.ts` → 21 pass / 0 fail / 38 expect() calls.
+  * `bun test tests/r008-distributed-circuit.test.ts` → 7 pass / 0 fail / 21 expect() calls.
+  * Aggregate across the 5 target files: 76 pass / 0 fail / 207 expect() calls.
+  * Note: Prisma "Unique constraint failed" messages appearing in stderr during the ack-replay tests are EXPECTED — they're the fail-closed behavior the tests verify (consuming an ack twice triggers the unique constraint, which is caught and returned as `false`). They are NOT test failures; the tests pass.
+
+- Verification (full suite):
+  * `bun run test:unit` → 390 pass / 8 fail / 1330 expect() calls across 26 files.
+  * All 8 failures are in `tests/r009-circuit-frame.test.ts` — the file the parent task is updating separately (explicitly expected to fail per the task brief).
+  * The other 25 test files pass cleanly — zero regressions from the receiver-local floor correction.
+
+- Verification (lint):
+  * `bun run lint` → exit code 0 (clean, no new errors).
+
+Stage Summary:
+- R-009 Stage 1 final replay-model correction is now test-complete (excluding the parent task's `r009-circuit-frame.test.ts`).
+- 2 test files updated (`r008-durable-integration.test.ts`, `r008-durable-persistence.test.ts`); 3 files needed no changes (verified they don't touch any of the 8 changed API methods directly — they only use the unchanged `setupCircuit`/`establishDistributedCircuit` entry points that take `floorStore` as a constructor arg).
+- The single semantic assertion fix (test 9: `replayGuard.getSequenceFloor() === PRE_SET_FLOOR` → `floorStore.getFloor(root, 0, FORWARD) === PRE_SET_FLOOR`) preserves the original test intent (prove the durable floor survived the re-key) while reflecting the new model (the durable floorStore is the source of truth, the in-memory replayGuard is just a fast-path cache mirror seeded at 0 by `establishDistributedCircuit`).
+- All 5 target test files pass: 76 / 76 tests, 207 expect() calls. Full unit suite: 390 pass / 8 fail (all 8 in the parent's separate r009-circuit-frame.test.ts).
+- Lint: clean (exit 0).

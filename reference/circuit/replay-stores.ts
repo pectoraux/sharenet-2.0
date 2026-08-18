@@ -86,32 +86,57 @@ export type SequenceFloorCheckResult =
   | { ok: false; reason: string };
 
 /**
- * Durable, per-circuit sequence-floor persistence.
+ * Durable, **receiver-local** sequence-floor persistence.
  *
- * Keyed by `commitment_root` (the route identity). A re-key on the same
- * route continues from the prior floor. A different route gets a fresh
- * floor (0).
+ * Keyed by `(commitment_root, hopIndex, direction)` — the **receiving
+ * security context**. Each hop has a different AEAD key (per spec/08 §4.1),
+ * and therefore needs its own replay state. A re-key on the same route +
+ * hop + direction continues from the prior floor.
+ *
+ * Per spec/08 §4.5 (FROZEN per R-008): "frame_sequence is strictly increasing
+ * per circuit; a receiver rejects any frame whose sequence is <= the highest
+ * sequence already accepted." The normative rule is **receiver-local** —
+ * EVERY receiver on the circuit enforces replay protection, not just the
+ * ingress relay. This is critical under ShareNet's threat model, which
+ * explicitly includes malicious relays: a malicious upstream relay can
+ * replay an already-valid inner ciphertext toward a downstream hop, and
+ * the downstream hop's own floor must catch it.
  *
  * Per spec/08 §4.5: "Sequence floors persist across circuit re-key events;
- * a re-key MUST continue the counter from the prior floor."
+ * a re-key MUST continue the counter from the prior floor." This holds
+ * per receiver: a re-key on the same (route, hop, direction) continues
+ * from that receiver's prior floor.
  *
  * The floor survives process restart because the durable implementation
  * persists to a database (not in-memory). The in-memory implementation
  * (for tests) does not survive restart — it exists only for conformance
  * vector verification and single-process unit tests.
+ *
+ * R-009 Stage 1 final replay-model correction (per the re-audit of 9726418):
+ * the previous namespace was `commitmentRoot` only (a single shared floor
+ * per route). That left downstream hops vulnerable to replay by a malicious
+ * upstream relay. The corrected namespace is `(commitmentRoot, hopIndex,
+ * direction)` — every hop has its own floor. See ADR-0019.
  */
 export interface CircuitSequenceFloorStore {
   /**
-   * Read the current sequence floor for a circuit route.
-   * Returns 0n if no prior circuit has been established on this route.
+   * Read the current sequence floor for a receiving context.
+   * Returns 0n if no prior frame has been accepted on this (route, hop, direction).
    *
    * @param commitmentRoot - the 32-byte route commitment root (Merkle root)
+   * @param hopIndex - which relay hop is the receiver (0-based)
+   * @param direction - 0x01 (forward) or 0x02 (backward)
    */
-  getFloor(commitmentRoot: Uint8Array): Promise<bigint>;
+  getFloor(
+    commitmentRoot: Uint8Array,
+    hopIndex: number,
+    direction: number,
+  ): Promise<bigint>;
 
   /**
    * Atomically check whether `attemptedSequence` is strictly higher than
-   * the persisted floor, and if so, durably persist the new floor.
+   * the persisted floor for this (route, hop, direction), and if so,
+   * durably persist the new floor.
    *
    * This is the core fail-closed operation: the check and the persist
    * happen in a single atomic transaction. If either fails, the frame
@@ -122,12 +147,16 @@ export interface CircuitSequenceFloorStore {
    * returns `{ ok: true }`.
    *
    * @param commitmentRoot - the 32-byte route commitment root
+   * @param hopIndex - which relay hop is the receiver (0-based)
+   * @param direction - 0x01 (forward) or 0x02 (backward)
    * @param attemptedSequence - the frame sequence being checked
    * @returns `{ ok: true }` if accepted + persisted; `{ ok: false, reason }`
    *          if rejected (replay/stale) or persistence failed (fail-closed).
    */
   checkAndAdvance(
     commitmentRoot: Uint8Array,
+    hopIndex: number,
+    direction: number,
     attemptedSequence: bigint,
   ): Promise<SequenceFloorCheckResult>;
 }
@@ -204,32 +233,48 @@ export interface CircuitAckReplayStore {
  * `DurableSqliteCircuitSequenceFloorStore` (in `src/lib/sharenet/`).
  */
 export class InMemoryCircuitSequenceFloorStore implements CircuitSequenceFloorStore {
+  // Keyed by (commitmentRootHex, hopIndex, direction) — receiver-local.
   private floors = new Map<string, bigint>();
 
-  async getFloor(commitmentRoot: Uint8Array): Promise<bigint> {
-    return this.floors.get(toHex(commitmentRoot)) ?? 0n;
+  private key(commitmentRoot: Uint8Array, hopIndex: number, direction: number): string {
+    return `${toHex(commitmentRoot)}:${hopIndex}:${direction}`;
+  }
+
+  async getFloor(
+    commitmentRoot: Uint8Array,
+    hopIndex: number,
+    direction: number,
+  ): Promise<bigint> {
+    return this.floors.get(this.key(commitmentRoot, hopIndex, direction)) ?? 0n;
   }
 
   async checkAndAdvance(
     commitmentRoot: Uint8Array,
+    hopIndex: number,
+    direction: number,
     attemptedSequence: bigint,
   ): Promise<SequenceFloorCheckResult> {
-    const key = toHex(commitmentRoot);
-    const current = this.floors.get(key) ?? 0n;
+    const k = this.key(commitmentRoot, hopIndex, direction);
+    const current = this.floors.get(k) ?? 0n;
     if (attemptedSequence <= current) {
       return {
         ok: false,
-        reason: `sequence ${attemptedSequence} ≤ floor ${current} (replay/stale)`,
+        reason: `sequence ${attemptedSequence} ≤ floor ${current} (replay/stale) at (hop ${hopIndex}, dir ${direction})`,
       };
     }
     // Atomic in-memory update (single-threaded JS — no race).
-    this.floors.set(key, attemptedSequence);
+    this.floors.set(k, attemptedSequence);
     return { ok: true };
   }
 
-  /** Test-only: directly set the floor (e.g. to simulate a prior circuit). */
-  setFloorForTest(commitmentRoot: Uint8Array, floor: bigint): void {
-    this.floors.set(toHex(commitmentRoot), floor);
+  /** Test-only: directly set the floor for a receiver context (e.g. to simulate prior traffic). */
+  setFloorForTest(
+    commitmentRoot: Uint8Array,
+    hopIndex: number,
+    direction: number,
+    floor: bigint,
+  ): void {
+    this.floors.set(this.key(commitmentRoot, hopIndex, direction), floor);
   }
 }
 

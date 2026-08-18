@@ -620,31 +620,30 @@ export type ProcessCircuitFrameResult =
  *    every accepted sequence before treating it as accepted. Persistence
  *    failure must fail closed."
  *
- * The operation is:
- *   1. Resolve the floor store: the `floorStore` argument if given,
- *      otherwise `circuit.floorStore` (set at setup), otherwise none
- *      (in-memory `replayGuard` only — single-process / test path).
- *   2. If a store is present: atomically check-and-advance the floor
- *      through the store. This is a single durable transaction — the
- *      sequence is accepted AND persisted together, or rejected together.
- *      Fail-closed: if the transaction cannot complete, the frame is
- *      rejected. This is what survives process restart.
- *   3. If no store is present: use the in-memory `replayGuard` (sync).
- *      This does NOT survive restart — it is the test-only path.
- *   4. Decrypt the onion layer.
+ * R-009 Stage 1 final replay-model correction: the durable floor is keyed by
+ * (commitmentRoot, hopIndex, direction) — the RECEIVING SECURITY CONTEXT.
+ * Every receiver on the circuit commits its own floor. This is critical under
+ * ShareNet's threat model (malicious relays): a malicious upstream relay
+ * replaying an already-valid inner ciphertext toward a downstream hop is
+ * caught by the downstream hop's own floor.
  *
- * Per spec/08 §4.5: the floor persists across re-key because it is keyed
- * by `commitment_root` (the route identity), not the circuit ID.
+ * The operation is:
+ *   1. AEAD authenticate + decrypt (reject if tag fails — floor UNCHANGED).
+ *   2. atomically check-and-advance the floor through the store, keyed by
+ *      (commitmentRoot, hopIndex, direction). Fail-closed.
+ *   3. frame accepted.
  *
  * @param circuit - the active circuit (MUST carry a `floorStore` — required field)
  * @param hopIndex - which relay hop is processing this frame
  * @param frameSequence - the frame's 32-bit sequence number
+ * @param direction - 0x01 (forward) or 0x02 (backward) — the frame's direction
  * @param ciphertext - the encrypted frame payload
  */
 export async function processCircuitFrame(
   circuit: ActiveCircuit,
   hopIndex: number,
   frameSequence: number,
+  direction: number,
   ciphertext: Uint8Array,
 ): Promise<ProcessCircuitFrameResult> {
   // R-008 FINAL HARDENING — frozen protocol ordering:
@@ -657,19 +656,6 @@ export async function processCircuitFrame(
   // tag verifies. This prevents the DoS vector flagged in the R-008 re-audit:
   //
   //   "sequence floor can be burned before AEAD authentication"
-  //
-  // Under the OLD (buggy) order (commit → decrypt), an attacker who guesses
-  // a valid future sequence number and sends invalid ciphertext could
-  // permanently advance the floor — causing the legitimate frame at that
-  // sequence to be rejected forever.
-  //
-  // Under this (frozen) order, an unauthenticated/tampered frame is rejected
-  // at step 1 and the floor is NEVER touched. Only cryptographically
-  // authenticated frames advance the floor. This is the invariant R-009
-  // (circuit packet semantics) MUST build on.
-  //
-  // Per the R-008 re-audit: "AEAD authenticate → durable sequence commit →
-  // frame accepted."
 
   // 1. AEAD authenticate + decrypt. If the tag does not verify (tampered
   //    ciphertext, wrong key), reject IMMEDIATELY — the durable floor is
@@ -683,17 +669,15 @@ export async function processCircuitFrame(
   }
 
   // 2. AEAD succeeded — now atomically commit the sequence floor through
-  //    the durable store. This is fail-closed: if the sequence is a replay
-  //    (seq ≤ floor) or the persistence operation cannot complete, the
-  //    frame is rejected. The floor only advances for authenticated frames.
+  //    the durable store, keyed by (commitmentRoot, hopIndex, direction).
+  //    This is the R-009 Stage 1 receiver-local replay model: every hop
+  //    has its own floor. Fail-closed.
   //
   //    `circuit.floorStore` is guaranteed set (ActiveCircuit.floorStore is
-  //    non-optional — construction APIs require it). The in-memory
-  //    `replayGuard` is only a fast-path cache mirror, not the source of
-  //    truth.
+  //    non-optional — construction APIs require it).
   const seq = BigInt(frameSequence);
   const commitResult = await circuit.floorStore.checkAndAdvance(
-    circuit.commitmentRoot, seq,
+    circuit.commitmentRoot, hopIndex, direction, seq,
   );
   if (!commitResult.ok) {
     return { ok: false, reason: commitResult.reason };
@@ -707,21 +691,25 @@ export async function processCircuitFrame(
 }
 
 /**
- * Load the durable sequence floor for a route and return it.
+ * Load the durable sequence floor for a receiving context and return it.
  *
- * Helper for circuit setup: the caller loads the prior floor (async) then
- * passes it to `setupCircuit` as `initialFloor` so the in-memory guard
- * cache starts at the right value. This is the re-key continuation path
- * (spec/08 §4.5).
+ * Helper for circuit setup: the caller loads the prior floor (async) for a
+ * specific (hop, direction) then passes it to `setupCircuit` as
+ * `initialFloor` so the in-memory guard cache starts at the right value.
+ * This is the re-key continuation path (spec/08 §4.5), per-receiver.
  *
  * @param floorStore - the durable floor store
  * @param commitmentRoot - the 32-byte route commitment root
+ * @param hopIndex - which relay hop is the receiver (0-based)
+ * @param direction - 0x01 (forward) or 0x02 (backward)
  */
 export async function loadCircuitFloor(
   floorStore: CircuitSequenceFloorStore,
   commitmentRoot: Uint8Array,
+  hopIndex: number,
+  direction: number,
 ): Promise<bigint> {
-  return floorStore.getFloor(commitmentRoot);
+  return floorStore.getFloor(commitmentRoot, hopIndex, direction);
 }
 
 // -----------------------------------------------------------------------

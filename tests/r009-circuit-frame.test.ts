@@ -327,7 +327,7 @@ describe("R-009: integration with R-008 frozen ordering (AEAD → durable commit
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
 
     // Floor starts at 0.
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
 
     // Tampered frame at seq=100 → AEAD fails.
     const sealed = sealForwardFrame(circuit, 100, new TextEncoder().encode("x"));
@@ -341,7 +341,7 @@ describe("R-009: integration with R-008 frozen ordering (AEAD → durable commit
 
     // Step 2 does NOT happen — the caller must NOT call floorStore.checkAndAdvance
     // when AEAD fails. The floor is UNCHANGED.
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
   });
 
   // 9. AEAD succeeds → durable commit → frame accepted
@@ -361,10 +361,12 @@ describe("R-009: integration with R-008 frozen ordering (AEAD → durable commit
     // Step 2: durable commit (only after AEAD succeeds).
     const commitResult = await floorStore.checkAndAdvance(
       route.commitmentRoot,
+      0,
+      DIRECTION_FORWARD,
       BigInt(sealed.frameSequence),
     );
     expect(commitResult.ok).toBe(true);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
   });
 
   // Replay: valid captured frame re-presented → AEAD succeeds but commit rejects
@@ -380,17 +382,17 @@ describe("R-009: integration with R-008 frozen ordering (AEAD → durable commit
     // First presentation: AEAD succeeds + commit succeeds.
     const aead1 = openFrame(circuit, 0, sealed);
     expect(aead1.ok).toBe(true);
-    const commit1 = await floorStore.checkAndAdvance(route.commitmentRoot, 1n);
+    const commit1 = await floorStore.checkAndAdvance(route.commitmentRoot, 0, DIRECTION_FORWARD, 1n);
     expect(commit1.ok).toBe(true);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
 
     // Replay: AEAD succeeds (valid ciphertext) but commit rejects (1 ≤ floor 1).
     const aead2 = openFrame(circuit, 0, sealed);
     expect(aead2.ok).toBe(true); // AEAD still succeeds — the ciphertext is valid
-    const commit2 = await floorStore.checkAndAdvance(route.commitmentRoot, 1n);
+    const commit2 = await floorStore.checkAndAdvance(route.commitmentRoot, 0, DIRECTION_FORWARD, 1n);
     expect(commit2.ok).toBe(false); // replay rejected at the floor
     if (!commit2.ok) expect(commit2.reason).toContain("≤ floor");
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // unchanged
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n); // unchanged
   });
 });
 
@@ -424,7 +426,7 @@ describe("R-009: multi-frame sequential sequence (ORDERED_STREAM)", () => {
       expect(new TextDecoder().decode(r1.plaintext)).toBe(`packet ${seq}`);
     }
 
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(10n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(10n);
   });
 });
 
@@ -596,7 +598,7 @@ describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invaria
     expect(new TextDecoder().decode(result.plaintext)).toBe("production path");
 
     // The floor was durably committed by the production path (not the caller).
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
   });
 
   test("production path: tampered frame → AEAD fails → floor UNCHANGED (no commit)", async () => {
@@ -617,7 +619,7 @@ describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invaria
     const result = await processCircuitWireFrame(circuit, 0, tamperedWire);
     expect(result.ok).toBe(false);
     // The floor is UNCHANGED — the production path did NOT commit (AEAD failed first).
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
   });
 
   test("production path: replay → AEAD succeeds but commit rejects (floor unchanged)", async () => {
@@ -633,14 +635,14 @@ describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invaria
     // First presentation: accepted + committed.
     const r1 = await processCircuitWireFrame(circuit, 0, wireBytes);
     expect(r1.ok).toBe(true);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
 
     // Replay: AEAD succeeds (valid ciphertext) but the durable commit rejects
     // (1 ≤ floor 1). The production path catches the replay.
     const r2 = await processCircuitWireFrame(circuit, 0, wireBytes);
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.reason).toContain("≤ floor");
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // unchanged
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n); // unchanged
   });
 
   test("production path: non-canonical wire → REJECT at decode (before AEAD)", async () => {
@@ -660,7 +662,7 @@ describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invaria
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toMatch(/non-canonical|CBOR decode failed|too many terminals|trailing/);
     // Floor unchanged — decode rejected before AEAD/commit.
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
   });
 });
 
@@ -695,35 +697,79 @@ describe("R-009 Stage 1 final hardening: commit ownership is protocol-enforced (
     expect(r0.ok).toBe(true);
     if (!r0.ok) return;
     expect(r0.committedSequence).toBe(1n);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // committed
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n); // committed
   });
 
-  test("hop 1 CANNOT claim commit ownership — the floor does NOT advance at hop 1", async () => {
+  test("every hop commits at its OWN receiver-local floor (root, hopIndex, FORWARD)", async () => {
+    // R-009 Stage 1 final replay-model correction: the durable floor is keyed
+    // by (commitmentRoot, hopIndex, direction) — every receiver commits its
+    // own floor. hop 0 commits at (root, 0, FORWARD); hop 1 commits at
+    // (root, 1, FORWARD) — independent floors. This catches replays by a
+    // malicious upstream relay toward a downstream hop.
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
 
-    // Pre-seed the floor at 5 (simulate prior traffic).
-    await floorStore.checkAndAdvance(route.commitmentRoot, 5n);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(5n);
+    // Pre-seed hop 0's floor at 5 (simulate prior traffic at hop 0).
+    await floorStore.checkAndAdvance(route.commitmentRoot, 0, DIRECTION_FORWARD, 5n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(5n);
+    // hop 1's floor starts at 0 (no prior traffic at hop 1).
+    expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_FORWARD)).toBe(0n);
 
-    // hop 0 processes a frame at seq=6 — commits, floor → 6.
+    // hop 0 processes a frame at seq=6 — commits at (root, 0, FORWARD) → 6.
     const plaintext = new TextEncoder().encode("seq 6");
     const sealed = sealForwardFrame(circuit, 6, plaintext);
     const wireBytes = encodeCircuitFrame(sealed);
     const r0 = await processCircuitWireFrame(circuit, 0, wireBytes);
     expect(r0.ok).toBe(true);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(6n); // hop 0 committed
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(6n); // hop 0 committed
 
-    // hop 1 processes the forwarded nextFrame — the floor MUST NOT advance
-    // (hop 1 is not the ingress checkpoint; it cannot claim commit ownership).
+    // hop 1 processes the forwarded nextFrame — commits at (root, 1, FORWARD) → 6
+    // (its OWN floor, independent from hop 0's).
     const r1 = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes);
     expect(r1.ok).toBe(true);
     if (!r1.ok) return;
     expect(r1.terminal).toBe(true); // hop 1 is terminal → delivers plaintext
-    // The floor is STILL 6 — hop 1 did not commit.
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(6n);
+    // hop 0's floor is STILL 6 (unchanged by hop 1's processing).
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(6n);
+    // hop 1's floor advanced to 6 (its own commit).
+    expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_FORWARD)).toBe(6n);
+  });
+
+  test("malicious relay replay toward downstream hop → REJECTED by downstream's own floor", async () => {
+    // The critical adversarial test: a malicious upstream relay replays an
+    // already-valid inner ciphertext toward a downstream hop. The downstream
+    // hop's OWN floor catches the replay — even though the AEAD succeeds
+    // (the ciphertext is valid). This is why the floor is receiver-local.
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Legitimate frame seq=10: source → hop 0 → hop 1.
+    const plaintext = new TextEncoder().encode("legitimate seq 10");
+    const sealed = sealForwardFrame(circuit, 10, plaintext);
+    const wireBytes = encodeCircuitFrame(sealed);
+
+    // hop 0 processes — commits at (root, 0, FORWARD) → 10.
+    const r0 = await processCircuitWireFrame(circuit, 0, wireBytes);
+    expect(r0.ok).toBe(true);
+    if (!r0.ok) return;
+
+    // hop 1 processes the forwarded nextFrame — commits at (root, 1, FORWARD) → 10.
+    const r1 = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes);
+    expect(r1.ok).toBe(true);
+    expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_FORWARD)).toBe(10n);
+
+    // MALICIOUS RELAY ATTACK: relay 0 replays the SAME nextFrame toward hop 1.
+    // The AEAD succeeds (valid ciphertext, same key+nonce → same plaintext),
+    // but hop 1's OWN floor catches the replay (10 ≤ floor 10).
+    const replayResult = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes);
+    expect(replayResult.ok).toBe(false);
+    if (!replayResult.ok) expect(replayResult.reason).toContain("≤ floor");
+    // hop 1's floor is UNCHANGED (still 10 — the replay did not advance it).
+    expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_FORWARD)).toBe(10n);
   });
 
   test("replay at hop 0 → rejected by the ingress checkpoint (commit fails)", async () => {
@@ -741,14 +787,14 @@ describe("R-009 Stage 1 final hardening: commit ownership is protocol-enforced (
     // First presentation at hop 0 → accepted + committed.
     const r1 = await processCircuitWireFrame(circuit, 0, wireBytes);
     expect(r1.ok).toBe(true);
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
 
     // Replay at hop 0 → AEAD succeeds (valid ciphertext) but the ingress
     // checkpoint's durable commit rejects (1 ≤ floor 1).
     const r2 = await processCircuitWireFrame(circuit, 0, wireBytes);
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.reason).toContain("≤ floor");
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(1n); // unchanged
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n); // unchanged
   });
 });
 
@@ -797,7 +843,7 @@ describe("R-009 Stage 1 final hardening: backward direction rejected by producti
       expect(result.reason).toContain("Stage 2");
     }
     // The floor is UNCHANGED — the backward frame never reached AEAD/commit.
-    expect(await floorStore.getFloor(route.commitmentRoot)).toBe(0n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
   });
 
   test("processCircuitWireFrame has NO commitFloor parameter (protocol-derived)", () => {

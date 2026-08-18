@@ -301,20 +301,40 @@ model DemoAccount {
 // Circuit Sequence Floors (persistent replay protection per route)
 // ---------------------------------------------------------------------
 
-/// Per spec/08 §4.5: "Sequence floors persist across circuit re-key events."
-/// This table stores the sequence floor keyed by commitment_root, so a
-/// re-key on the same route continues from the prior floor. Process
-/// restarts do NOT reset the floor because it is durably persisted.
+/// Per spec/08 §4.5 (FROZEN per R-008): "frame_sequence is strictly increasing
+/// per circuit; a receiver rejects any frame whose sequence is <= the highest
+/// sequence already accepted." The normative rule is RECEIVER-LOCAL — every
+/// receiver on the circuit enforces replay protection, not just the ingress.
+///
+/// This table stores the sequence floor keyed by (commitmentRoot, hopIndex,
+/// direction) — the receiving security context. Each hop has a different AEAD
+/// key (per spec/08 §4.1) and therefore its own replay state. A re-key on the
+/// same (route, hop, direction) continues from the prior floor.
+///
+/// R-009 Stage 1 final replay-model correction (per the re-audit of 9726418):
+/// the previous schema was keyed by commitmentRootHex only (a single shared
+/// floor per route). That left downstream hops vulnerable to replay by a
+/// malicious upstream relay. The corrected key is (commitmentRootHex,
+/// hopIndex, direction) — every hop has its own floor. See ADR-0019.
 model CircuitSequenceFloor {
   /// Hex of the 32-byte commitment_root (the route identity).
-  commitmentRootHex String   @id
+  commitmentRootHex String
+  /// Which relay hop is the receiver (0-based).
+  hopIndex          Int
+  /// Traffic direction: 0x01 = forward, 0x02 = backward (per spec/08 §4.6).
+  direction         Int
   /// The current maximum accepted frame_sequence (bigint stored as string).
   /// n <= floor is rejected (replay/stale). n > floor is accepted.
   currentMaxSequence String
   /// Last updated timestamp.
   lastAdvancedAt   DateTime @default(now()) @updatedAt
-  /// First time this route's floor was created.
+  /// First time this receiver's floor was created.
   firstSeenAt     DateTime @default(now())
+
+  /// Unique composite key: (commitmentRoot, hopIndex, direction) — one floor
+  /// per receiving context.
+  @@unique([commitmentRootHex, hopIndex, direction])
+  @@index([commitmentRootHex])
 }
 
 // ---------------------------------------------------------------------
