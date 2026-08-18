@@ -1511,6 +1511,56 @@ def seal_forward_frame(circuit: dict, frame_sequence: int,
     }
 
 
+def seal_return_frame(circuit: dict, frame_sequence: int,
+                      plaintext: bytes) -> dict:
+    """Onion-encrypt the plaintext from the innermost hop (first) to the
+    outermost hop (last), producing a return (backward) CircuitFrame.
+
+    Per spec/08 §4.6a (R-009 Stage 2): the gateway onion-encrypts return
+    traffic using each hop's `returnKey` (NOT `forwardingKey`). The
+    return-onion is the mirror of the forward onion:
+
+      - forward onion : encrypt hop N-1 (innermost) → hop 0 (outermost),
+        using forwardingKey. Terminal = hop N-1.
+      - backward onion: encrypt hop 0 (innermost) → hop N-1 (outermost),
+        using returnKey. Terminal = hop 0 (the source).
+
+    So for a 2-hop circuit the layering is:
+      ciphertext = AEAD_enc(returnKey1, AEAD_enc(returnKey0, plaintext))
+    where returnKey1 is the outermost (peeled first at hop 1) and
+    returnKey0 is the innermost (peeled last at hop 0 — the terminal).
+
+    `circuit` is a dict with:
+      commitmentRoot: bytes (32)
+      noncePrefix: bytes (8)
+      hops: list of dicts each with `forwardingKey` + `returnKey` (bytes 32).
+    """
+    if not isinstance(frame_sequence, int) or frame_sequence < 1 \
+            or frame_sequence > 0xffffffff:
+        raise ValueError(
+            f"sealReturnFrame: frameSequence must be a u32 ≥ 1, "
+            f"got {frame_sequence}"
+        )
+
+    aad = build_circuit_frame_ad(
+        circuit["commitmentRoot"], frame_sequence, DIRECTION_BACKWARD)
+    nonce = build_circuit_nonce(circuit["noncePrefix"], frame_sequence)
+
+    # Onion-encrypt from the innermost hop (first, terminal for backward)
+    # to the outermost hop (last, first to decrypt).
+    data = bytes(plaintext)
+    for i in range(0, len(circuit["hops"])):
+        hop = circuit["hops"][i]
+        data = encrypt_payload(hop["returnKey"], nonce, data, aad)
+
+    return {
+        "circuitNoncePrefix": bytes(circuit["noncePrefix"]),
+        "frameSequence": frame_sequence,
+        "direction": DIRECTION_BACKWARD,
+        "ciphertext": data,
+    }
+
+
 def open_frame(circuit: dict, hop_index: int, frame: dict) -> dict:
     """Peel ONE AEAD layer of a CircuitFrame at the given hop.
 
@@ -1561,9 +1611,15 @@ def open_frame(circuit: dict, hop_index: int, frame: dict) -> dict:
             "reason": f"AEAD authentication failed: {e}",
         }
 
-    # Terminal hop for forward direction = last hop in the route.
-    is_terminal = (frame["direction"] == DIRECTION_FORWARD and
-                   hop_index == len(circuit["hops"]) - 1)
+    # Terminal hop depends on direction:
+    #   FORWARD  -> hop_index == len(hops) - 1 (last hop in the route)
+    #   BACKWARD -> hop_index == 0 (the source — the destination for
+    #              return traffic). Per spec/08 §4.6a (R-009 Stage 2):
+    #              the return-onion's terminal is the source.
+    if frame["direction"] == DIRECTION_FORWARD:
+        is_terminal = hop_index == len(circuit["hops"]) - 1
+    else:  # DIRECTION_BACKWARD
+        is_terminal = hop_index == 0
 
     return {"ok": True, "payload": payload, "isTerminal": is_terminal}
 
@@ -1664,6 +1720,9 @@ def verify_circuit_frame_vector(data: dict) -> dict:
     # Carry state across cases (some vectors reference prior outputs).
     sealed_forward_frame = None  # set by seal-forward-frame
     next_frame_at_hop_0 = None  # set by forward-frame-hop0
+    # R-009 Stage 2 (backward/return onion) — V-CIRCUIT-FRAME-002.
+    sealed_return_frame = None  # set by seal-return-frame
+    next_frame_at_hop1 = None  # set by forward-frame-hop1-backward
 
     failures = []
     for v in vectors:
@@ -1967,6 +2026,152 @@ def verify_circuit_frame_vector(data: dict) -> dict:
                             f"{name}: reason '{decoded['reason']}' !contains "
                             f"'{expected['reasonContains']}'"
                         )
+
+            # ----- R-009 Stage 2: 5 backward/return-onion cases -----
+            # (V-CIRCUIT-FRAME-002). The return-onion is the mirror of the
+            # forward onion: gateway onion-encrypts using returnKey (hop 0
+            # innermost → hop N-1 outermost). Terminal for BACKWARD is hop 0.
+
+            elif name == "seal-return-frame":
+                # 2-hop return-onion encrypt the plaintext at the given seq.
+                # Uses returnKey0 (innermost) then returnKey1 (outermost).
+                plaintext = bytes.fromhex(inp["plaintextHex"])
+                sealed = seal_return_frame(circuit, inp["frameSequence"],
+                                           plaintext)
+                sealed_encoded = encode_circuit_frame(sealed)
+                sealed_return_frame = sealed
+                if sealed_encoded.hex() != expected["sealedEncodedHex"]:
+                    failures.append(
+                        f"{name}: sealedEncoded "
+                        f"{sealed_encoded.hex()} != "
+                        f"{expected['sealedEncodedHex']}"
+                    )
+                if len(sealed["ciphertext"]) != expected["ciphertextLen"]:
+                    failures.append(
+                        f"{name}: ciphertextLen "
+                        f"{len(sealed['ciphertext'])} != "
+                        f"{expected['ciphertextLen']}"
+                    )
+                if sealed["direction"] != expected["direction"]:
+                    failures.append(
+                        f"{name}: direction 0x{sealed['direction']:02x} != "
+                        f"0x{expected['direction']:02x}"
+                    )
+
+            elif name == "open-frame-hop1-backward":
+                # openFrame at hop 1 (backward): peel the outermost returnKey
+                # layer. isTerminal=false (terminal for backward is hop 0).
+                if sealed_return_frame is None:
+                    failures.append(f"{name}: no sealedReturnFrame")
+                else:
+                    r = open_frame(circuit, 1, sealed_return_frame)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: ok {r['ok']} != {expected['ok']}"
+                        )
+                    elif r["ok"]:
+                        if r["isTerminal"] != expected["isTerminal"]:
+                            failures.append(
+                                f"{name}: isTerminal {r['isTerminal']} != "
+                                f"{expected['isTerminal']}"
+                            )
+                        if len(r["payload"]) != expected["payloadLen"]:
+                            failures.append(
+                                f"{name}: payloadLen "
+                                f"{len(r['payload'])} != "
+                                f"{expected['payloadLen']}"
+                            )
+                        if r["payload"].hex() != expected["payloadHex"]:
+                            failures.append(
+                                f"{name}: payload "
+                                f"{r['payload'].hex()} != "
+                                f"{expected['payloadHex']}"
+                            )
+
+            elif name == "forward-frame-hop1-backward":
+                # forwardFrame at hop 1 (backward): produces nextFrame for
+                # hop 0 (the source). terminal=false.
+                if sealed_return_frame is None:
+                    failures.append(f"{name}: no sealedReturnFrame")
+                else:
+                    r = forward_frame(circuit, 1, sealed_return_frame)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: ok {r['ok']} != {expected['ok']}"
+                        )
+                    elif r["ok"]:
+                        if r["terminal"] != expected["terminal"]:
+                            failures.append(
+                                f"{name}: terminal {r['terminal']} != "
+                                f"{expected['terminal']}"
+                            )
+                        elif not r["terminal"]:
+                            nf = r["nextFrame"]
+                            nf_encoded = encode_circuit_frame(nf)
+                            if nf_encoded.hex() != \
+                                    expected["nextFrameEncodedHex"]:
+                                failures.append(
+                                    f"{name}: nextFrame "
+                                    f"{nf_encoded.hex()} != "
+                                    f"{expected['nextFrameEncodedHex']}"
+                                )
+                            if len(nf["ciphertext"]) != \
+                                    expected["nextFrameCiphertextLen"]:
+                                failures.append(
+                                    f"{name}: nextFrameCiphertextLen "
+                                    f"{len(nf['ciphertext'])} != "
+                                    f"{expected['nextFrameCiphertextLen']}"
+                                )
+                            next_frame_at_hop1 = nf
+
+            elif name == "forward-frame-hop0-backward-terminal":
+                # forwardFrame at hop 0 (backward, terminal): delivers the
+                # original return plaintext to the source.
+                if next_frame_at_hop1 is None:
+                    failures.append(f"{name}: no nextFrameAtHop1")
+                else:
+                    r = forward_frame(circuit, 0, next_frame_at_hop1)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: ok {r['ok']} != {expected['ok']}"
+                        )
+                    elif r["ok"]:
+                        if r["terminal"] != expected["terminal"]:
+                            failures.append(
+                                f"{name}: terminal {r['terminal']} != "
+                                f"{expected['terminal']}"
+                            )
+                        elif r["terminal"]:
+                            if r["plaintext"].hex() != \
+                                    expected["plaintextHex"]:
+                                failures.append(
+                                    f"{name}: plaintext "
+                                    f"{r['plaintext'].hex()} != "
+                                    f"{expected['plaintextHex']}"
+                                )
+
+            elif name == "tampered-return-ciphertext-rejected":
+                # Flip one bit in the sealed return ciphertext, then
+                # openFrame at hop 1 (backward). AEAD must reject.
+                if sealed_return_frame is None:
+                    failures.append(f"{name}: no sealedReturnFrame")
+                else:
+                    tampered_ct = bytearray(sealed_return_frame["ciphertext"])
+                    tampered_ct[0] ^= 0x01
+                    tampered_frame = dict(sealed_return_frame)
+                    tampered_frame["ciphertext"] = bytes(tampered_ct)
+                    r = open_frame(circuit, 1, tampered_frame)
+                    if r["ok"] != expected["ok"]:
+                        failures.append(
+                            f"{name}: expected ok={expected['ok']}, "
+                            f"got ok={r['ok']}"
+                        )
+                    elif not r["ok"]:
+                        if expected["reasonContains"] not in r["reason"]:
+                            failures.append(
+                                f"{name}: reason '{r['reason']}' !contains "
+                                f"'{expected['reasonContains']}'"
+                            )
 
             else:
                 failures.append(f"{name}: unknown circuit-frame case name")

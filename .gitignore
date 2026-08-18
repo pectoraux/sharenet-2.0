@@ -75,3 +75,4 @@ server.log
 # tool output artifacts (read tool)
 /tool-results/
 /tool-results
+__pycache__/

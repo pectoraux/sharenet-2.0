@@ -450,13 +450,87 @@ export function openFrame(
     return { ok: false, reason: `AEAD authentication failed: ${(e as Error).message}` };
   }
 
-  // This hop is terminal if it's the last hop in the route AND the direction
-  // is forward (the gateway receives the plaintext). For backward direction,
-  // the terminal hop is hop 0 (the source) — but Stage 1 does not fully
-  // exercise backward; the isTerminal flag is computed for forward.
-  const isTerminal = frame.direction === DIRECTION_FORWARD && hopIndex === circuit.hops.length - 1;
+  // This hop is terminal depending on the direction:
+  //   FORWARD:  the terminal hop is the LAST hop (gateway receives plaintext).
+  //   BACKWARD: the terminal hop is hop 0 (the source receives plaintext).
+  //
+  // The relay at the terminal position delivers the plaintext; all other hops
+  // forward the inner ciphertext toward the terminal.
+  const isTerminal =
+    (frame.direction === DIRECTION_FORWARD && hopIndex === circuit.hops.length - 1) ||
+    (frame.direction === DIRECTION_BACKWARD && hopIndex === 0);
 
   return { ok: true, payload, isTerminal };
+}
+
+// -----------------------------------------------------------------------
+// Return frame seal (gateway-side: create the N-layer return-onion)
+// -----------------------------------------------------------------------
+
+/**
+ * Seal a plaintext into a backward (return) CircuitFrame (gateway → source).
+ *
+ * R-009 Stage 2 (return-onion traffic): the gateway seals a return payload
+ * using the per-hop `returnKey`s. The sealing order is the MIRROR of the
+ * forward onion: the gateway encrypts from the INNERMOST hop (hop 0, the
+ * source) to the OUTERMOST hop (hop N-1, the gateway's neighbor), so each
+ * relay peels one layer with its `returnKey` as the frame travels backward.
+ *
+ * Per spec/08 §4.1: each hop's HKDF output is split into forwardingKey
+ * (bytes 0-31, forward traffic) + returnKey (bytes 32-63, return traffic).
+ * The returnKey is used ONLY for backward-direction frames.
+ *
+ * The AEAD AD uses DIRECTION_BACKWARD (0x02), binding the frame to the
+ * return direction. The nonce construction is the same as forward (nonce
+ * prefix || frame_sequence) — since the nonce prefix is bound to the circuit
+ * instance (ADR-0020) + the direction is part of the AD, forward + backward
+ * nonces at the same sequence are cryptographically distinct (different AD).
+ *
+ * After sealing, the gateway sends the frame to hop N-1 (its neighbor).
+ * Each relay peels one layer with its returnKey + forwards to the next hop
+ * toward the source. The terminal hop (hop 0 = source) delivers the
+ * plaintext.
+ *
+ * @param circuit - the active circuit (carries the per-hop returnKeys)
+ * @param frameSequence - the 32-bit frame sequence (starts at 1, strictly increasing per (root, hop, BACKWARD))
+ * @param plaintext - the return payload to send back to the source
+ * @returns a CircuitFrame (direction=BACKWARD) ready to encode + send to hop N-1
+ */
+export function sealReturnFrame(
+  circuit: ActiveCircuit,
+  frameSequence: number,
+  plaintext: Uint8Array,
+): CircuitFrame {
+  if (!Number.isInteger(frameSequence) || frameSequence < 1 || frameSequence > 0xffffffff) {
+    throw new Error(
+      `sealReturnFrame: frameSequence must be a u32 ≥ 1, got ${frameSequence}`,
+    );
+  }
+
+  // Per spec/08 §4.6: AD = domain || commitment_root || frame_sequence || direction
+  // The direction is BACKWARD (0x02) — this binds the frame to the return direction.
+  const aad = buildCircuitFrameAD(circuit.commitmentRoot, frameSequence, DIRECTION_BACKWARD);
+
+  // Return-onion encrypt from the INNERMOST hop (hop 0, the source) to the
+  // OUTERMOST hop (hop N-1, the gateway's neighbor). This is the MIRROR of
+  // the forward onion (which encrypts from hop N-1 down to hop 0).
+  //
+  // After this loop, `data` is N layers deep. The gateway sends the frame
+  // to hop N-1, which peels the outermost layer (its returnKey) + forwards
+  // to hop N-2, ..., hop 0 peels the final layer + delivers the plaintext.
+  let data = plaintext;
+  for (let i = 0; i < circuit.hops.length; i++) {
+    const hop = circuit.hops[i]!;
+    const nonce = buildNonce(circuit.noncePrefix, frameSequence);
+    data = encryptPayload(hop.returnKey, nonce, data, aad);
+  }
+
+  return {
+    circuitNoncePrefix: circuit.noncePrefix,
+    frameSequence,
+    direction: DIRECTION_BACKWARD,
+    ciphertext: data,
+  };
 }
 
 // Re-export for convenience.

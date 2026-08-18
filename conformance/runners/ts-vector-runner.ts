@@ -75,8 +75,10 @@ import {
   encodeCircuitFrame,
   decodeCircuitFrame,
   sealForwardFrame,
+  sealReturnFrame,
   openFrame,
   DIRECTION_FORWARD,
+  DIRECTION_BACKWARD,
   type CircuitFrame,
 } from "@reference/circuit/frame";
 import { forwardFrame } from "@reference/circuit/forwarding";
@@ -1028,6 +1030,9 @@ function verifyCircuitFrameVector(data: any): VectorResult {
   // reference the output of a previous vector).
   let sealedForwardFrame: CircuitFrame | null = null;
   let nextFrameAtHop0: CircuitFrame | null = null;
+  // Return-onion (V-CIRCUIT-FRAME-002) state.
+  let sealedReturnFrame: CircuitFrame | null = null;
+  let nextFrameAtHop1: CircuitFrame | null = null;
 
   for (const v of vectors) {
     try {
@@ -1233,6 +1238,95 @@ function verifyCircuitFrameVector(data: any): VectorResult {
           if (!decoded.reason.includes(expected.reasonContains)) {
             caseOk = false;
             failures.push(`${v.name}: reason "${decoded.reason}" !contains "${expected.reasonContains}"`);
+          }
+        }
+      } else if (v.name === "seal-return-frame") {
+        // R-009 Stage 2: sealReturnFrame (gateway onion-encrypts using returnKeys).
+        const plaintext = hexToBytes(shared.plaintextHex);
+        const sealed = sealReturnFrame(circuit, input.frameSequence, plaintext);
+        const sealedEncoded = encodeCircuitFrame(sealed);
+        const sealedEncodedHex = toHex(sealedEncoded);
+        sealedReturnFrame = sealed;
+        if (sealedEncodedHex !== expected.sealedEncodedHex) {
+          caseOk = false;
+          failures.push(`${v.name}: sealedEncoded ${sealedEncodedHex} != ${expected.sealedEncodedHex}`);
+        }
+        if (sealed.ciphertext.length !== expected.ciphertextLen) {
+          caseOk = false;
+          failures.push(`${v.name}: ciphertextLen ${sealed.ciphertext.length} != ${expected.ciphertextLen}`);
+        }
+        if (sealed.direction !== DIRECTION_BACKWARD) {
+          caseOk = false;
+          failures.push(`${v.name}: direction ${sealed.direction} != ${DIRECTION_BACKWARD}`);
+        }
+      } else if (v.name === "open-frame-hop1-backward") {
+        if (!sealedReturnFrame) { caseOk = false; failures.push(`${v.name}: no sealedReturnFrame`); }
+        else {
+          const r = openFrame(circuit, 1, sealedReturnFrame);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`);
+          } else if (r.ok) {
+            if (r.isTerminal !== expected.isTerminal) caseOk = false;
+            if (r.payload.length !== expected.payloadLen) caseOk = false;
+            if (toHex(r.payload) !== expected.payloadHex) caseOk = false;
+            if (!caseOk) failures.push(`${v.name}: open result mismatch`);
+          }
+        }
+      } else if (v.name === "forward-frame-hop1-backward") {
+        if (!sealedReturnFrame) { caseOk = false; failures.push(`${v.name}: no sealedReturnFrame`); }
+        else {
+          const r = forwardFrame(circuit, 1, sealedReturnFrame);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`);
+          } else if (r.ok) {
+            if (r.terminal !== expected.terminal) {
+              caseOk = false;
+              failures.push(`${v.name}: terminal ${r.terminal} != ${expected.terminal}`);
+            } else if (!r.terminal) {
+              const nfEncoded = encodeCircuitFrame(r.nextFrame);
+              if (toHex(nfEncoded) !== expected.nextFrameEncodedHex) {
+                caseOk = false;
+                failures.push(`${v.name}: nextFrame mismatch`);
+              }
+              if (r.nextFrame.ciphertext.length !== expected.nextFrameCiphertextLen) {
+                caseOk = false;
+                failures.push(`${v.name}: nextFrameCiphertextLen ${r.nextFrame.ciphertext.length} != ${expected.nextFrameCiphertextLen}`);
+              }
+              nextFrameAtHop1 = r.nextFrame;
+            }
+          }
+        }
+      } else if (v.name === "forward-frame-hop0-backward-terminal") {
+        if (!nextFrameAtHop1) { caseOk = false; failures.push(`${v.name}: no nextFrameAtHop1`); }
+        else {
+          const r = forwardFrame(circuit, 0, nextFrameAtHop1);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`);
+          } else if (r.ok && r.terminal) {
+            if (toHex(r.plaintext) !== expected.plaintextHex) {
+              caseOk = false;
+              failures.push(`${v.name}: plaintext mismatch`);
+            }
+          }
+        }
+      } else if (v.name === "tampered-return-ciphertext-rejected") {
+        if (!sealedReturnFrame) { caseOk = false; failures.push(`${v.name}: no sealedReturnFrame`); }
+        else {
+          const tamperedCt = new Uint8Array(sealedReturnFrame.ciphertext);
+          tamperedCt[0] ^= 0x01;
+          const tamperedFrame: CircuitFrame = { ...sealedReturnFrame, ciphertext: tamperedCt };
+          const r = openFrame(circuit, 1, tamperedFrame);
+          if (r.ok !== expected.ok) {
+            caseOk = false;
+            failures.push(`${v.name}: expected ok=false, got ok=${r.ok}`);
+          } else if (!r.ok) {
+            if (!r.reason.includes(expected.reasonContains)) {
+              caseOk = false;
+              failures.push(`${v.name}: reason "${r.reason}" !contains "${expected.reasonContains}"`);
+            }
           }
         }
       } else {

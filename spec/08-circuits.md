@@ -224,6 +224,37 @@ This binds the frame to a specific `CommittedRoute`. A frame
 encrypted under a circuit's key but presented with a different
 `commitment_root` MUST fail AEAD verification.
 
+### 4.6a Forward + Backward (Return) Onion (R-009 Stage 2)
+
+The circuit carries bidirectional traffic. Forward frames
+(`direction = 0x01`) travel source → gateway; backward frames
+(`direction = 0x02`) travel gateway → source.
+
+**Forward onion** (source seals, §5): the source onion-encrypts the
+plaintext from the outermost hop (last) to the innermost hop (first),
+using each hop's `forwardingKey`. Each relay peels one layer; the terminal
+hop (hop N-1, the gateway) delivers the plaintext.
+
+**Backward (return) onion** (gateway seals): the gateway onion-encrypts
+the return plaintext from the innermost hop (hop 0, the source) to the
+outermost hop (hop N-1, the gateway's neighbor), using each hop's
+`returnKey`. This is the MIRROR of the forward onion. Each relay peels one
+layer with its `returnKey`; the terminal hop (hop 0, the source) delivers
+the plaintext.
+
+Per §4.1, each hop's HKDF output is split into `forwardingKey` (bytes 0-31)
++ `returnKey` (bytes 32-63). The `returnKey` is used ONLY for
+backward-direction frames. The AEAD AD includes the `direction` byte, so a
+forward frame + a backward frame at the same `frame_sequence` are
+cryptographically distinct (different AD → different AEAD tag).
+
+**Replay protection (bidirectional):** per ADR-0019, the durable sequence
+floor is keyed by `(commitmentRoot, hopIndex, direction)`. Forward + backward
+floors are INDEPENDENT — a forward frame at seq=1 + a backward frame at
+seq=1 are BOTH accepted at the same hop (different `direction` → different
+floor row). A replay in either direction is caught by that direction's own
+floor. Every hop commits its own floor for both directions.
+
 ### 4.7 Expiration
 
 A circuit carries `valid_until = min(hop.accepted_expiry for hop in

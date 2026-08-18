@@ -1,10 +1,10 @@
-# ADR-0019: Receiver-local replay protection (R-009 Stage 1)
+# ADR-0019: Receiver-local replay protection (R-009 Stage 1 + Stage 2)
 
-**Date:** 2026-08-18 (revised)
+**Date:** 2026-08-18 (revised for Stage 2)
 **Status:** ACCEPTED
-**Phase:** R-009 Stage 1 (forward traffic)
+**Phase:** R-009 Stage 1 (forward traffic) + Stage 2 (backward/return traffic)
 **Supersedes:** The "single ingress replay checkpoint" model from the initial 9726418 version of this ADR.
-**Superseded by:** (future ADR when Stage 2 freezes return-onion semantics)
+**Superseded by:** None
 
 ## Context
 
@@ -160,21 +160,31 @@ frame is rejected at step 3 and the floor is never touched.
   one per route. For an N-hop circuit, N floor rows per direction. This is
   acceptable — the rows are small + the security benefit is essential.
 
-## Open question for Stage 2
+## Stage 2 resolution (backward/return traffic — RESOLVED)
 
 With the receiver-local namespace `(commitmentRoot, hopIndex, direction)`,
 forward and backward sequences are **already independent** (different
-`direction` values → different floor rows). So the "direction-specific
-floors" question from the previous version of this ADR is **resolved by
+`direction` values → different floor rows). The "direction-specific floors"
+question from the previous version of this ADR is **resolved by
 construction** — the namespace already includes `direction`.
 
-Stage 2's remaining work is to:
-1. Lift the BACKWARD rejection in `processCircuitWireFrame()`.
-2. Implement the return-onion sealing (source-internal, using `returnKey`s).
-3. Define the ingress checkpoint for backward traffic (likely: the gateway is
-   the ingress for backward, mirroring how hop 0 is the entry for forward —
-   but with receiver-local floors, every hop still commits its own backward
-   floor, so this is about sealing order, not commit ownership).
+R-009 Stage 2 (this revision) completes the bidirectional model:
+1. The BACKWARD rejection in `processCircuitWireFrame()` is **lifted** —
+   backward frames are now accepted.
+2. The return-onion sealing (`sealReturnFrame`) is implemented: the gateway
+   seals the return payload using each hop's `returnKey`, from the innermost
+   hop (hop 0, the source) to the outermost hop (hop N-1, the gateway's
+   neighbor). This is the MIRROR of the forward onion.
+3. `openFrame` computes `isTerminal` correctly for both directions:
+   - FORWARD: terminal = hop N-1 (the gateway).
+   - BACKWARD: terminal = hop 0 (the source).
+4. `processCircuitWireFrame` commits at `(root, hopIndex, frame.direction)`
+   — so every hop commits its own floor for BOTH directions. A forward
+   frame at seq=1 + a backward frame at seq=1 are BOTH accepted at the
+   same hop (different `direction` → different floor row). A replay in
+   either direction is caught by that direction's own floor.
+
+The bidirectional replay model is now frozen. See `spec/08 §4.6a`.
 
 ## Architectural lesson (carried forward from 9726418)
 

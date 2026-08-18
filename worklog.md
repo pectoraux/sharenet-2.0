@@ -1763,3 +1763,64 @@ Stage Summary:
 - The V-CIRCUIT-FRAME-001 verifier now re-derives the nonce prefix from `sharedInputs.initiatorX25519PubHex` (matching the TS runner at line 1010) — the regenerated sealed-frame hex values pass under the new derivation.
 - No regressions: all 36 vectors pass; the V-CIRCUIT-FRAME-001's 14 cases (9 original + 5 R-009 Stage 1 hardening) all still pass under the new prefix derivation. The frozen R-008 protocol ordering (AEAD → durable commit → accept) is untouched — only the nonce-prefix INPUT changed.
 - Cross-implementation conformance (TS ↔ Python) is preserved: both runners independently reproduce the exact bytes from the regenerated vector files.
+
+---
+Task ID: 5d-python-return-onion
+Agent: general-purpose (subagent)
+Task: Add the INDEPENDENT Python conformance verifier support for R-009 Stage 2 (the backward/return onion) at `conformance/runners/py_vector_verifier.py`. The TS verifier already passes 37/37 on the new `conformance/vectors/V-CIRCUIT-FRAME-002.json` vector (5 cases: seal-return-frame, open-frame-hop1-backward, forward-frame-hop1-backward, forward-frame-hop0-backward-terminal, tampered-return-ciphertext-rejected). This task closes the spec↔registry↔manifest↔TS↔Python conformance chain for the return onion by mirroring the same 5 cases in the independent Python verifier. The V-CIRCUIT-FRAME-002 vector shares the SAME `sharedInputs` structure (commitmentRootHex, noncePrefixHex, initiatorX25519PubHex, returnKey0Hex, returnKey1Hex, etc.) and the SAME minimal `ActiveCircuit` reconstruction as V-CIRCUIT-FRAME-001 — only the onion direction + key selection differ.
+
+Work Log:
+- Read context: worklog.md last 5 sections (5-python-verifier, 5b-python-negative-vectors, 8-test-updates, 5c-python-nonce-binding) — confirmed the FROZEN R-008 crypto substrate (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload, deriveNoncePrefix) that R-009 Stage 2 builds on top of, plus the prior Python verifier tasks (5 + 5b + 5c) that established the independent Python V-CIRCUIT-FRAME-001 verifier with strict-canonical decoding + ADR-0020 nonce-prefix binding.
+
+- Read `conformance/vectors/V-CIRCUIT-FRAME-002.json` (5 cases — the backward onion mirror of V-CIRCUIT-FRAME-001's forward onion):
+  * `seal-return-frame` — gateway onion-encrypts the plaintext at seq=1 using `returnKey1` (outermost) then `returnKey0` (innermost). Expected `sealedEncodedHex` is 88 bytes (18-byte CBOR header + 70-byte ciphertext = 38 plaintext + 2 AEAD tags). Expected `direction: 2` (BACKWARD) + `ciphertextLen: 70`.
+  * `open-frame-hop1-backward` — openFrame at hop 1 peels the outermost returnKey layer. Expected `isTerminal: false` (terminal for backward is hop 0, NOT hop N-1), `payloadLen: 54` (= 38 + 16 = one AEAD tag stripped).
+  * `forward-frame-hop1-backward` — forwardFrame at hop 1 produces the nextFrame for hop 0. Expected `terminal: false`, `nextFrameEncodedHex` (54-byte ciphertext, direction still 0x02), `nextFrameCiphertextLen: 54`.
+  * `forward-frame-hop0-backward-terminal` — forwardFrame at hop 0 (terminal for backward) delivers the original return plaintext to the source. Expected `terminal: true`, `plaintextHex` matches the original plaintext.
+  * `tampered-return-ciphertext-rejected` — flip one bit in the sealed ciphertext → AEAD authentication fails (ok=false, reason contains "AEAD authentication failed").
+
+- Confirmed baseline: `python3 conformance/runners/py_vector_verifier.py 2>&1 | tail -5` → `Passed: 36/37, Failed: 1` with V-CIRCUIT-FRAME-002 failing all 5 cases as `unknown circuit-frame case name` (the existing `verify_circuit_frame_vector` already routes `V-CIRCUIT-FRAME-002` to itself via the `vid.startswith("V-CIRCUIT-FRAME-")` dispatch — no routing change needed; only the per-case branches were missing).
+
+- Pre-flight audit of the existing `open_frame`:
+  * Key selection: ALREADY correct. Lines 1592-1595 already do `if frame["direction"] == DIRECTION_FORWARD: key = hop["forwardingKey"] else: key = hop["returnKey"]` — the `returnKey` is selected for backward direction. NO change needed here (the prior task 5-python-verifier correctly anticipated the backward direction's key selection).
+  * `is_terminal` computation: WAS A BUG. The old code computed `is_terminal = (frame["direction"] == DIRECTION_FORWARD and hop_index == len(circuit["hops"]) - 1)` — which always returns False for BACKWARD direction (because the first clause short-circuits to False). This is wrong: for BACKWARD, the terminal hop is hop 0 (the source/destination for return traffic), NOT "never terminal".
+
+- Edit 1 (open_frame `is_terminal` fix, lines 1564-1574): rewrote the `is_terminal` computation to branch on direction:
+  * `DIRECTION_FORWARD`  → `is_terminal = hop_index == len(circuit["hops"]) - 1` (last hop in the route)
+  * `DIRECTION_BACKWARD` → `is_terminal = hop_index == 0` (the source — the destination for return traffic). Per spec/08 §4.6a (R-009 Stage 2).
+  This fix is REQUIRED for `forward-frame-hop0-backward-terminal` to return `terminal: true` (otherwise it would return `terminal: false` and the test would fail because `nextFrame` would be undefined). Verified this fix does NOT regress V-CIRCUIT-FRAME-001 (the FORWARD terminal case is unchanged: `hop_index == len(hops) - 1`).
+
+- Edit 2 (new `seal_return_frame` function, lines 1514-1561): added `seal_return_frame(circuit, frame_sequence, plaintext)` mirroring `seal_forward_frame` but with two key differences:
+  * `DIRECTION_BACKWARD` is used in the AD (via `build_circuit_frame_ad(commitment_root, frame_sequence, DIRECTION_BACKWARD)`) and in the resulting frame dict (`"direction": DIRECTION_BACKWARD`).
+  * Onion encryption order is REVERSED: `for i in range(0, len(circuit["hops"]))` (hop 0 first → hop N-1 last), and each layer uses `hop["returnKey"]` (NOT `forwardingKey`). This produces the layout: `ciphertext = AEAD_enc(returnKey1, AEAD_enc(returnKey0, plaintext))` for a 2-hop circuit — where `returnKey1` is the outermost layer (peeled first at hop 1) and `returnKey0` is the innermost layer (peeled last at hop 0 — the terminal). This is the MIRROR of the forward onion (which encrypts from hop N-1 → hop 0 using `forwardingKey`, so `forwardingKey0` is outermost + `forwardingKey1` is innermost).
+  * Same `frame_sequence ≥ 1` u32 range check as `seal_forward_frame` (rejects 0 and out-of-range).
+
+- Edit 3 (state variables, lines 1720-1725): added 2 new state-carrying variables alongside the existing `sealed_forward_frame` + `next_frame_at_hop_0`:
+  * `sealed_return_frame = None` — set by `seal-return-frame`, consumed by `open-frame-hop1-backward`, `forward-frame-hop1-backward`, `tampered-return-ciphertext-rejected`.
+  * `next_frame_at_hop1 = None` — set by `forward-frame-hop1-backward`, consumed by `forward-frame-hop0-backward-terminal`.
+
+- Edit 4 (5 new dispatch branches, lines 2030-2174): added 5 `elif name == "..."` branches AFTER `sequence-zero` and BEFORE the `else` (unknown-name) branch. Each branch mirrors the structure of the corresponding forward case from V-CIRCUIT-FRAME-001:
+  * `seal-return-frame`: reads `plaintextHex` from the vector's `input` (NOT from sharedInputs — the per-case input is the contract), calls `seal_return_frame(circuit, inp["frameSequence"], plaintext)`, encodes to wire, stashes the sealed frame, asserts `sealedEncodedHex` + `ciphertextLen` + `direction == 0x02` (explicit direction check — the sealedEncodedHex match would already catch a wrong direction since the direction byte is encoded in the CBOR, but the explicit check is clearer for diagnostics).
+  * `open-frame-hop1-backward`: opens at hop 1, asserts `ok` + `isTerminal==false` + `payloadLen` + `payloadHex`.
+  * `forward-frame-hop1-backward`: forwards at hop 1, asserts `ok` + `terminal==false` + `nextFrameEncodedHex` + `nextFrameCiphertextLen`. Stashes `nextFrame` as `next_frame_at_hop1`.
+  * `forward-frame-hop0-backward-terminal`: forwards the stashed nextFrame at hop 0, asserts `ok` + `terminal==true` + `plaintextHex`.
+  * `tampered-return-ciphertext-rejected`: flips bit 0 of `sealed_return_frame.ciphertext`, calls `open_frame(circuit, 1, tampered)`, asserts `ok==false` + reason contains "AEAD authentication failed" (same pattern as `tampered-ciphertext-rejected` for the forward onion).
+
+- Verification:
+  * `python3 conformance/runners/py_vector_verifier.py 2>&1 | tail -5` → `Passed: 37/37, Failed: 0` (exit 0). UP from 36/37.
+  * `python3 conformance/runners/py_vector_verifier.py 2>&1 | grep -c '^\s*\[PASS\]'` → 37; `grep -c '^\s*\[FAIL\]'` → 0.
+  * All 5 V-CIRCUIT-FRAME-002 cases pass independently (verified via standalone driver script that re-runs `seal_return_frame` + `open_frame` + `forward_frame` + tamper on the vector's sharedInputs + compares to the expected hex byte-by-byte — all match exactly).
+  * V-CIRCUIT-FRAME-001 (forward, 14 cases) still passes — the `is_terminal` fix did NOT regress the forward direction (the forward terminal computation is unchanged: `hop_index == len(hops) - 1`).
+  * All other 35 vectors (NodeID, Advertisement, CBOR, Circuit, CircuitAck, CircuitSetup, Contribution, Discovery, Gateway, GatewayAuth, GatewaySvc, Hint, LedgerEntry, LinkAuth, LinkHandshake, PathValidation, Receipt, RouteCommit, RouteProposal, SVC, TopologyPropagation) still pass — zero regressions.
+  * Process exit code is 0 (clean).
+
+- Independence preserved: AST-walked the file imports — only stdlib (`hashlib`, `hmac`, `json`, `os`, `re`, `sys`, `struct`, `io`, `pathlib`, `typing`) + `blake3`, `cbor2`, `nacl.signing`/`nacl.exceptions`, `cryptography.hazmat...ChaCha20Poly1305`/`cryptography.exceptions.InvalidTag`. ZERO imports from `reference/` or any TS-side module — the Python verifier remains a fully independent cross-implementation check. The return-onion AEAD (ChaCha20-Poly1305 via `cryptography`), CBOR encoding (via `cbor2.dumps(canonical=True)`), and onion-encryption byte layout are reproduced independently from the spec/08 §4.6a wire format, and the byte-for-byte match against the TS-generated expected hex proves cross-implementation conformance.
+
+Stage Summary:
+- Python conformance runner: 36/37 → 37/37 vectors pass. V-CIRCUIT-FRAME-002 now passes all 5 cases, matching the TS runner's 37/37 count.
+- The independent Python implementation now reproduces every byte of the TS-generated expected values for both the FORWARD onion (V-CIRCUIT-FRAME-001, 14 cases) AND the BACKWARD/return onion (V-CIRCUIT-FRAME-002, 5 cases).
+- The `is_terminal` computation now correctly branches on direction: FORWARD → `hop_index == len(hops) - 1`; BACKWARD → `hop_index == 0`. This was a latent bug in the prior `open_frame` that was hidden because the only existing caller (V-CIRCUIT-FRAME-001) exclusively used the FORWARD direction.
+- The new `seal_return_frame` is the MIRROR of `seal_forward_frame`: reversed onion-encryption order (hop 0 → hop N-1) + `returnKey` instead of `forwardingKey` + `DIRECTION_BACKWARD` in the AD and the frame dict. The receiver-local replay floor namespace `(commitmentRoot, hopIndex, direction)` handles forward + backward independently — a forward frame and a backward frame at the same seq on the same circuit are BOTH accepted (per ADR-0019 + the receiver-local replay model that R-009 Stage 1 finalized).
+- The frozen R-008 crypto substrate (buildNonce, buildCircuitFrameAD, encryptPayload, decryptPayload, deriveNoncePrefix) was NOT modified — R-009 Stage 2 builds on top of it.
+- No regressions: all 36 previously-passing Python vectors still pass. V-CIRCUIT-FRAME-001 (forward, 14 cases) still passes — the `is_terminal` fix is forward-safe.
+- Cross-implementation conformance (TS ↔ Python) is preserved for both directions of the onion: both runners independently reproduce the exact bytes from the frozen vector files.

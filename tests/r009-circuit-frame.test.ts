@@ -36,8 +36,10 @@ import {
   encodeCircuitFrame,
   decodeCircuitFrame,
   sealForwardFrame,
+  sealReturnFrame,
   openFrame,
   DIRECTION_FORWARD,
+  DIRECTION_BACKWARD,
   type CircuitFrame,
 } from "@reference/circuit/frame";
 import {
@@ -799,20 +801,19 @@ describe("R-009 Stage 1 final hardening: commit ownership is protocol-enforced (
   });
 });
 
-describe("R-009 Stage 1 final hardening: backward direction rejected by production path", () => {
-  // Stage 1 implements FORWARD traffic only. The return-onion protocol
-  // (including the replay-floor keying question: per-route vs
-  // per-(route, direction)) is Stage 2 work. The Stage 1 production path
-  // fails closed on BACKWARD. The generic CircuitFrame decoder still
-  // accepts both enum values (0x01 + 0x02) so the wire schema stays
-  // compatible with Stage 2.
+describe("R-009 Stage 2: backward (return) direction — return-onion traffic", () => {
+  // Stage 2 lifts the Stage 1 BACKWARD rejection. The return-onion protocol
+  // is now implemented (sealReturnFrame). The receiver-local replay floor
+  // (commitmentRoot, hopIndex, direction) already handles forward + backward
+  // independently (different direction → different floor row per ADR-0019).
+  // The terminal hop for BACKWARD is hop 0 (the source); for FORWARD it's
+  // hop N-1 (the gateway).
 
-  test("decode accepts BACKWARD (wire schema compatible with Stage 2)", () => {
-    // The decoder recognizes direction=0x02 (BACKWARD) as a valid wire value.
+  test("decode accepts BACKWARD (wire schema)", () => {
     const m = new Map<number, unknown>([
       [1, new Uint8Array(8).fill(0xab)],
-      [2, 1], // frame_sequence
-      [3, 0x02], // direction = BACKWARD
+      [2, 1],
+      [3, 0x02], // BACKWARD
       [4, new Uint8Array(32).fill(0xcd)],
     ]);
     const encoded = canonicalEncode(m);
@@ -822,35 +823,120 @@ describe("R-009 Stage 1 final hardening: backward direction rejected by producti
     expect(decoded.frame.direction).toBe(0x02);
   });
 
-  test("processCircuitWireFrame REJECTS backward frame (Stage 1 — fail closed)", async () => {
+  test("sealReturnFrame + processCircuitWireFrame: 1-hop return chain delivers plaintext at hop 0", async () => {
     const route = makeRoute(1);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
 
-    // Manually craft a backward frame (valid canonical CBOR, direction=0x02).
-    const m = new Map<number, unknown>([
-      [1, circuit.noncePrefix],
-      [2, 1], // frame_sequence
-      [3, 0x02], // direction = BACKWARD (Stage 1 rejects)
-      [4, new Uint8Array(32).fill(0xcd)], // dummy ciphertext
-    ]);
-    const wireBytes = canonicalEncode(m);
+    // The gateway seals a return frame at seq=1.
+    const returnPayload = new TextEncoder().encode("return data from gateway");
+    const sealed = sealReturnFrame(circuit, 1, returnPayload);
+    expect(sealed.direction).toBe(DIRECTION_BACKWARD);
+    const wireBytes = encodeCircuitFrame(sealed);
 
+    // hop 0 (the source) processes — terminal for BACKWARD, delivers plaintext.
     const result = await processCircuitWireFrame(circuit, 0, wireBytes);
-    expect(result.ok).toBe(false);
-    if (!result.ok) {
-      expect(result.reason).toContain("BACKWARD");
-      expect(result.reason).toContain("Stage 2");
-    }
-    // The floor is UNCHANGED — the backward frame never reached AEAD/commit.
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.terminal).toBe(true); // hop 0 is terminal for BACKWARD
+    expect(new TextDecoder().decode(result.plaintext)).toBe("return data from gateway");
+    // The backward floor at (root, 0, BACKWARD) advanced to 1.
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(1n);
+    // The FORWARD floor is UNCHANGED (independent namespace).
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
   });
 
+  test("sealReturnFrame + processCircuitWireFrame: 2-hop return chain (gateway → relay 1 → source)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    const returnPayload = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    const sealed = sealReturnFrame(circuit, 1, returnPayload);
+    const wireBytes = encodeCircuitFrame(sealed);
+
+    // hop 1 (gateway's neighbor) processes first — NOT terminal (terminal is hop 0).
+    const r1 = await processCircuitWireFrame(circuit, 1, wireBytes);
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+    expect(r1.terminal).toBe(false); // hop 1 is NOT terminal for BACKWARD
+    expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_BACKWARD)).toBe(1n);
+
+    // Forward the nextFrame to hop 0 (the source) — terminal, delivers plaintext.
+    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes);
+    expect(r0.ok).toBe(true);
+    if (!r0.ok) return;
+    expect(r0.terminal).toBe(true); // hop 0 IS terminal for BACKWARD
+    expect(new TextDecoder().decode(r0.plaintext)).toBe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(1n);
+  });
+
+  test("forward + backward at the same sequence are independent (no cross-direction replay)", async () => {
+    // A forward frame at seq=1 + a backward frame at seq=1 are BOTH accepted
+    // because the replay floor is keyed by (root, hop, direction) — different
+    // direction → different floor. This proves the receiver-local namespace
+    // handles bidirectional traffic correctly.
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Forward frame at seq=1.
+    const fwdPayload = new TextEncoder().encode("forward");
+    const fwdSealed = sealForwardFrame(circuit, 1, fwdPayload);
+    const fwdResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(fwdSealed));
+    expect(fwdResult.ok).toBe(true);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
+
+    // Backward frame at seq=1 — ACCEPTED (different direction → different floor).
+    const retPayload = new TextEncoder().encode("backward");
+    const retSealed = sealReturnFrame(circuit, 1, retPayload);
+    const retResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(retSealed));
+    expect(retResult.ok).toBe(true);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(1n);
+    // Forward floor UNCHANGED by the backward frame.
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
+  });
+
+  test("backward replay → rejected by the receiver-local backward floor", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    const sealed = sealReturnFrame(circuit, 1, new TextEncoder().encode("ret"));
+    const wireBytes = encodeCircuitFrame(sealed);
+
+    // First presentation — accepted.
+    const r1 = await processCircuitWireFrame(circuit, 0, wireBytes);
+    expect(r1.ok).toBe(true);
+
+    // Replay — rejected by the backward floor (1 ≤ 1).
+    const r2 = await processCircuitWireFrame(circuit, 0, wireBytes);
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.reason).toContain("≤ floor");
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(1n);
+  });
+
+  test("tampered return frame → AEAD fails → backward floor UNCHANGED", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    const sealed = sealReturnFrame(circuit, 100, new TextEncoder().encode("x"));
+    const wireBytes = new Uint8Array(encodeCircuitFrame(sealed));
+    wireBytes[15] ^= 0x01; // tamper
+
+    const result = await processCircuitWireFrame(circuit, 0, wireBytes);
+    expect(result.ok).toBe(false);
+    // Backward floor UNCHANGED — AEAD failed before commit.
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(0n);
+  });
+
   test("processCircuitWireFrame has NO commitFloor parameter (protocol-derived)", () => {
-    // The function signature has exactly 3 params (circuit, hopIndex, wireBytes).
-    // The commitFloor boolean was REMOVED — commit ownership is derived from
-    // protocol state (direction + hopIndex), not caller-supplied.
     expect(processCircuitWireFrame.length).toBe(3);
   });
 });

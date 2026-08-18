@@ -211,15 +211,13 @@ export async function processCircuitWireFrame(
   }
   const frame = decoded.frame;
 
-  // Step 2 (R-009 Stage 1): reject BACKWARD direction.
-  // Stage 1 implements FORWARD traffic only. The return-onion protocol is
-  // Stage 2 work. The production path fails closed on BACKWARD until Stage 2.
-  if (frame.direction !== DIRECTION_FORWARD) {
-    return {
-      ok: false,
-      reason: "R-009 Stage 1 production path rejects BACKWARD direction (return-onion is Stage 2 work — not yet frozen)",
-    };
-  }
+  // Step 2 (R-009 Stage 2): both directions accepted.
+  // Stage 1 rejected BACKWARD; Stage 2 lifts that restriction. The return-onion
+  // protocol is now implemented (sealReturnFrame). The receiver-local replay
+  // floor (commitmentRoot, hopIndex, direction) already handles forward +
+  // backward independently (different direction values → different floor rows).
+  // The terminal hop for BACKWARD is hop 0 (the source); for FORWARD it's hop N-1
+  // (the gateway). openFrame computes isTerminal correctly for both directions.
 
   // Step 3 (R-008 frozen ordering): AEAD authenticate + decrypt one layer.
   const forward = forwardFrame(circuit, hopIndex, frame);
@@ -228,17 +226,17 @@ export async function processCircuitWireFrame(
     return { ok: false, reason: forward.reason };
   }
 
-  // Step 4 (R-009 Stage 1 receiver-local replay): atomic durable sequence
-  // commit at THIS RECEIVER's floor, keyed by (commitmentRoot, hopIndex, FORWARD).
-  // EVERY hop commits its own floor — not just the ingress. This catches
-  // replays by a malicious upstream relay toward a downstream hop.
-  // Fail-closed: if the sequence is a replay (seq ≤ floor) or the persistence
-  // operation cannot complete, the frame is rejected. Floor UNCHANGED.
+  // Step 4 (R-009 receiver-local replay): atomic durable sequence commit at
+  // THIS RECEIVER's floor, keyed by (commitmentRoot, hopIndex, frame.direction).
+  // EVERY hop commits its own floor — for BOTH forward + backward directions.
+  // Forward + backward floors are independent (different direction → different
+  // floor row per ADR-0019). This catches replays by a malicious relay in
+  // either direction. Fail-closed.
   const seq = BigInt(frame.frameSequence);
   const commitResult = await circuit.floorStore.checkAndAdvance(
     circuit.commitmentRoot,
     hopIndex,
-    DIRECTION_FORWARD,
+    frame.direction,
     seq,
   );
   if (!commitResult.ok) {
