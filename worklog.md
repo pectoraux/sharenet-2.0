@@ -1191,3 +1191,30 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - The conformance system now enforces the full chain: normative spec → registry → manifest → TS runner → Python runner. Adding a new wire object to any spec without adding it to the registry, creating a vector, and adding dispatch branches to both runners MUST fail CI.
+
+---
+Task ID: R-007-classification-final
+Agent: main (Z.ai Code)
+Task: R-007 classification final — reclassify GatewayServiceAgreement and GatewayAuthorization as wire objects, add maturity field to all registry entries, add V-GATEWAY-SVC + V-GATEWAY-AUTH vector families.
+
+Work Log:
+- Reclassified GatewayServiceAgreement: kind "sub_object" → "wire", conformance_vector_family "V-SVC" → "V-GATEWAY-SVC", maturity "spec-frozen". It is a dual-signed wire object per spec/09 §3.1.
+- Reclassified GatewayAuthorization: kind "rule" → "wire", conformance_vector_family "V-GATEWAY" → "V-GATEWAY-AUTH", maturity "spec-frozen". It is a signed authorization statement crossing a trust boundary per spec/09 §2.
+- Added maturity field to ALL registry entries (v3): every object now declares "reference-implemented" or "spec-frozen". Objects with no TS implementation: CandidateDestination, GatewayServiceAgreement, GatewayAuthorization — all marked "spec-frozen".
+- Created V-GATEWAY-SVC-001.json: GatewayServiceAgreement dual-signed vector (gateway + source Ed25519 signatures over canonical CBOR body with domain-separated signing payloads).
+- Created V-GATEWAY-AUTH-001.json: GatewayAuthorization signed vector (gateway Ed25519 signature over canonical CBOR body with SHARENET/GATEWAY/AUTH/1 domain).
+- Added TS + Python runner handlers for both new families (independent verification using real Ed25519 signatures).
+- Updated MANIFEST.json with 2 new entries (34 total vectors).
+- Strengthened completeness test:
+  - Registry version check: 2 → 3
+  - New test: "every wire object has a maturity field declared" (every kind:"wire" must carry maturity)
+  - New test: "every spec-frozen wire object has status 'frozen' in its vector file"
+
+Stage Summary:
+- Tests: 334 → 336 pass, 0 fail (+2 maturity tests). 1094 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 34/34 vectors pass (was 32/32).
+- Python conformance runner: 34/34 vectors pass (was 32/32).
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- The protocol registry now: classifies every gateway object correctly as wire/sub_object/state/rule, declares maturity for every entry, and requires a vector family for every wire object. GatewayServiceAgreement and GatewayAuthorization are both wire objects with their own dedicated vector families.

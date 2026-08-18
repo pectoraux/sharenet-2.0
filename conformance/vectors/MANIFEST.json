@@ -171,6 +171,20 @@
       "file": "V-GATEWAY-001.json"
     },
     {
+      "id": "V-GATEWAY-SVC-001",
+      "protocol": "service",
+      "schema_version": "1",
+      "expected_result": "GatewayServiceAgreement dual-signed canonical encoding (spec-frozen)",
+      "file": "V-GATEWAY-SVC-001.json"
+    },
+    {
+      "id": "V-GATEWAY-AUTH-001",
+      "protocol": "gateway",
+      "schema_version": "1",
+      "expected_result": "GatewayAuthorization signed canonical encoding (spec-frozen)",
+      "file": "V-GATEWAY-AUTH-001.json"
+    },
+    {
       "id": "V-RECEIPT-001",
       "protocol": "economics",
       "schema_version": "1",

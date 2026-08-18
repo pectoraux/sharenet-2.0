@@ -118,7 +118,7 @@ function getPyRunnerDispatchPrefixes(): Set<string> {
 
 describe("R-007: Registry-driven vector completeness", () => {
   test("protocol registry is valid JSON with the expected structure", () => {
-    expect(REGISTRY.version).toBe(2);
+    expect(REGISTRY.version).toBe(3);
     expect(REGISTRY.object_kinds).toBeDefined();
     expect(REGISTRY.layers).toBeDefined();
     expect(Object.keys(REGISTRY.layers).length).toBeGreaterThan(0);
@@ -195,6 +195,74 @@ describe("R-007: Registry-driven vector completeness", () => {
         expect((obj as any).conformance_vector_family).toBeDefined();
       }
     }
+  });
+
+  test("every wire object has a maturity field declared", () => {
+    // Maturity declares whether a wire object has a TypeScript reference
+    // implementation (`reference-implemented`) or is a spec-frozen wire
+    // format with no implementation yet (`spec-frozen`). Every wire object
+    // MUST declare one or the other — a wire object with no maturity is
+    // an underspecified protocol surface that must not be allowed.
+    const wireObjects: Array<{ layer: string; name: string; obj: any }> = [];
+    for (const [layerName, layer] of Object.entries(REGISTRY.layers)) {
+      for (const [objName, obj] of Object.entries((layer as any).objects)) {
+        if ((obj as any).kind === "wire") {
+          wireObjects.push({ layer: layerName, name: objName, obj });
+        }
+      }
+    }
+    expect(wireObjects.length).toBeGreaterThan(0);
+    for (const { layer, name, obj } of wireObjects) {
+      expect(obj.maturity).toBeDefined();
+      expect(
+        obj.maturity === "reference-implemented" || obj.maturity === "spec-frozen",
+        `wire object ${layer}/${name} has invalid maturity "${obj.maturity}"`,
+      ).toBe(true);
+    }
+  });
+
+  test("every spec-frozen wire object has status 'frozen' (spec-frozen) in its vector file", () => {
+    // For every registry wire object with maturity="spec-frozen", every
+    // vector file in the manifest that belongs to its family MUST carry a
+    // top-level `status` field set to either "frozen" or "spec-frozen".
+    // (Existing vectors use "frozen"; the test accepts "spec-frozen" as a
+    // forward-compatible spelling of the same concept.) A spec-frozen
+    // vector without a `status` field, or with status="draft", would mean
+    // the canonical bytes are NOT yet committed — a contradiction.
+    const specFrozenFamilies = new Set<string>();
+    for (const layer of Object.values(REGISTRY.layers)) {
+      for (const obj of Object.values((layer as any).objects)) {
+        if ((obj as any).kind === "wire" && (obj as any).maturity === "spec-frozen") {
+          const family = (obj as any).conformance_vector_family;
+          if (family) specFrozenFamilies.add(family);
+        }
+      }
+    }
+    // Sanity: the registry actually has spec-frozen wire objects.
+    expect(specFrozenFamilies.size).toBeGreaterThan(0);
+
+    const offenders: string[] = [];
+    for (const v of MANIFEST.vectors) {
+      const matchesFamily = [...specFrozenFamilies].some((f) =>
+        v.id.startsWith(f),
+      );
+      if (!matchesFamily) continue;
+
+      const path = join(process.cwd(), "conformance", "vectors", v.file);
+      const vec = JSON.parse(readFileSync(path, "utf-8"));
+      const status = vec.status;
+      if (status !== "frozen" && status !== "spec-frozen") {
+        offenders.push(
+          `${v.id} (${v.file}): expected status "frozen" or "spec-frozen", got "${status}"`,
+        );
+      }
+    }
+
+    // If this fails, a spec-frozen wire object's vector file does not carry
+    // status "frozen"/"spec-frozen". Update the vector file's status field,
+    // OR change the registry maturity to "reference-implemented" once a TS
+    // implementation exists.
+    expect(offenders).toEqual([]);
   });
 
   // -----------------------------------------------------------------

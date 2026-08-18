@@ -1,0 +1,33 @@
+{
+  "id": "V-GATEWAY-AUTH-001",
+  "status": "frozen",
+  "spec": "spec/09-internet-gateway.md §2",
+  "description": "GatewayAuthorization canonical encoding — signed by the gateway operator, authorizing a specific NodeId to use the gateway service.",
+  "statusNote": "spec-frozen — no TS implementation of GatewayAuthorization as a separate signed wire object exists. The implementation uses runtime policy evaluation. This vector freezes the canonical encoding for future implementations.",
+  "vectors": [
+    {
+      "name": "valid-authorization",
+      "description": "A valid GatewayAuthorization signed by the gateway",
+      "input": {
+        "authorizationVersion": 1,
+        "gatewayId": "ts7x3sm6dblogydeburaqq4wnycb4spbqj4uasposqgi6x67kpdq",
+        "authorizedNodeId": "uelca22eghyw7q6ifsmcpdzjpk5pg6b2fyh2wu2k45xc74ktmapq",
+        "authorizedService": "INTERNET_GATEWAY",
+        "issuedAt": 1786876545,
+        "expiresAt": 1786962945,
+        "authorizationNonceHex": "34d8e95f8438269bb3bcc6702de60076"
+      },
+      "intermediate": {
+        "bodyHex": "a701010278347473377833736d3664626c6f6779646562757261717134776e79636234737062716a34756173706f73716769367836376b70647103783475656c6361323265676879773771366966736d6370647a6a706b357067366232667968327775326b3435786337346b746d6170710470494e5445524e45545f47415445574159051a6a819281061a6a82e40107503e1612add48798344630329e001f6cda",
+        "signingPayloadHex": "53484152454e45542f474154455741592f415554482f31a701010278347473377833736d3664626c6f6779646562757261717134776e79636234737062716a34756173706f73716769367836376b70647103783475656c6361323265676879773771366966736d6370647a6a706b357067366232667968327775326b3435786337346b746d6170710470494e5445524e45545f47415445574159051a6a819281061a6a82e40107503e1612add48798344630329e001f6cda"
+      },
+      "expected": {
+        "signatureHex": "083c139d44a7206725df63906625bf6ed96d9c36f2e8776a24bef74fc721c6b5a860d5931925c374bd7434b4efd2277045e363666f83ee16266dd1740d7a010a",
+        "signatureValid": true
+      },
+      "sharedKeys": {
+        "gatewayPublicKeyHex": "44a8330e013e8531dac9512f184688ba256e38269fc19a1b4f4bf37b21121fa5"
+      }
+    }
+  ]
+}
