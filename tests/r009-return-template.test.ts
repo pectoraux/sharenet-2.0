@@ -21,6 +21,7 @@ import {
 import {
   encodeCircuitFrame,
   decodeCircuitFrame,
+  sealForwardFrame,
   DIRECTION_FORWARD,
   DIRECTION_BACKWARD,
 } from "@reference/circuit/frame";
@@ -250,6 +251,128 @@ describe("R-009 Stage 2: distributed return-onion template", () => {
       if (!decrypted.ok) return;
       expect(new TextDecoder().decode(decrypted.plaintext)).toBe(`response ${seq}`);
     }
+  });
+});
+
+// =====================================================================
+// R-009 Stage 2: FULL DISTRIBUTED INTEGRATION TEST
+// Exercises the complete production path: source ↔ relay 0 ↔ relay 1 ↔ gateway
+// Forward: source → relay 0 → gateway (terminal)
+// Backward: gateway (seals using template) → relay 1 → source (terminal)
+// All through processCircuitWireFrame (the canonical production entry point).
+// =====================================================================
+
+describe("R-009 Stage 2: full distributed integration (production path)", () => {
+  test("forward request + backward response through processCircuitWireFrame", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // The initiator constructs the return-onion template during setup.
+    // (In a real deployment, this is sent to the gateway.)
+    const template = constructReturnOnionTemplate(circuit);
+
+    // --- FORWARD: source → relay 0 → gateway (hop 1, terminal) ---
+    const httpRequest = new TextEncoder().encode("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    const fwdSealed = sealForwardFrame(circuit, 1, httpRequest);
+    const fwdWire = encodeCircuitFrame(fwdSealed);
+
+    // Relay 0 processes the forward frame.
+    const fwdR0 = await processCircuitWireFrame(circuit, 0, fwdWire);
+    expect(fwdR0.ok).toBe(true);
+    if (!fwdR0.ok) return;
+    expect(fwdR0.terminal).toBe(false); // hop 0 is not terminal for FORWARD
+
+    // Gateway (hop 1) processes — terminal for FORWARD, delivers the request.
+    const fwdR1 = await processCircuitWireFrame(circuit, 1, fwdR0.nextWireBytes);
+    expect(fwdR1.ok).toBe(true);
+    if (!fwdR1.ok) return;
+    expect(fwdR1.terminal).toBe(true); // hop 1 IS terminal for FORWARD
+    expect(new TextDecoder().decode(fwdR1.plaintext)).toBe(
+      "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+
+    // --- BACKWARD: gateway seals response → relay 1 → source (hop 0, terminal) ---
+    // The gateway uses the template (NOT raw returnKeys) to seal the response.
+    const httpResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    const retCiphertext = sealReturnFrameFromTemplate(template, 1, httpResponse);
+    const retFrame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 1,
+      direction: DIRECTION_BACKWARD,
+      ciphertext: retCiphertext,
+    } as any;
+    const retWire = encodeCircuitFrame(retFrame);
+
+    // Relay 1 (gateway's neighbor) processes the backward frame.
+    const retR1 = await processCircuitWireFrame(circuit, 1, retWire);
+    expect(retR1.ok).toBe(true);
+    if (!retR1.ok) return;
+    expect(retR1.terminal).toBe(false); // hop 1 is NOT terminal for BACKWARD
+
+    // Source (hop 0) processes — terminal for BACKWARD, delivers the response.
+    const retR0 = await processCircuitWireFrame(circuit, 0, retR1.nextWireBytes);
+    expect(retR0.ok).toBe(true);
+    if (!retR0.ok) return;
+    expect(retR0.terminal).toBe(true); // hop 0 IS terminal for BACKWARD
+    expect(new TextDecoder().decode(retR0.plaintext)).toBe(
+      "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    );
+
+    // Verify the forward + backward floors are independent.
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_FORWARD)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(1n);
+    expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_BACKWARD)).toBe(1n);
+  });
+
+  test("backward replay through production path → rejected", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+
+    const ciphertext = sealReturnFrameFromTemplate(template, 1, new TextEncoder().encode("ret"));
+    const frame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 1,
+      direction: DIRECTION_BACKWARD,
+      ciphertext,
+    } as any;
+    const wire = encodeCircuitFrame(frame);
+
+    // First presentation — accepted.
+    const r1 = await processCircuitWireFrame(circuit, 0, wire);
+    expect(r1.ok).toBe(true);
+
+    // Replay through the production path — rejected.
+    const r2 = await processCircuitWireFrame(circuit, 0, wire);
+    expect(r2.ok).toBe(false);
+    if (!r2.ok) expect(r2.reason).toContain("≤ floor");
+  });
+
+  test("tampered backward frame through production path → AEAD fails → floor UNCHANGED", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+
+    const ciphertext = sealReturnFrameFromTemplate(template, 100, new TextEncoder().encode("x"));
+    const frame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 100,
+      direction: DIRECTION_BACKWARD,
+      ciphertext,
+    } as any;
+    const wire = new Uint8Array(encodeCircuitFrame(frame));
+    wire[wire.length - 1] ^= 0x01; // tamper
+
+    const result = await processCircuitWireFrame(circuit, 0, wire);
+    expect(result.ok).toBe(false);
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(0n);
   });
 });
 

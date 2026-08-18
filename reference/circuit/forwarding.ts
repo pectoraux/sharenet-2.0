@@ -46,10 +46,16 @@ import {
   decodeCircuitFrame,
   openFrame,
   DIRECTION_FORWARD,
+  DIRECTION_BACKWARD,
   type CircuitFrame,
   type OpenFrameResult,
 } from "./frame";
 import type { ActiveCircuit } from "./circuit";
+import {
+  peelReturnEnvelopeLayer,
+  decryptReturnPayload,
+  encodeReturnFramePayload,
+} from "./return-template";
 
 // -----------------------------------------------------------------------
 // Forwarding result (AEAD-only, no durable commit)
@@ -63,8 +69,16 @@ import type { ActiveCircuit } from "./circuit";
  * The production path uses `ProcessCircuitWireFrameResult` (below), which
  * includes the durable commit.
  *
- * - `{ ok: true, terminal: true, plaintext }`: terminal hop — deliver plaintext.
+ * FORWARD direction:
+ * - `{ ok: true, terminal: true, plaintext }`: terminal hop (gateway) — deliver plaintext.
  * - `{ ok: true, terminal: false, nextFrame }`: intermediate hop — forward nextFrame.
+ *
+ * BACKWARD direction (distributed return-onion template model):
+ * - `{ ok: true, terminal: true, plaintext }`: terminal hop (source) — the response
+ *   plaintext, decrypted with the K_ret recovered from the envelope.
+ * - `{ ok: true, terminal: false, nextFrame }`: intermediate hop — forward the
+ *   nextFrame (with inner { sealedPayload, innerEnvelope } ciphertext).
+ *
  * - `{ ok: false, reason }`: AEAD authentication failed. Floor MUST NOT advance.
  */
 export type ForwardFrameResult =
@@ -95,6 +109,20 @@ export type ProcessCircuitWireFrameResult =
  * Forward a CircuitFrame at a relay hop: peel one AEAD layer and produce
  * the outgoing wire frame (or deliver the plaintext if terminal).
  *
+ * R-009 Stage 2 UNIFIED WIRE PROTOCOL: the frame direction determines the
+ * processing path:
+ *
+ *   FORWARD  → openFrame() with the hop's forwardingKey (the forward onion:
+ *              the ciphertext is N-layer-deep, each layer peeled with
+ *              forwardingKey). Terminal hop = hop N-1 (gateway) → plaintext.
+ *
+ *   BACKWARD → peelReturnEnvelopeLayer() with the hop's returnKey (the
+ *              distributed return-onion template model: the ciphertext is
+ *              CBOR { sealedPayload, envelopeLayer }. The relay peels its
+ *              returnKey from the envelopeLayer, NOT from the frame ciphertext
+ *              directly. Terminal hop = hop 0 (source) → recovers K_ret from
+ *              the envelope + decrypts the sealedPayload → plaintext).
+ *
  * This is the LOWER-LEVEL function: it performs step 1 (AEAD authenticate +
  * decrypt) of the R-008 frozen ordering ONLY. It does NOT do the durable
  * sequence commit (step 2). Use this for:
@@ -103,21 +131,6 @@ export type ProcessCircuitWireFrameResult =
  *
  * For the PRODUCTION relay path, use `processCircuitWireFrame()` instead —
  * it owns the full invariant (decode → AEAD → durable commit → forward).
- *
- * Per spec/08 §4.1 + §4.6:
- *   - The relay decrypts one layer using its forwardingKey (forward direction)
- *     or returnKey (backward direction).
- *   - The AEAD tag authenticates the frame header (nonce_prefix +
- *     frame_sequence + direction + commitment_root), binding the frame
- *     to the exact circuit.
- *   - If this is the terminal hop (last hop, forward direction), the
- *     decrypted payload is the application plaintext.
- *   - Otherwise, the decrypted payload is the inner ciphertext — wrap it
- *     in a new CircuitFrame with the SAME header + forward to the next hop.
- *
- * The outgoing CircuitFrame carries the SAME header as the incoming frame
- * (the header is hop-invariant — only the ciphertext shrinks by 16 bytes
- * per hop, the AEAD tag).
  *
  * @param circuit - the active circuit (carries per-hop keys + noncePrefix)
  * @param hopIndex - which relay hop is processing this frame (0-based)
@@ -129,27 +142,60 @@ export function forwardFrame(
   hopIndex: number,
   frame: CircuitFrame,
 ): ForwardFrameResult {
-  // Step 1 (R-008 frozen ordering): AEAD authenticate + decrypt one layer.
-  const openResult: OpenFrameResult = openFrame(circuit, hopIndex, frame);
-  if (!openResult.ok) {
-    return { ok: false, reason: openResult.reason };
+  if (frame.direction === DIRECTION_FORWARD) {
+    // FORWARD: the forward onion. openFrame peels one forwardingKey layer.
+    const openResult: OpenFrameResult = openFrame(circuit, hopIndex, frame);
+    if (!openResult.ok) {
+      return { ok: false, reason: openResult.reason };
+    }
+    if (openResult.isTerminal) {
+      return { ok: true, terminal: true, plaintext: openResult.payload };
+    }
+    // Intermediate forward hop — the payload is the inner onion ciphertext.
+    const nextFrame: CircuitFrame = {
+      circuitNoncePrefix: frame.circuitNoncePrefix,
+      frameSequence: frame.frameSequence,
+      direction: frame.direction,
+      ciphertext: openResult.payload,
+    };
+    return { ok: true, terminal: false, nextFrame };
   }
 
-  // Forward or deliver.
-  if (openResult.isTerminal) {
-    // Terminal hop — the payload is the application plaintext.
-    return { ok: true, terminal: true, plaintext: openResult.payload };
+  // BACKWARD: the distributed return-onion template model.
+  // The ciphertext is CBOR { sealedPayload, envelopeLayer }.
+  // peelReturnEnvelopeLayer peels the hop's returnKey from the envelopeLayer.
+  const peelResult = peelReturnEnvelopeLayer(circuit, hopIndex, frame.ciphertext);
+  if (!peelResult.ok) {
+    return { ok: false, reason: peelResult.reason };
   }
 
-  // Intermediate hop — the payload is the inner ciphertext. Build a new
-  // CircuitFrame with the SAME header + the inner ciphertext, for the next hop.
+  if (peelResult.isTerminal) {
+    // Terminal backward hop (hop 0 = source): recover K_ret + decrypt the sealedPayload.
+    if (!peelResult.kRet) {
+      return { ok: false, reason: "terminal backward hop: K_ret not recovered" };
+    }
+    const decResult = decryptReturnPayload(
+      peelResult.kRet,
+      circuit.noncePrefix,
+      circuit.commitmentRoot,
+      frame.frameSequence,
+      peelResult.innerPayload.sealedPayload,
+    );
+    if (!decResult.ok) {
+      return { ok: false, reason: decResult.reason };
+    }
+    return { ok: true, terminal: true, plaintext: decResult.plaintext };
+  }
+
+  // Intermediate backward hop — re-encode { sealedPayload, innerEnvelope }
+  // as the next frame's ciphertext + forward toward the source.
+  const nextCiphertext = encodeReturnFramePayload(peelResult.innerPayload);
   const nextFrame: CircuitFrame = {
     circuitNoncePrefix: frame.circuitNoncePrefix,
     frameSequence: frame.frameSequence,
     direction: frame.direction,
-    ciphertext: openResult.payload,
+    ciphertext: nextCiphertext,
   };
-
   return { ok: true, terminal: false, nextFrame };
 }
 

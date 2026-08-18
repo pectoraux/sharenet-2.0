@@ -1247,38 +1247,32 @@ function verifyCircuitFrameVector(data: any): VectorResult {
             failures.push(`${v.name}: reason "${decoded.reason}" !contains "${expected.reasonContains}"`);
           }
         }
-      } else if (v.name === "seal-return-frame") {
-        // R-009 Stage 2: sealReturnFrame (gateway onion-encrypts using returnKeys).
+      } else if (v.name === "seal-return-from-template") {
+        // R-009 Stage 2: gateway seals return response using the ReturnOnionTemplate.
         const plaintext = hexToBytes(shared.plaintextHex);
-        const sealed = sealReturnFrame(circuit, input.frameSequence, plaintext);
-        const sealedEncoded = encodeCircuitFrame(sealed);
-        const sealedEncodedHex = toHex(sealedEncoded);
-        sealedReturnFrame = sealed;
-        if (sealedEncodedHex !== expected.sealedEncodedHex) {
+        const kRet = hexToBytes(shared.kRetHex);
+        const template = constructReturnOnionTemplate(circuit, kRet);
+        const ciphertext = sealReturnFrameFromTemplate(template, input.frameSequence, plaintext);
+        const backwardFrame: CircuitFrame = {
+          circuitNoncePrefix: circuit.noncePrefix,
+          frameSequence: input.frameSequence,
+          direction: DIRECTION_BACKWARD,
+          ciphertext,
+        };
+        const wireBytes = encodeCircuitFrame(backwardFrame);
+        const wireHex = toHex(wireBytes);
+        sealedReturnFrame = backwardFrame;
+        if (wireHex !== expected.wireHex) {
           caseOk = false;
-          failures.push(`${v.name}: sealedEncoded ${sealedEncodedHex} != ${expected.sealedEncodedHex}`);
+          failures.push(`${v.name}: wire ${wireHex} != ${expected.wireHex}`);
         }
-        if (sealed.ciphertext.length !== expected.ciphertextLen) {
+        if (ciphertext.length !== expected.ciphertextLen) {
           caseOk = false;
-          failures.push(`${v.name}: ciphertextLen ${sealed.ciphertext.length} != ${expected.ciphertextLen}`);
+          failures.push(`${v.name}: ciphertextLen ${ciphertext.length} != ${expected.ciphertextLen}`);
         }
-        if (sealed.direction !== DIRECTION_BACKWARD) {
+        if (backwardFrame.direction !== expected.direction) {
           caseOk = false;
-          failures.push(`${v.name}: direction ${sealed.direction} != ${DIRECTION_BACKWARD}`);
-        }
-      } else if (v.name === "open-frame-hop1-backward") {
-        if (!sealedReturnFrame) { caseOk = false; failures.push(`${v.name}: no sealedReturnFrame`); }
-        else {
-          const r = openFrame(circuit, 1, sealedReturnFrame);
-          if (r.ok !== expected.ok) {
-            caseOk = false;
-            failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`);
-          } else if (r.ok) {
-            if (r.isTerminal !== expected.isTerminal) caseOk = false;
-            if (r.payload.length !== expected.payloadLen) caseOk = false;
-            if (toHex(r.payload) !== expected.payloadHex) caseOk = false;
-            if (!caseOk) failures.push(`${v.name}: open result mismatch`);
-          }
+          failures.push(`${v.name}: direction ${backwardFrame.direction} != ${expected.direction}`);
         }
       } else if (v.name === "forward-frame-hop1-backward") {
         if (!sealedReturnFrame) { caseOk = false; failures.push(`${v.name}: no sealedReturnFrame`); }
@@ -1293,13 +1287,9 @@ function verifyCircuitFrameVector(data: any): VectorResult {
               failures.push(`${v.name}: terminal ${r.terminal} != ${expected.terminal}`);
             } else if (!r.terminal) {
               const nfEncoded = encodeCircuitFrame(r.nextFrame);
-              if (toHex(nfEncoded) !== expected.nextFrameEncodedHex) {
+              if (toHex(nfEncoded) !== expected.nextFrameHex) {
                 caseOk = false;
                 failures.push(`${v.name}: nextFrame mismatch`);
-              }
-              if (r.nextFrame.ciphertext.length !== expected.nextFrameCiphertextLen) {
-                caseOk = false;
-                failures.push(`${v.name}: nextFrameCiphertextLen ${r.nextFrame.ciphertext.length} != ${expected.nextFrameCiphertextLen}`);
               }
               nextFrameAtHop1 = r.nextFrame;
             }
@@ -1322,10 +1312,12 @@ function verifyCircuitFrameVector(data: any): VectorResult {
       } else if (v.name === "tampered-return-ciphertext-rejected") {
         if (!sealedReturnFrame) { caseOk = false; failures.push(`${v.name}: no sealedReturnFrame`); }
         else {
+          // Tamper a byte in the envelope layer (not the CBOR header) so the
+          // CBOR decodes but the AEAD envelope peel fails.
           const tamperedCt = new Uint8Array(sealedReturnFrame.ciphertext);
-          tamperedCt[0] ^= 0x01;
+          tamperedCt[tamperedCt.length - 1] ^= 0x01;
           const tamperedFrame: CircuitFrame = { ...sealedReturnFrame, ciphertext: tamperedCt };
-          const r = openFrame(circuit, 1, tamperedFrame);
+          const r = forwardFrame(circuit, 1, tamperedFrame);
           if (r.ok !== expected.ok) {
             caseOk = false;
             failures.push(`${v.name}: expected ok=false, got ok=${r.ok}`);

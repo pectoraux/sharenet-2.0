@@ -224,29 +224,42 @@ This binds the frame to a specific `CommittedRoute`. A frame
 encrypted under a circuit's key but presented with a different
 `commitment_root` MUST fail AEAD verification.
 
-### 4.6a Forward + Backward (Return) Onion (R-009 Stage 2)
+### 4.6a Forward + Backward (Return) Wire Protocol (R-009 Stage 2)
 
 The circuit carries bidirectional traffic. Forward frames
 (`direction = 0x01`) travel source → gateway; backward frames
 (`direction = 0x02`) travel gateway → source.
 
-**Forward onion** (source seals, §5): the source onion-encrypts the
-plaintext from the outermost hop (last) to the innermost hop (first),
-using each hop's `forwardingKey`. Each relay peels one layer; the terminal
-hop (hop N-1, the gateway) delivers the plaintext.
+There is ONE canonical `CircuitFrame.ciphertext` representation per
+direction:
 
-**Backward (return) onion** (gateway seals): the gateway onion-encrypts
-the return plaintext from the innermost hop (hop 0, the source) to the
-outermost hop (hop N-1, the gateway's neighbor), using each hop's
-`returnKey`. This is the MIRROR of the forward onion. Each relay peels one
-layer with its `returnKey`; the terminal hop (hop 0, the source) delivers
-the plaintext.
+**FORWARD ciphertext** (the forward onion): N-layer-deep onion ciphertext.
+The source onion-encrypts the plaintext from the outermost hop (last) to
+the innermost hop (first), using each hop's `forwardingKey`. Each relay
+peels one layer with its `forwardingKey`; the terminal hop (hop N-1, the
+gateway) delivers the plaintext.
+
+**BACKWARD ciphertext** (the distributed return-onion template model,
+per §4.8 + ADR-0021): a CBOR pair `{ 1: sealedPayload, 2: envelopeLayer }`.
+The gateway seals the response with `K_ret` (circuit-scoped key, held by
+the gateway — NOT a relay key) + attaches the opaque envelope. Each relay
+peels its `returnKey` from the `envelopeLayer` (NOT from the frame
+ciphertext directly); the terminal hop (hop 0, the source) recovers `K_ret`
++ decrypts the `sealedPayload`. The gateway does NOT hold the per-hop
+`returnKey`s.
+
+The production frame path (`processCircuitWireFrame`) routes based on
+direction: FORWARD → `openFrame(forwardingKey)`; BACKWARD →
+`peelReturnEnvelopeLayer(returnKey)`. Both paths preserve the R-008 frozen
+ordering: decode → AEAD authenticate → receiver-local durable commit →
+forward/deliver.
 
 Per §4.1, each hop's HKDF output is split into `forwardingKey` (bytes 0-31)
 + `returnKey` (bytes 32-63). The `returnKey` is used ONLY for
-backward-direction frames. The AEAD AD includes the `direction` byte, so a
-forward frame + a backward frame at the same `frame_sequence` are
-cryptographically distinct (different AD → different AEAD tag).
+backward-direction envelope peeling (§4.8). The AEAD AD includes the
+`direction` byte, so a forward frame + a backward frame at the same
+`frame_sequence` are cryptographically distinct (different AD → different
+AEAD tag).
 
 **Replay protection (bidirectional):** per ADR-0019, the durable sequence
 floor is keyed by `(commitmentRoot, hopIndex, direction)`. Forward + backward

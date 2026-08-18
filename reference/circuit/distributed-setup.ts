@@ -58,6 +58,7 @@ import {
   AEAD_KEY_BYTES,
 } from "./circuit";
 import type { CircuitAckReplayStore, CircuitSequenceFloorStore } from "./replay-stores";
+import { constructReturnOnionTemplate, type ReturnOnionTemplate } from "./return-template";
 
 // -----------------------------------------------------------------------
 // Constants (FROZEN per spec/14 §4 + ADR-0017)
@@ -655,7 +656,7 @@ export async function establishDistributedCircuit(
    * `processCircuitFrame` does atomic durable AEAD→commit ordering.
    */
   floorStore: CircuitSequenceFloorStore,
-): Promise<{ ok: true; circuit: ActiveCircuit } | { ok: false; reason: string }> {
+): Promise<{ ok: true; circuit: ActiveCircuit; returnTemplate: ReturnOnionTemplate } | { ok: false; reason: string }> {
   // 1. Verify the route is genuine
   if (!isBrandedCommittedRoute(route)) {
     return { ok: false, reason: "route is not a genuine BrandedCommittedRoute" };
@@ -742,5 +743,13 @@ export async function establishDistributedCircuit(
     floorStore,
   };
 
-  return { ok: true, circuit };
+  // 6. R-009 Stage 2: construct the ReturnOnionTemplate.
+  //    The initiator (who holds all returnKeys from the ECDH setup) constructs
+  //    the layered encrypted envelope wrapping K_ret. The template is sent to
+  //    the gateway (the terminal hop) during setup — the gateway holds K_ret +
+  //    the opaque envelope, NOT the per-hop returnKeys. The gateway uses
+  //    sealReturnFrameFromTemplate() to seal return responses. See ADR-0021.
+  const returnTemplate = constructReturnOnionTemplate(circuit);
+
+  return { ok: true, circuit, returnTemplate };
 }

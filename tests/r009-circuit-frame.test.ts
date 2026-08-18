@@ -47,6 +47,10 @@ import {
   processWireFrame,
   processCircuitWireFrame,
 } from "@reference/circuit/forwarding";
+import {
+  constructReturnOnionTemplate,
+  sealReturnFrameFromTemplate,
+} from "@reference/circuit/return-template";
 import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
@@ -823,17 +827,27 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     expect(decoded.frame.direction).toBe(0x02);
   });
 
-  test("sealReturnFrame + processCircuitWireFrame: 1-hop return chain delivers plaintext at hop 0", async () => {
+  test("distributed return template + processCircuitWireFrame: 1-hop return chain delivers plaintext at hop 0", async () => {
     const route = makeRoute(1);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
 
-    // The gateway seals a return frame at seq=1.
+    // The initiator constructs the return-onion template during setup.
+    // The gateway receives { K_ret, envelope } — NOT the raw returnKeys.
+    const template = constructReturnOnionTemplate(circuit);
+
+    // The gateway seals a return frame using the template (production path).
     const returnPayload = new TextEncoder().encode("return data from gateway");
-    const sealed = sealReturnFrame(circuit, 1, returnPayload);
-    expect(sealed.direction).toBe(DIRECTION_BACKWARD);
-    const wireBytes = encodeCircuitFrame(sealed);
+    const ciphertext = sealReturnFrameFromTemplate(template, 1, returnPayload);
+    // Construct the backward CircuitFrame with the template-based ciphertext.
+    const backwardFrame: CircuitFrame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 1,
+      direction: DIRECTION_BACKWARD,
+      ciphertext,
+    };
+    const wireBytes = encodeCircuitFrame(backwardFrame);
 
     // hop 0 (the source) processes — terminal for BACKWARD, delivers plaintext.
     const result = await processCircuitWireFrame(circuit, 0, wireBytes);
@@ -847,15 +861,22 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
   });
 
-  test("sealReturnFrame + processCircuitWireFrame: 2-hop return chain (gateway → relay 1 → source)", async () => {
+  test("distributed return template + processCircuitWireFrame: 2-hop return chain (gateway → relay 1 → source)", async () => {
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
 
+    const template = constructReturnOnionTemplate(circuit);
     const returnPayload = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
-    const sealed = sealReturnFrame(circuit, 1, returnPayload);
-    const wireBytes = encodeCircuitFrame(sealed);
+    const ciphertext = sealReturnFrameFromTemplate(template, 1, returnPayload);
+    const backwardFrame: CircuitFrame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 1,
+      direction: DIRECTION_BACKWARD,
+      ciphertext,
+    };
+    const wireBytes = encodeCircuitFrame(backwardFrame);
 
     // hop 1 (gateway's neighbor) processes first — NOT terminal (terminal is hop 0).
     const r1 = await processCircuitWireFrame(circuit, 1, wireBytes);
@@ -882,6 +903,7 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
 
     // Forward frame at seq=1.
     const fwdPayload = new TextEncoder().encode("forward");
@@ -892,8 +914,14 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
 
     // Backward frame at seq=1 — ACCEPTED (different direction → different floor).
     const retPayload = new TextEncoder().encode("backward");
-    const retSealed = sealReturnFrame(circuit, 1, retPayload);
-    const retResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(retSealed));
+    const retCiphertext = sealReturnFrameFromTemplate(template, 1, retPayload);
+    const retFrame: CircuitFrame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 1,
+      direction: DIRECTION_BACKWARD,
+      ciphertext: retCiphertext,
+    };
+    const retResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(retFrame));
     expect(retResult.ok).toBe(true);
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(1n);
     // Forward floor UNCHANGED by the backward frame.
@@ -905,9 +933,16 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
 
-    const sealed = sealReturnFrame(circuit, 1, new TextEncoder().encode("ret"));
-    const wireBytes = encodeCircuitFrame(sealed);
+    const ciphertext = sealReturnFrameFromTemplate(template, 1, new TextEncoder().encode("ret"));
+    const frame: CircuitFrame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 1,
+      direction: DIRECTION_BACKWARD,
+      ciphertext,
+    };
+    const wireBytes = encodeCircuitFrame(frame);
 
     // First presentation — accepted.
     const r1 = await processCircuitWireFrame(circuit, 0, wireBytes);
@@ -925,10 +960,17 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
 
-    const sealed = sealReturnFrame(circuit, 100, new TextEncoder().encode("x"));
-    const wireBytes = new Uint8Array(encodeCircuitFrame(sealed));
-    wireBytes[15] ^= 0x01; // tamper
+    const ciphertext = sealReturnFrameFromTemplate(template, 100, new TextEncoder().encode("x"));
+    const frame: CircuitFrame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 100,
+      direction: DIRECTION_BACKWARD,
+      ciphertext,
+    };
+    const wireBytes = new Uint8Array(encodeCircuitFrame(frame));
+    wireBytes[wireBytes.length - 1] ^= 0x01; // tamper the ciphertext
 
     const result = await processCircuitWireFrame(circuit, 0, wireBytes);
     expect(result.ok).toBe(false);

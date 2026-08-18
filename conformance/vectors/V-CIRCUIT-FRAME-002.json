@@ -1,71 +1,57 @@
 {
   "id": "V-CIRCUIT-FRAME-002",
   "status": "frozen",
-  "spec": "spec/08-circuits.md §4.6a, §4.6, R-009 Stage 2",
-  "adr": "adr/0019-receiver-local-replay-protection.md",
-  "description": "CircuitFrame backward (return) onion: sealReturnFrame (gateway onion-encrypts using returnKeys, mirror of forward onion), openFrame (relay AEAD-peels one returnKey layer), forwardFrame (relay forwarding backward). Per spec/08 §4.6a: backward frames use direction=0x02 + returnKey. The terminal hop for BACKWARD is hop 0 (the source). Built ON the frozen R-008 crypto substrate + the R-009 Stage 1 receiver-local replay namespace (commitmentRoot, hopIndex, direction) — forward + backward floors are independent by construction.",
+  "spec": "spec/08-circuits.md §4.6a, §4.8, R-009 Stage 2",
+  "adr": "adr/0021-return-onion-template-distribution.md",
+  "description": "CircuitFrame backward (return) via the distributed return-onion template model. The gateway seals the response with K_ret + attaches the opaque envelope. forwardFrame routes BACKWARD through peelReturnEnvelopeLayer (peels returnKey from the envelope, NOT from the frame ciphertext). Terminal hop (hop 0 = source) recovers K_ret + decrypts. This is the CANONICAL BACKWARD wire format (CBOR { sealedPayload, envelopeLayer }) — there is no competing backward construction.",
   "sharedInputs": {
-    "commitmentRootHex": "fddc2d4fe47baf57e8355b0bddd755fcf6dadee5ecf3662f3a4695441c0fdfcc",
-    "noncePrefixHex": "dff484e477490b7f",
+    "commitmentRootHex": "6d6e6a57d0a3b9502798f0e382e4716b55eb4200023131446bd305315e573477",
+    "noncePrefixHex": "e13449f92429271f",
+    "circuitIdHex": "377ccbbd820be4b1167496b07e2e3b3b3027da0cf7aeac5c663ad9579e053b07",
     "initiatorX25519SecretKeyHex": "0101010101010101010101010101010101010101010101010101010101010101",
     "initiatorX25519PubHex": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
     "relay0X25519SecretKeyHex": "0202020202020202020202020202020202020202020202020202020202020202",
     "relay0X25519PubHex": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
     "relay1X25519SecretKeyHex": "0303030303030303030303030303030303030303030303030303030303030303",
     "relay1X25519PubHex": "5dfedd3b6bd47f6fa28ee15d969d5bb0ea53774d488bdaf9df1c6e0124b3ef22",
-    "forwardingKey0Hex": "6291fd810418e63e51760880871781b62331972b1064f038b92958e0584abf07",
-    "forwardingKey1Hex": "3f582801d69f6da177bbed7fa63b2a5423d46f7e27bec5c91905fc6e891c8974",
-    "returnKey0Hex": "e91165de57bdc6962e2250d8e3faea8960a616c58b63180530740abb87bd39d1",
-    "returnKey1Hex": "7f001b79b9310c6588297fbb62b9d80c4c9a0b4e0ca0098fd6a94e0b37b8595f",
+    "forwardingKey0Hex": "cb8e2e68b054d47fb74c42ee1d8da145cf2732118371af9f991a61bd1e3a37f4",
+    "forwardingKey1Hex": "aee7552ed61be034fda295d19108dcceb7f65dd14b733ce77075e5ddd84aa7a2",
+    "returnKey0Hex": "7777f75d1cc3f5482f6905800e3567c6e5ec447a23a553f93b87fc12a2509a29",
+    "returnKey1Hex": "37ae0a88438e5813ea6b4665bf9dc76d7a0e1b231533175ba39c1892030f22b8",
+    "kRetHex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "plaintextHex": "485454502f312e3120323030204f4b0d0a436f6e74656e742d4c656e6774683a20300d0a0d0a",
     "plaintextAscii": "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
     "referenceNow": 1786876545
   },
   "vectors": [
     {
-      "name": "seal-return-frame",
-      "description": "sealReturnFrame: 2-hop return-onion encrypt the plaintext at seq=1 (gateway → source). Uses returnKey1 (outermost) then returnKey0 (innermost).",
+      "name": "seal-return-from-template",
+      "description": "Gateway seals return response using the ReturnOnionTemplate → backward CircuitFrame (CBOR { sealedPayload, envelope }).",
       "input": {
         "frameSequence": 1,
         "plaintextHex": "485454502f312e3120323030204f4b0d0a436f6e74656e742d4c656e6774683a20300d0a0d0a"
       },
       "expected": {
-        "circuitNoncePrefixHex": "dff484e477490b7f",
-        "frameSequence": 1,
-        "direction": 2,
-        "sealedEncodedHex": "a40148dff484e477490b7f02010302045846b7178b35aae5b31d9e6edec059c102896c5a3aecc3c177b8873b3641c9dbb93c3cfd18a4328cad59fe8dda308dd6913ef3b2afff39302cd18197f59f1067348f84711a9db867",
-        "ciphertextLen": 70
-      }
-    },
-    {
-      "name": "open-frame-hop1-backward",
-      "description": "openFrame at hop 1 (backward): peel the outermost returnKey layer. isTerminal=false (terminal for backward is hop 0).",
-      "input": {
-        "frame": "sealedReturnFrame@seq1"
-      },
-      "expected": {
-        "ok": true,
-        "isTerminal": false,
-        "payloadHex": "cc540d034ea6316371eb567bbeb3b79c517028801e5e87e739c6963e2199328f326fa325022f6e07c467026e87a62f6d28386ded3b9c",
-        "payloadLen": 54
+        "wireHex": "a40148e13449f92429271f0201030204587da2015836e002e517fb3082c7d3af3ed2a42e00f074e854ef223fd5f7cb278d59cd9ef1f41c81c84a6d41b6fc1bec4c6ec5e439efb8e274105e88025840a8c8344f9b17f2c6f7e390ba08660cd1823993be0c57b57c313032416d58b2f96910730548e5244be4e5a12177f76a5dab913187ae6caf2bfefc25ea0d5c3364",
+        "ciphertextLen": 125,
+        "direction": 2
       }
     },
     {
       "name": "forward-frame-hop1-backward",
-      "description": "forwardFrame at hop 1 (backward): produces nextFrame for hop 0 (the source).",
+      "description": "forwardFrame at hop 1 (backward): peels returnKey_1 from the envelope → nextFrame for hop 0. NOT terminal.",
       "input": {
-        "frame": "sealedReturnFrame@seq1"
+        "frame": "backwardFrame@seq1"
       },
       "expected": {
         "ok": true,
         "terminal": false,
-        "nextFrameEncodedHex": "a40148dff484e477490b7f02010302045836cc540d034ea6316371eb567bbeb3b79c517028801e5e87e739c6963e2199328f326fa325022f6e07c467026e87a62f6d28386ded3b9c",
-        "nextFrameCiphertextLen": 54
+        "nextFrameHex": "a40148e13449f92429271f0201030204586da2015836e002e517fb3082c7d3af3ed2a42e00f074e854ef223fd5f7cb278d59cd9ef1f41c81c84a6d41b6fc1bec4c6ec5e439efb8e274105e880258302de13565af73eb3519a344ee32f97d6e20276acf1c1c141805bb59970b6c9134c030bd1ae07b1fafcaf8a9854a5104e3"
       }
     },
     {
       "name": "forward-frame-hop0-backward-terminal",
-      "description": "forwardFrame at hop 0 (backward, terminal): delivers the original return plaintext to the source.",
+      "description": "forwardFrame at hop 0 (backward, terminal): recovers K_ret + decrypts the sealedPayload → response plaintext.",
       "input": {
         "frame": "nextFrame@hop1"
       },
@@ -78,18 +64,18 @@
     },
     {
       "name": "tampered-return-ciphertext-rejected",
-      "description": "openFrame (backward) with a single bit flipped in the ciphertext → AEAD authentication fails (ok=false).",
+      "description": "forwardFrame (backward) with a tampered ciphertext → AEAD envelope peel fails (ok=false).",
       "input": {
-        "frame": "tamperedReturn@seq1"
+        "frame": "tampered@seq1"
       },
       "expected": {
         "ok": false,
-        "reasonContains": "AEAD authentication failed"
+        "reasonContains": "AEAD"
       }
     }
   ],
   "verification": {
     "runner": "ts-vector-runner.ts:verifyCircuitFrameVector + py_vector_verifier.py:verify_circuit_frame_vector",
-    "notes": "Same fixed seeds as V-CIRCUIT-FRAME-001. The return-onion is the mirror of the forward onion: returnKey1 (outermost) → returnKey0 (innermost). The terminal hop for backward is hop 0 (the source). The receiver-local replay floor (root, hopIndex, direction) handles forward + backward independently — a forward + backward frame at the same seq are both accepted."
+    "notes": "Same fixed seeds as V-CIRCUIT-FRAME-001. The backward frame uses the distributed return-onion template model (CBOR { sealedPayload, envelopeLayer }) — the CANONICAL backward wire format. forwardFrame routes BACKWARD through peelReturnEnvelopeLayer. The gateway holds K_ret (from the template) — NOT the raw returnKeys."
   }
 }
