@@ -1,0 +1,257 @@
+{
+  "id": "V-GATEWAY-001",
+  "status": "draft",
+  "spec": "spec/09-internet-gateway.md §3, spec/00 §2, GATE-07, ADR-0011",
+  "description": "Gateway policy evaluation (evaluateGatewayRequest). The gateway is the ONLY component that makes outbound Internet connections. Every request MUST pass: enabled-check → peer-revocation → allowlist → SSRF/loopback/link-local/private blocking (BEFORE DNS) → per-peer quota → global quota → rate limit → bandwidth. Per spec/09 §3: NEVER an unrestricted open proxy.",
+  "referenceNowMs": 1786876545000,
+  "defaults": {
+    "note": "Each case constructs its own policy via defaultGatewayPolicy() with explicit overrides. capacity is freshly seeded per case from defaultGatewayCapacity().",
+    "defaultPolicy": {
+      "allowedDestinations": [
+        "example.com",
+        "*.sharenet.local"
+      ],
+      "blockPrivateAddresses": true,
+      "blockLoopback": true,
+      "blockLinkLocal": true,
+      "blockSsrf": true,
+      "perPeerQuota": 100,
+      "globalQuota": 10000,
+      "rateLimitPerSec": 10,
+      "bandwidthBps": 1048576,
+      "revokedPeers": [],
+      "enabled": true
+    }
+  },
+  "vectors": [
+    {
+      "name": "allow",
+      "description": "Valid request to example.com:443 (in default allowlist), peer is not revoked, all blocks pass, capacity is fresh. evaluateGatewayRequest returns ALLOW.",
+      "input": {
+        "request": {
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "destination": "example.com:443",
+          "requestedBytes": 1024
+        },
+        "policy": {
+          "allowedDestinations": [
+            "example.com",
+            "*.sharenet.local"
+          ],
+          "blockPrivateAddresses": true,
+          "blockLoopback": true,
+          "blockLinkLocal": true,
+          "blockSsrf": true,
+          "perPeerQuota": 100,
+          "globalQuota": 10000,
+          "rateLimitPerSec": 10,
+          "bandwidthBps": 1048576,
+          "revokedPeers": [],
+          "enabled": true
+        }
+      },
+      "expected": {
+        "decision": "ALLOW",
+        "actualResult": {
+          "decision": "ALLOW",
+          "detail": "all guards passed",
+          "destination": "example.com:443",
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "decidedAt": 1786876545000
+        }
+      }
+    },
+    {
+      "name": "deny-ssrf",
+      "description": "Destination 169.254.169.254 is the AWS/GCP cloud-metadata IP. Even with a permissive allowlist [\"*\"], isSsrfTarget returns true and the gateway MUST deny with DESTINATION_BLOCKED_SSRF. This defeats DNS-rebinding attacks by re-checking the resolved IP post-DNS (see checkResolvedIp).",
+      "input": {
+        "request": {
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "destination": "169.254.169.254:80",
+          "requestedBytes": 512
+        },
+        "policy": {
+          "allowedDestinations": [
+            "*"
+          ],
+          "blockPrivateAddresses": true,
+          "blockLoopback": true,
+          "blockLinkLocal": true,
+          "blockSsrf": true,
+          "perPeerQuota": 100,
+          "globalQuota": 10000,
+          "rateLimitPerSec": 10,
+          "bandwidthBps": 1048576,
+          "revokedPeers": [],
+          "enabled": true
+        }
+      },
+      "expected": {
+        "decision": "DENY",
+        "reason": "DESTINATION_BLOCKED_SSRF",
+        "actualResult": {
+          "decision": "DENY",
+          "reason": "DESTINATION_BLOCKED_SSRF",
+          "detail": "SSRF-sensitive: 169.254.169.254",
+          "destination": "169.254.169.254:80",
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "decidedAt": 1786876545000
+        }
+      }
+    },
+    {
+      "name": "deny-private",
+      "description": "Destination 10.0.0.1 is an RFC 1918 private address. With allowlist [\"*\"], isPrivateAddress returns true and the gateway MUST deny with DESTINATION_BLOCKED_PRIVATE.",
+      "input": {
+        "request": {
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "destination": "10.0.0.1:80",
+          "requestedBytes": 512
+        },
+        "policy": {
+          "allowedDestinations": [
+            "*"
+          ],
+          "blockPrivateAddresses": true,
+          "blockLoopback": true,
+          "blockLinkLocal": true,
+          "blockSsrf": true,
+          "perPeerQuota": 100,
+          "globalQuota": 10000,
+          "rateLimitPerSec": 10,
+          "bandwidthBps": 1048576,
+          "revokedPeers": [],
+          "enabled": true
+        }
+      },
+      "expected": {
+        "decision": "DENY",
+        "reason": "DESTINATION_BLOCKED_PRIVATE",
+        "actualResult": {
+          "decision": "DENY",
+          "reason": "DESTINATION_BLOCKED_PRIVATE",
+          "detail": "private address: 10.0.0.1",
+          "destination": "10.0.0.1:80",
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "decidedAt": 1786876545000
+        }
+      }
+    },
+    {
+      "name": "deny-loopback",
+      "description": "Destination 127.0.0.1 is a loopback address. With allowlist [\"*\"], isLoopback returns true and the gateway MUST deny with DESTINATION_BLOCKED_LOOPBACK.",
+      "input": {
+        "request": {
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "destination": "127.0.0.1:80",
+          "requestedBytes": 512
+        },
+        "policy": {
+          "allowedDestinations": [
+            "*"
+          ],
+          "blockPrivateAddresses": true,
+          "blockLoopback": true,
+          "blockLinkLocal": true,
+          "blockSsrf": true,
+          "perPeerQuota": 100,
+          "globalQuota": 10000,
+          "rateLimitPerSec": 10,
+          "bandwidthBps": 1048576,
+          "revokedPeers": [],
+          "enabled": true
+        }
+      },
+      "expected": {
+        "decision": "DENY",
+        "reason": "DESTINATION_BLOCKED_LOOPBACK",
+        "actualResult": {
+          "decision": "DENY",
+          "reason": "DESTINATION_BLOCKED_LOOPBACK",
+          "detail": "loopback: 127.0.0.1",
+          "destination": "127.0.0.1:80",
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "decidedAt": 1786876545000
+        }
+      }
+    },
+    {
+      "name": "deny-not-allowed",
+      "description": "Destination evil.com is NOT in the allowlist [\"example.com\"]. The gateway MUST deny with DESTINATION_NOT_ALLOWED — the SSRF/private/loopback checks are not reached because the allowlist check fires first.",
+      "input": {
+        "request": {
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "destination": "evil.com:443",
+          "requestedBytes": 256
+        },
+        "policy": {
+          "allowedDestinations": [
+            "example.com"
+          ],
+          "blockPrivateAddresses": true,
+          "blockLoopback": true,
+          "blockLinkLocal": true,
+          "blockSsrf": true,
+          "perPeerQuota": 100,
+          "globalQuota": 10000,
+          "rateLimitPerSec": 10,
+          "bandwidthBps": 1048576,
+          "revokedPeers": [],
+          "enabled": true
+        }
+      },
+      "expected": {
+        "decision": "DENY",
+        "reason": "DESTINATION_NOT_ALLOWED",
+        "actualResult": {
+          "decision": "DENY",
+          "reason": "DESTINATION_NOT_ALLOWED",
+          "detail": "host evil.com not in allowlist",
+          "destination": "evil.com:443",
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "decidedAt": 1786876545000
+        }
+      }
+    },
+    {
+      "name": "deny-disabled",
+      "description": "Gateway enabled=false. The FIRST check in evaluateGatewayRequest fails — no destination / quota / rate checks are evaluated. Gateway MUST deny with GATEWAY_DISABLED.",
+      "input": {
+        "request": {
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "destination": "example.com:443",
+          "requestedBytes": 1024
+        },
+        "policy": {
+          "allowedDestinations": [
+            "*"
+          ],
+          "blockPrivateAddresses": true,
+          "blockLoopback": true,
+          "blockLinkLocal": true,
+          "blockSsrf": true,
+          "perPeerQuota": 100,
+          "globalQuota": 10000,
+          "rateLimitPerSec": 10,
+          "bandwidthBps": 1048576,
+          "revokedPeers": [],
+          "enabled": false
+        }
+      },
+      "expected": {
+        "decision": "DENY",
+        "reason": "GATEWAY_DISABLED",
+        "actualResult": {
+          "decision": "DENY",
+          "reason": "GATEWAY_DISABLED",
+          "detail": "gateway is disabled",
+          "destination": "example.com:443",
+          "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+          "decidedAt": 1786876545000
+        }
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/gateway/gateway.ts — evaluateGatewayRequest.",
+  "notes": "Each case uses a FRESH GatewayCapacity (no state leakage between cases). The peerNodeId is the canonical NodeId derived from TEST_SEED_2 (0x000…02). The gateway does NOT sign or hash anything in evaluateGatewayRequest — that happens later in signServiceMeasurement."
+}

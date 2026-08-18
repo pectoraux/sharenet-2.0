@@ -993,3 +993,41 @@ Stage Summary:
 - Lint: clean (0 errors).
 - Dev server: healthy; browser self-verification zero errors.
 - R-003/R-004 are now CLOSED with the machine-readable schema artifact as the single source of truth shared by spec, implementation, tests, and both conformance runners.
+
+---
+Task ID: R-007-full-vector-expansion
+Agent: main (Z.ai Code)
+Task: Expand the conformance vector suite from 20 to 25 vectors, covering topology, service negotiation, circuit, gateway, and contribution. Both TS and Python runners consume the same artifacts. Add a completeness test.
+
+Work Log:
+- Generated 5 new vector families with real computed values from the reference implementation:
+  - V-HINT-001: RemoteNodeHint (valid + tampered signature + expired + hop overflow)
+  - V-SVC-001: Service negotiation (valid policy + SSRF/private/capability-mismatch/not-allowed DENY)
+  - V-CIRCUIT-001: Circuit ID derivation + HKDF hop keys + nonce layout + replay guard (deterministic byte stability + duplicate/lower rejection)
+  - V-GATEWAY-001: Gateway policy (ALLOW + SSRF/private/loopback/not-allowed/disabled DENY)
+  - V-RECEIPT-001: Bilateral receipt (valid + tampered gateway sig + tampered peer sig + tampered receipt ID)
+  - All values computed from real Ed25519 signatures, BLAKE3 hashes, and HKDF derivations — no placeholders.
+
+- Added TS runner handlers for all 5 new families (verifyHintVector, verifyServiceNegotiationVector, verifyCircuitVector, verifyGatewayVector, verifyReceiptVector) + dispatch branches.
+
+- Added Python runner handlers for all 5 new families with independent implementations (BLAKE3, Ed25519 verify via PyNaCl, CBOR via cbor2, HKDF-SHA256, replay guard, SSRF/private/loopback checks).
+
+- Fixed a latent bug in remote-node-hint.ts: hintFromHex was missing canonicalDecode import.
+
+- Created tests/r007-completeness.test.ts (5 tests):
+  - MANIFEST.json has the expected structure
+  - Every required vector family has at least one entry in the manifest
+  - Routing schema artifact objects have corresponding vector families
+  - Total vector count ≥ 20
+  - Every manifest entry references a file that exists
+
+- Updated MANIFEST.json with 5 new entries.
+
+Stage Summary:
+- Tests: 319 → 324 pass, 0 fail (+5 completeness tests). 915 expect() calls.
+- Architecture tests: 24/24 pass.
+- TS conformance runner: 25/25 vectors pass (was 20/20).
+- Python conformance runner: 25/25 vectors pass (was 20/20).
+- Lint: clean (0 errors).
+- Dev server: healthy; browser self-verification zero errors.
+- R-007 vector expansion: the conformance suite now covers identity, encoding, advertisement, link, routing, topology, service negotiation, circuit, gateway, and contribution. Both TS and Python runners consume the same frozen artifacts. A completeness test prevents the suite from silently falling behind the specification.

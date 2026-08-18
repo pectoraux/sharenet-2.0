@@ -17,6 +17,8 @@ Usage:
 Exit: 0 if all vectors pass, 1 if any fail.
 """
 
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -383,6 +385,21 @@ def verify_vector(data: dict) -> dict:
     elif vid.startswith("V-ROUTE-COMMIT-"):
         return verify_route_commit_vector(data)
 
+    elif vid.startswith("V-HINT-"):
+        return verify_hint_vector(data)
+
+    elif vid.startswith("V-SVC-"):
+        return verify_svc_vector(data)
+
+    elif vid.startswith("V-CIRCUIT-"):
+        return verify_circuit_vector(data)
+
+    elif vid.startswith("V-GATEWAY-"):
+        return verify_gateway_vector(data)
+
+    elif vid.startswith("V-RECEIPT-"):
+        return verify_receipt_vector(data)
+
     return {"id": vid, "passed": False, "expected": "known type", "actual": "unknown type"}
 
 
@@ -599,6 +616,758 @@ def _verify_possession_proof(public_key: bytes, signature: bytes,
         return True
     except (BadSignatureError, Exception):
         return False
+
+
+# -----------------------------------------------------------------------
+# RemoteNodeHint vector verification (added for R-007 — V-HINT-001)
+# -----------------------------------------------------------------------
+
+HINT_SIGNATURE_DOMAIN = b"SHARENET/HINT/1"
+MAX_HINT_HOPS = 3
+MAX_HINT_FRESHNESS_SECONDS = 3600
+HINT_NONCE_BYTES = 16
+
+
+def encode_hint_body(body: dict) -> bytes:
+    """Encode a RemoteNodeHint body as canonical CBOR (integer-keyed map per ADR-0004).
+
+    Keys: 1=reporterNodeId, 2=subjectNodeId, 3=subjectEndpointHint,
+          4=claimedCapabilities[], 5=hopCount, 6=timestamp, 7=nonce (16-byte bstr).
+    """
+    m = {
+        1: body["reporterNodeId"],
+        2: body["subjectNodeId"],
+        3: body["subjectEndpointHint"],
+        4: list(body["claimedCapabilities"]),
+        5: body["hopCount"],
+        6: body["timestamp"],
+        7: body["nonce"] if isinstance(body.get("nonce"), bytes)
+            else bytes.fromhex(body["nonceHex"]),
+    }
+    return canonical_cbor_encode(m)
+
+
+def hint_signing_payload(body: dict) -> bytes:
+    """Compute the bytes-to-be-signed for a RemoteNodeHint body."""
+    return HINT_SIGNATURE_DOMAIN + encode_hint_body(body)
+
+
+def verify_remote_node_hint(hint: dict, reporter_public_key: bytes, now: int) -> dict:
+    """Verify a RemoteNodeHint cryptographically (independent implementation).
+
+    Mirrors reference/topology/remote-node-hint.ts — verifyRemoteNodeHint:
+      1. hopCount <= MAX_HINT_HOPS (3)
+      2. |timestamp - now| <= MAX_HINT_FRESHNESS_SECONDS (3600)
+      3. nonce length == 16
+      4. Ed25519 signature over (domain || canonical CBOR body) verifies
+    """
+    hop_count = hint["hopCount"]
+    if hop_count > MAX_HINT_HOPS:
+        return {"ok": False, "error": "HOP_COUNT_EXCEEDED",
+                "detail": f"hopCount {hop_count} exceeds max {MAX_HINT_HOPS}"}
+
+    timestamp = hint["timestamp"]
+    if abs(timestamp - now) > MAX_HINT_FRESHNESS_SECONDS:
+        return {"ok": False, "error": "EXPIRED",
+                "detail": "hint outside freshness window"}
+
+    nonce = (hint["nonce"] if isinstance(hint.get("nonce"), bytes)
+             else bytes.fromhex(hint["nonceHex"]))
+    if len(nonce) != HINT_NONCE_BYTES:
+        return {"ok": False, "error": "MALFORMED_NONCE",
+                "detail": f"expected {HINT_NONCE_BYTES} bytes, got {len(nonce)}"}
+
+    sig_hex = hint.get("reporterSignatureHex") or hint.get("tamperedReporterSignatureHex")
+    if not sig_hex:
+        return {"ok": False, "error": "MALFORMED_SIGNATURE",
+                "detail": "no signature provided"}
+    sig = bytes.fromhex(sig_hex)
+    if len(sig) != 64:
+        return {"ok": False, "error": "MALFORMED_SIGNATURE",
+                "detail": f"expected 64 bytes, got {len(sig)}"}
+
+    payload = hint_signing_payload(hint)
+    try:
+        VerifyKey(reporter_public_key).verify(payload, sig)
+    except BadSignatureError:
+        return {"ok": False, "error": "SIGNATURE_INVALID",
+                "detail": "reporter signature invalid"}
+    except Exception as e:
+        return {"ok": False, "error": "SIGNATURE_INVALID", "detail": str(e)}
+
+    return {"ok": True}
+
+
+def verify_hint_vector(data: dict) -> dict:
+    """Verify a V-HINT-* vector (RemoteNodeHint signed-claim verification)."""
+    vid = data.get("id", "unknown")
+    shared_keys = data.get("sharedKeys", {})
+    reporter_pubkey = bytes.fromhex(shared_keys["reporterPublicKeyHex"])
+    reference_now = data["referenceNow"]
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            exp = v["expected"]
+            intermediate = v.get("intermediate", {})
+            hint = {
+                "reporterNodeId": inp["reporterNodeId"],
+                "subjectNodeId": inp["subjectNodeId"],
+                "subjectEndpointHint": inp["subjectEndpointHint"],
+                "claimedCapabilities": inp["claimedCapabilities"],
+                "hopCount": inp["hopCount"],
+                "timestamp": inp["timestamp"],
+                "nonceHex": inp["nonceHex"],
+            }
+            # Signatures may live under `input` (tampered/expired/hop-overflow
+            # cases) or under `intermediate` (valid-hint case).
+            sig_hex = (
+                inp.get("reporterSignatureHex")
+                or inp.get("tamperedReporterSignatureHex")
+                or intermediate.get("reporterSignatureHex")
+            )
+            if sig_hex:
+                hint["reporterSignatureHex"] = sig_hex
+
+            result = verify_remote_node_hint(hint, reporter_pubkey, reference_now)
+
+            if exp["verificationResult"] == "ok":
+                if not result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected ok, got {result.get("error")}: {result.get("detail")}'
+                    )
+            else:
+                expected_code = exp.get("errorCode")
+                if result["ok"]:
+                    failures.append(f'{v["name"]}: expected fail/{expected_code}, got ok')
+                elif result.get("error") != expected_code:
+                    failures.append(
+                        f'{v["name"]}: expected fail/{expected_code}, got fail/{result.get("error")}'
+                    )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} hint vectors match",
+        "actual": f"{len(vectors)} hint vectors match" if passed else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# Service negotiation policy check (added for R-007 — V-SVC-001)
+# -----------------------------------------------------------------------
+
+def _extract_host(destination: str) -> str:
+    """Extract the host portion of a destination string. Mirrors reference impl."""
+    s = destination
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    if "/" in s:
+        s = s.split("/", 1)[0]
+    if ":" in s:
+        s = s.split(":", 1)[0]
+    return s.lower()
+
+
+def _is_loopback(host: str) -> bool:
+    return host == "localhost" or host == "::1" or host.startswith("127.")
+
+
+def _is_link_local(host: str) -> bool:
+    return host.startswith("169.254.") or host.startswith("fe80:")
+
+
+def _is_private_address(host: str) -> bool:
+    if host.startswith("10."):
+        return True
+    if host.startswith("192.168."):
+        return True
+    if host.startswith("172."):
+        parts = host.split(".")
+        if len(parts) > 1:
+            try:
+                second = int(parts[1])
+                if 16 <= second <= 31:
+                    return True
+            except ValueError:
+                pass
+    if host.startswith("fc") or host.startswith("fd"):
+        return True
+    return False
+
+
+def _is_ssrf_target(host: str) -> bool:
+    if host == "169.254.169.254":
+        return True
+    if host == "metadata.google.internal":
+        return True
+    if host == "fd00:ec2::254":
+        return True
+    if host.endswith(".internal") and not host.endswith(".sharenet.local"):
+        return True
+    return False
+
+
+def _match_glob(pattern: str, host: str) -> bool:
+    if pattern == "*":
+        return True
+    if pattern == host:
+        return True
+    if pattern.startswith("*."):
+        suffix = pattern[2:]
+        return host == suffix or host.endswith("." + suffix)
+    return False
+
+
+def check_service_policy(requirement: dict, offer: dict, now: int,
+                         allowed_destinations=None, revoked_peers=None) -> dict:
+    """Independent implementation of reference/routing/service-negotiation.ts checkPolicy."""
+    if requirement["expiry"] <= now:
+        return {"ok": False, "reason": "EXPIRED"}
+
+    if offer["capability"] != requirement["requiredCapability"]:
+        return {"ok": False, "reason": "CAPABILITY_MISMATCH"}
+
+    if offer.get("advVerifiedOnly"):
+        return {"ok": False, "reason": "ADV_VERIFIED_ONLY"}
+    if not offer.get("linkUp"):
+        return {"ok": False, "reason": "NO_LINK_UP"}
+
+    if revoked_peers and offer["nodeId"] in revoked_peers:
+        return {"ok": False, "reason": "PEER_REVOKED"}
+
+    # Gateway destination policy (mirrors spec/09 §3 ordering)
+    if offer["capability"] == "INTERNET_GATEWAY" and requirement.get("destination"):
+        host = _extract_host(requirement["destination"])
+
+        if _is_ssrf_target(host):
+            return {"ok": False, "reason": "DESTINATION_BLOCKED_SSRF"}
+        if _is_loopback(host):
+            return {"ok": False, "reason": "DESTINATION_BLOCKED_LOOPBACK"}
+        if _is_link_local(host):
+            return {"ok": False, "reason": "DESTINATION_BLOCKED_LINK_LOCAL"}
+        if _is_private_address(host):
+            return {"ok": False, "reason": "DESTINATION_BLOCKED_PRIVATE"}
+
+        if allowed_destinations and len(allowed_destinations) > 0:
+            if not any(_match_glob(p, host) for p in allowed_destinations):
+                return {"ok": False, "reason": "DESTINATION_NOT_ALLOWED"}
+
+    return {"ok": True, "policyVersion": 1}
+
+
+def verify_svc_vector(data: dict) -> dict:
+    """Verify a V-SVC-* vector (service-negotiation policy check)."""
+    vid = data.get("id", "unknown")
+    reference_now = data["referenceNow"]
+    defaults = data.get("defaults", {})
+    allowed_destinations = defaults.get("allowedDestinations", [])
+    revoked_peers = defaults.get("revokedPeers", [])
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            exp = v["expected"]
+            requirement = inp["requirement"]
+            offer = inp["offer"]
+
+            result = check_service_policy(
+                requirement, offer, reference_now,
+                allowed_destinations, revoked_peers,
+            )
+
+            if exp["result"] == "ok":
+                if not result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected ok, got DENY/{result.get("reason")}'
+                    )
+            else:
+                expected_reason = exp.get("reason")
+                if result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected DENY/{expected_reason}, got ok'
+                    )
+                elif result.get("reason") != expected_reason:
+                    failures.append(
+                        f'{v["name"]}: expected DENY/{expected_reason}, '
+                        f'got DENY/{result.get("reason")}'
+                    )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} svc vectors match",
+        "actual": f"{len(vectors)} svc vectors match" if passed else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# Circuit byte-stability + replay guard (added for R-007 — V-CIRCUIT-001)
+# -----------------------------------------------------------------------
+
+CIRCUIT_ID_DOMAIN = b"SHARENET/CIRCUIT/ID/1"
+CIRCUIT_KEY_DOMAIN = b"SHARENET/CIRCUIT/KEY/1"
+CIRCUIT_AEAD_NONCE_BYTES = 12
+CIRCUIT_HKDF_EXPAND_LEN = 64
+
+
+def derive_circuit_id(route_id: str, initiator_x25519_pubkey: bytes) -> bytes:
+    """CircuitId = BLAKE3-256(SHARENET/CIRCUIT/ID/1 || route_id || initiator_pubkey)."""
+    h = blake3.blake3()
+    h.update(CIRCUIT_ID_DOMAIN)
+    h.update(route_id.encode("utf-8"))
+    h.update(initiator_x25519_pubkey)
+    return h.digest(length=32)
+
+
+def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    """HKDF-Extract per RFC 5869 with SHA-256."""
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def _hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """HKDF-Expand per RFC 5869 with SHA-256."""
+    out = b""
+    t = b""
+    counter = 1
+    while len(out) < length:
+        t = hmac.new(prk, t + info + bytes([counter]), hashlib.sha256).digest()
+        out += t
+        counter += 1
+    return out[:length]
+
+
+def derive_hop_keys(shared_secret: bytes, hop_index: int, circuit_id: bytes) -> tuple:
+    """Derive (forwardingKey, returnKey) via HKDF-SHA256.
+
+    info = utf8(SHARENET/CIRCUIT/KEY/1) || u8(hopIndex) || circuit_id (32 bytes)
+    Output: 64 bytes → forwardingKey[0:32] || returnKey[32:64]
+    """
+    if hop_index < 0 or hop_index > 255:
+        raise ValueError(f"hopIndex out of u8 range: {hop_index}")
+    prk = _hkdf_extract(b"", shared_secret)
+    info = CIRCUIT_KEY_DOMAIN + bytes([hop_index]) + circuit_id
+    expanded = _hkdf_expand(prk, info, CIRCUIT_HKDF_EXPAND_LEN)
+    return expanded[:32], expanded[32:64]
+
+
+def build_circuit_nonce(route_id_prefix: int, sequence_number: int) -> bytes:
+    """Nonce = u32be(routeIdPrefix) || u64be(sequenceNumber)."""
+    return struct.pack(">I", route_id_prefix) + struct.pack(">Q", sequence_number)
+
+
+class CircuitReplayGuard:
+    """Independent implementation of reference/circuit/circuit.ts CircuitReplayGuard.
+
+    Implements the FROZEN ORDERED_STREAM replay model: a receiver rejects any
+    frame whose sequence is `<=` the highest sequence already accepted.
+    """
+
+    def __init__(self):
+        self._highest_seq = 0
+
+    def check_and_record(self, seq: int) -> dict:
+        if seq <= self._highest_seq:
+            return {"ok": False,
+                    "reason": f"sequence {seq} ≤ highest {self._highest_seq} (replay/stale)"}
+        self._highest_seq = seq
+        return {"ok": True}
+
+    @property
+    def highest_seq(self) -> int:
+        return self._highest_seq
+
+
+def verify_circuit_vector(data: dict) -> dict:
+    """Verify a V-CIRCUIT-* vector (circuit id / hop keys / nonce / replay guard)."""
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            name = v["name"]
+            inp = v["input"]
+            exp = v["expected"]
+
+            if name == "circuit-id-deterministic":
+                route_id = inp["routeId"]
+                initiator_pub = bytes.fromhex(inp["initiatorX25519PublicKeyHex"])
+                cid = derive_circuit_id(route_id, initiator_pub)
+                if cid.hex() != exp["circuitIdHex"]:
+                    failures.append(
+                        f'{name}: circuitId {cid.hex()} != {exp["circuitIdHex"]}'
+                    )
+
+            elif name == "hop-keys-deterministic":
+                shared = bytes.fromhex(inp["sharedSecretHex"])
+                hop_index = inp["hopIndex"]
+                cid = bytes.fromhex(inp["circuitIdHex"])
+                fwd, ret = derive_hop_keys(shared, hop_index, cid)
+                if fwd.hex() != exp["forwardingKeyHex"]:
+                    failures.append(
+                        f'{name}: forwardingKey {fwd.hex()} != {exp["forwardingKeyHex"]}'
+                    )
+                if ret.hex() != exp["returnKeyHex"]:
+                    failures.append(
+                        f'{name}: returnKey {ret.hex()} != {exp["returnKeyHex"]}'
+                    )
+
+            elif name == "nonce-layout":
+                prefix = inp["routeIdPrefix"]
+                seq = int(inp["sequenceNumber"])
+                nonce = build_circuit_nonce(prefix, seq)
+                if nonce.hex() != exp["nonceHex"]:
+                    failures.append(
+                        f'{name}: nonce {nonce.hex()} != {exp["nonceHex"]}'
+                    )
+
+            elif name in ("replay-guard-rejects-duplicate",
+                          "replay-guard-rejects-lower"):
+                guard = CircuitReplayGuard()
+                # First call sequence — "checkAndRecord(Nn)" → parse N from the string.
+                first_call = inp["firstCall"]
+                second_call = inp["secondCall"]
+                first_seq = _parse_seq_from_call(first_call)
+                second_seq = _parse_seq_from_call(second_call)
+                r1 = guard.check_and_record(first_seq)
+                if r1["ok"] != (exp["firstResult"] == "ok"):
+                    failures.append(
+                        f'{name}: first call expected {exp["firstResult"]}, '
+                        f'got {"ok" if r1["ok"] else "fail"}'
+                    )
+                r2 = guard.check_and_record(second_seq)
+                if r2["ok"] != (exp["secondResult"] == "ok"):
+                    failures.append(
+                        f'{name}: second call expected {exp["secondResult"]}, '
+                        f'got {"ok" if r2["ok"] else "fail"}'
+                    )
+            else:
+                failures.append(f'{name}: unknown circuit sub-vector')
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} circuit vectors match",
+        "actual": f"{len(vectors)} circuit vectors match" if passed else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+def _parse_seq_from_call(call_str: str) -> int:
+    """Parse a 'checkAndRecord(Nn)' string into an int N."""
+    # Strip trailing 'n' (JS BigInt literal) and surrounding parens.
+    inner = call_str.split("(", 1)[1].rstrip(")")
+    inner = inner.rstrip("n")
+    return int(inner)
+
+
+# -----------------------------------------------------------------------
+# Gateway policy evaluation (added for R-007 — V-GATEWAY-001)
+# -----------------------------------------------------------------------
+
+GATEWAY_QUOTA_WINDOW_MS = 60_000
+
+
+def evaluate_gateway_request(input_req: dict, policy: dict,
+                             capacity: dict, now: int) -> dict:
+    """Independent implementation of reference/gateway/gateway.ts evaluateGatewayRequest.
+
+    Returns ALLOW only if ALL checks pass:
+      1. enabled → 2. peer revoked → 3. allowlist (empty deny-all + glob match)
+      4. SSRF / loopback / link-local / private (BEFORE DNS)
+      5. per-peer quota → 6. global quota → 7. rate limit → 8. bandwidth
+    """
+    destination = input_req["destination"]
+    peer_node_id = input_req["peerNodeId"]
+    requested_bytes = input_req["requestedBytes"]
+    host = _extract_host(destination)
+
+    def deny(reason, detail):
+        return {"decision": "DENY", "reason": reason, "detail": detail,
+                "destination": destination, "peerNodeId": peer_node_id,
+                "decidedAt": now}
+
+    # 1. Gateway enabled
+    if not policy.get("enabled", True):
+        return deny("GATEWAY_DISABLED", "gateway is disabled")
+
+    # 2. Peer revoked
+    if peer_node_id in policy.get("revokedPeers", []):
+        return deny("PEER_REVOKED", f"peer {peer_node_id} is revoked")
+
+    # 3. Destination allowlist
+    allowed = policy.get("allowedDestinations", [])
+    if len(allowed) == 0:
+        return deny("DESTINATION_NOT_ALLOWED",
+                    "no destinations allowed (secure default)")
+    if not any(_match_glob(p, host) for p in allowed):
+        return deny("DESTINATION_NOT_ALLOWED",
+                    f"host {host} not in allowlist")
+
+    # 4. SSRF / loopback / link-local / private blocking (BEFORE DNS)
+    if policy.get("blockSsrf") and _is_ssrf_target(host):
+        return deny("DESTINATION_BLOCKED_SSRF", f"SSRF-sensitive: {host}")
+    if policy.get("blockLoopback") and _is_loopback(host):
+        return deny("DESTINATION_BLOCKED_LOOPBACK", f"loopback: {host}")
+    if policy.get("blockLinkLocal") and _is_link_local(host):
+        return deny("DESTINATION_BLOCKED_LINK_LOCAL", f"link-local: {host}")
+    if policy.get("blockPrivateAddresses") and _is_private_address(host):
+        return deny("DESTINATION_BLOCKED_PRIVATE", f"private address: {host}")
+
+    # Reset window if expired (mirror TS side-effects)
+    if now - capacity["windowStart"] > GATEWAY_QUOTA_WINDOW_MS:
+        capacity["windowStart"] = now
+        capacity["globalCount"] = 0
+        capacity["perPeerCounts"] = {}
+    if now - capacity["secondStart"] > 1000:
+        capacity["secondStart"] = now
+        capacity["bytesThisSecond"] = 0
+
+    # 5. Per-peer quota
+    peer_count = capacity["perPeerCounts"].get(peer_node_id, 0)
+    if peer_count >= policy["perPeerQuota"]:
+        return deny("PER_PEER_QUOTA_EXHAUSTED",
+                    f"peer {peer_node_id} has {peer_count}/{policy['perPeerQuota']} requests")
+
+    # 6. Global quota
+    if capacity["globalCount"] >= policy["globalQuota"]:
+        return deny("GLOBAL_QUOTA_EXHAUSTED",
+                    f"global {capacity['globalCount']}/{policy['globalQuota']} requests")
+
+    # 7. Rate limit (per-peer, per-second)
+    last_req = capacity["lastRequestPerPeer"].get(peer_node_id, 0)
+    if now - last_req < 1000 / policy["rateLimitPerSec"]:
+        return deny("RATE_LIMIT_EXCEEDED",
+                    f"peer {peer_node_id} rate-limited")
+
+    # 8. Bandwidth
+    if capacity["bytesThisSecond"] + requested_bytes > policy["bandwidthBps"]:
+        total = capacity["bytesThisSecond"] + requested_bytes
+        return deny("BANDWIDTH_EXCEEDED",
+                    f"bandwidth {total}/{policy['bandwidthBps']} bytes/s")
+
+    # ALL checks passed — ALLOW. Update capacity tracking.
+    capacity["perPeerCounts"][peer_node_id] = peer_count + 1
+    capacity["globalCount"] = capacity["globalCount"] + 1
+    capacity["lastRequestPerPeer"][peer_node_id] = now
+    capacity["bytesThisSecond"] = capacity["bytesThisSecond"] + requested_bytes
+
+    return {"decision": "ALLOW", "detail": "all guards passed",
+            "destination": destination, "peerNodeId": peer_node_id,
+            "decidedAt": now}
+
+
+def verify_gateway_vector(data: dict) -> dict:
+    """Verify a V-GATEWAY-* vector (gateway policy evaluation)."""
+    vid = data.get("id", "unknown")
+    now_ms = data["referenceNowMs"]
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            exp = v["expected"]
+            request = inp["request"]
+            policy = inp["policy"]
+
+            # Fresh capacity per case (no state leakage between cases).
+            capacity = {
+                "perPeerCounts": {},
+                "globalCount": 0,
+                "windowStart": now_ms,
+                "lastRequestPerPeer": {},
+                "bytesThisSecond": 0,
+                "secondStart": now_ms,
+            }
+
+            result = evaluate_gateway_request(request, policy, capacity, now_ms)
+
+            if exp["decision"] == "ALLOW":
+                if result["decision"] != "ALLOW":
+                    failures.append(
+                        f'{v["name"]}: expected ALLOW, '
+                        f'got DENY/{result.get("reason")}'
+                    )
+            else:
+                expected_reason = exp.get("reason")
+                if result["decision"] != "DENY":
+                    failures.append(
+                        f'{v["name"]}: expected DENY/{expected_reason}, got ALLOW'
+                    )
+                elif result.get("reason") != expected_reason:
+                    failures.append(
+                        f'{v["name"]}: expected DENY/{expected_reason}, '
+                        f'got DENY/{result.get("reason")}'
+                    )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} gateway vectors match",
+        "actual": f"{len(vectors)} gateway vectors match" if passed else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# Bilateral receipt verification (added for R-007 — V-RECEIPT-001)
+# -----------------------------------------------------------------------
+
+RECEIPT_DOMAIN = b"SHARENET/CONTRIBUTION/RECEIPT/1"
+
+
+def receipt_signing_payload(receipt: dict) -> bytes:
+    """Compute the bytes-to-be-signed for a bilateral receipt body.
+
+    Body canonical CBOR map (integer keys per ADR-0004):
+      1=receiptId, 2=gatewayNodeId, 3=peerNodeId, 4=destination,
+      5=bytesSent, 6=bytesReceived, 7=sessionStart, 8=sessionEnd, 9=httpStatus
+    """
+    m = {
+        1: receipt["receiptId"],
+        2: receipt["gatewayNodeId"],
+        3: receipt["peerNodeId"],
+        4: receipt["destination"],
+        5: receipt["bytesSent"],
+        6: receipt["bytesReceived"],
+        7: receipt["sessionStart"],
+        8: receipt["sessionEnd"],
+        9: receipt["httpStatus"],
+    }
+    return RECEIPT_DOMAIN + canonical_cbor_encode(m)
+
+
+def verify_bilateral_receipt(receipt: dict, gateway_public_key: bytes,
+                             peer_public_key: bytes) -> dict:
+    """Verify BOTH Ed25519 signatures on a bilateral receipt.
+
+    Mirrors reference/economics/contribution.ts — verifyBilateralReceipt:
+      gateway signature checked first, then peer signature.
+    A receipt with only one valid signature is a UNILATERAL claim → NO credit.
+    """
+    payload = receipt_signing_payload(receipt)
+    gateway_sig = bytes.fromhex(receipt["gatewaySignatureHex"])
+    peer_sig = bytes.fromhex(receipt["peerSignatureHex"])
+
+    if len(gateway_sig) != 64 or len(gateway_public_key) != 32:
+        return {"ok": False, "error": "GATEWAY_SIGNATURE_INVALID",
+                "detail": "malformed gateway signature or public key"}
+    try:
+        VerifyKey(gateway_public_key).verify(payload, gateway_sig)
+    except BadSignatureError:
+        return {"ok": False, "error": "GATEWAY_SIGNATURE_INVALID",
+                "detail": "gateway signature invalid"}
+    except Exception as e:
+        return {"ok": False, "error": "GATEWAY_SIGNATURE_INVALID", "detail": str(e)}
+
+    if len(peer_sig) != 64 or len(peer_public_key) != 32:
+        return {"ok": False, "error": "PEER_SIGNATURE_INVALID",
+                "detail": "malformed peer signature or public key"}
+    try:
+        VerifyKey(peer_public_key).verify(payload, peer_sig)
+    except BadSignatureError:
+        return {"ok": False, "error": "PEER_SIGNATURE_INVALID",
+                "detail": "peer signature invalid"}
+    except Exception as e:
+        return {"ok": False, "error": "PEER_SIGNATURE_INVALID", "detail": str(e)}
+
+    return {"ok": True}
+
+
+def verify_receipt_vector(data: dict) -> dict:
+    """Verify a V-RECEIPT-* vector (bilateral receipt signature verification)."""
+    vid = data.get("id", "unknown")
+    shared_keys = data.get("sharedKeys", {})
+    gateway_pubkey = bytes.fromhex(shared_keys["gatewayPublicKeyHex"])
+    peer_pubkey = bytes.fromhex(shared_keys["peerPublicKeyHex"])
+    vectors = data.get("vectors", [])
+    failures = []
+
+    for v in vectors:
+        try:
+            inp = v["input"]
+            exp = v["expected"]
+            intermediate = v.get("intermediate", {})
+            receipt = {
+                "receiptId": inp["receiptId"],
+                "gatewayNodeId": inp["gatewayNodeId"],
+                "peerNodeId": inp["peerNodeId"],
+                "destination": inp["destination"],
+                "bytesSent": inp["bytesSent"],
+                "bytesReceived": inp["bytesReceived"],
+                "sessionStart": inp["sessionStart"],
+                "sessionEnd": inp["sessionEnd"],
+                "httpStatus": inp["httpStatus"],
+                # For valid-receipt, the signatures live under `intermediate`.
+                # For tampered cases, they live under `input` (alongside the
+                # mutated field that the test mutates in place).
+                "gatewaySignatureHex": inp.get("gatewaySignatureHex")
+                    or intermediate.get("gatewaySignatureHex", ""),
+                "peerSignatureHex": inp.get("peerSignatureHex")
+                    or intermediate.get("peerSignatureHex", ""),
+            }
+
+            result = verify_bilateral_receipt(receipt, gateway_pubkey, peer_pubkey)
+
+            if exp["verificationResult"] == "ok":
+                if not result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected ok, '
+                        f'got {result.get("error")}: {result.get("detail")}'
+                    )
+            else:
+                # Expected fail. The test vector carries both a high-level
+                # errorCode label and the actualVerificationResult string.
+                # For tampered-receipt-id, the high-level errorCode is
+                # RECEIPT_BODY_MISMATCH but the actual failure mode is
+                # "gateway signature invalid" (the gateway signature was
+                # made over the original receiptId, not the mutated one).
+                # We accept any signature-invalid failure in that case.
+                expected_code = exp.get("errorCode")
+                if result["ok"]:
+                    failures.append(
+                        f'{v["name"]}: expected fail/{expected_code}, got ok'
+                    )
+                elif expected_code == "RECEIPT_BODY_MISMATCH":
+                    acceptable = ("GATEWAY_SIGNATURE_INVALID",
+                                  "PEER_SIGNATURE_INVALID",
+                                  "RECEIPT_BODY_MISMATCH")
+                    if result.get("error") not in acceptable:
+                        failures.append(
+                            f'{v["name"]}: expected body mismatch, '
+                            f'got {result.get("error")}'
+                        )
+                elif result.get("error") != expected_code:
+                    failures.append(
+                        f'{v["name"]}: expected fail/{expected_code}, '
+                        f'got fail/{result.get("error")}'
+                    )
+        except Exception as e:
+            failures.append(f'{v["name"]}: threw {e}')
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} receipt vectors match",
+        "actual": f"{len(vectors)} receipt vectors match" if passed else f"FAILED: {'; '.join(failures)}",
+    }
 
 
 def main():

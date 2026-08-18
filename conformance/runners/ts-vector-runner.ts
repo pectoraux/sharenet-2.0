@@ -44,6 +44,37 @@ import {
   type RouteAcceptance,
   type RouteHop,
 } from "@reference/routing/route";
+import {
+  createRemoteNodeHint,
+  verifyRemoteNodeHint,
+  hintFromHex,
+  hintToHex,
+  type RemoteNodeHint,
+} from "@reference/topology/remote-node-hint";
+import {
+  checkPolicy,
+  type ServiceRequirement,
+  type CapabilityOffer,
+} from "@reference/routing/service-negotiation";
+import {
+  deriveCircuitId,
+  deriveHopKeys,
+  buildNonce,
+  CircuitReplayGuard,
+} from "@reference/circuit/circuit";
+import {
+  evaluateGatewayRequest,
+  defaultGatewayPolicy,
+  defaultGatewayCapacity,
+  type GatewayPolicy,
+  type GatewayRequestInput,
+  type GatewayCapacity,
+} from "@reference/gateway/gateway";
+import {
+  createBilateralReceipt,
+  verifyBilateralReceipt,
+  type BilateralReceipt,
+} from "@reference/economics/contribution";
 
 interface VectorResult {
   id: string;
@@ -295,6 +326,384 @@ function verifyRouteCommitVector(data: any): VectorResult {
   };
 }
 
+// ---------------------------------------------------------------------------
+// V-HINT-001 — RemoteNodeHint (signed rumor about a peer node).
+// Verifies createRemoteNodeHint output via hintFromHex/hintToHex round-trip
+// AND verifies each mutation case through verifyRemoteNodeHint.
+// ---------------------------------------------------------------------------
+
+function verifyHintVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const reporterPublicKey = hexToBytes(data.sharedKeys.reporterPublicKeyHex);
+  const referenceNow = data.referenceNow;
+  let allOk = true;
+  const failures: string[] = [];
+
+  // Sanity: round-trip the valid hint through hex (exercises hintFromHex + hintToHex).
+  const validCase = vectors.find((v: any) => v.name === "valid-hint");
+  if (validCase?.intermediate?.hintHex) {
+    try {
+      const parsed = hintFromHex(validCase.intermediate.hintHex);
+      const roundTripped = hintToHex(parsed);
+      if (roundTripped !== validCase.intermediate.hintHex) {
+        allOk = false;
+        failures.push(`hint hex round-trip mismatch: ${roundTripped} != ${validCase.intermediate.hintHex}`);
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`hint hex round-trip threw: ${(e as Error).message}`);
+    }
+  }
+
+  for (const v of vectors) {
+    try {
+      const input = v.input;
+      // The signature field name varies across cases (the mutation vectors
+      // attach the mutated signature directly to `input`, while the valid
+      // case keeps it in `intermediate`).
+      const signatureHex =
+        input.tamperedReporterSignatureHex ??
+        input.reporterSignatureHex ??
+        v.intermediate?.reporterSignatureHex;
+      if (!signatureHex) {
+        throw new Error("no reporter signature found in vector input");
+      }
+      // Reconstruct the hint object directly. The brand is preserved so
+      // verifyRemoteNodeHint exercises its runtime verification path
+      // (the constructor's input validation is intentionally bypassed
+      // so we can test mutated fields like hopCount=4).
+      const hint: RemoteNodeHint = {
+        __brand: "RemoteNodeHint",
+        reporterNodeId: input.reporterNodeId,
+        subjectNodeId: input.subjectNodeId,
+        subjectEndpointHint: input.subjectEndpointHint,
+        claimedCapabilities: input.claimedCapabilities,
+        hopCount: input.hopCount,
+        timestamp: input.timestamp,
+        nonce: hexToBytes(input.nonceHex),
+        reporterSignature: hexToBytes(signatureHex),
+      };
+      const result = verifyRemoteNodeHint(hint, reporterPublicKey, referenceNow);
+      const expected = v.expected;
+      let caseOk: boolean;
+      if (expected.verificationResult === "ok") {
+        caseOk = result.ok === true;
+      } else {
+        // Expected fail — compare the actual reason to the
+        // actualVerificationResult string (after stripping the "fail/" prefix).
+        if (!result.ok) {
+          const expectedReason = String(expected.actualVerificationResult).replace(/^fail\//, "");
+          caseOk = result.reason === expectedReason;
+        } else {
+          caseOk = false;
+        }
+      }
+      if (!caseOk) {
+        allOk = false;
+        failures.push(`${v.name}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(result)}`);
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} hint cases match`,
+    actual: allOk ? `${vectors.length} hint cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// V-SVC-001 — Service negotiation policy check (checkPolicy).
+// Exercises the gateway-capability branch: capability match, SSRF/private
+// blocking, allowlist enforcement.
+// ---------------------------------------------------------------------------
+
+function verifyServiceNegotiationVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const now = data.referenceNow;
+  const allowedDestinations: readonly string[] | undefined = data.defaults?.allowedDestinations;
+  const revokedPeers: readonly string[] | undefined = data.defaults?.revokedPeers;
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const reqInput = v.input.requirement;
+      const offerInput = v.input.offer;
+      const requirement: ServiceRequirement = {
+        requiredCapability: reqInput.requiredCapability,
+        destination: reqInput.destination,
+        maxHops: reqInput.maxHops,
+        bandwidthBps: reqInput.bandwidthBps,
+        expiry: reqInput.expiry,
+      };
+      const offer: CapabilityOffer = {
+        nodeId: offerInput.nodeId,
+        capability: offerInput.capability,
+        endpoints: offerInput.endpoints,
+        linkUp: offerInput.linkUp,
+        advVerifiedOnly: offerInput.advVerifiedOnly,
+      };
+      const result = checkPolicy(requirement, offer, now, allowedDestinations, revokedPeers);
+      const expected = v.expected;
+      let caseOk: boolean;
+      if (expected.result === "ok") {
+        caseOk = result.ok === true && result.policyVersion === expected.policyVersion;
+      } else {
+        caseOk = !result.ok && result.reason === expected.reason;
+      }
+      if (!caseOk) {
+        allOk = false;
+        failures.push(`${v.name}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(result)}`);
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} service-negotiation cases match`,
+    actual: allOk ? `${vectors.length} service-negotiation cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// V-CIRCUIT-001 — Circuit ID, hop keys, nonce layout, replay guard.
+// Each case is a distinct cryptographic primitive; we dispatch by `name`.
+// ---------------------------------------------------------------------------
+
+function verifyCircuitVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      let caseOk = false;
+      const input = v.input;
+      const expected = v.expected;
+
+      if (v.name === "circuit-id-deterministic") {
+        const routeId: string = input.routeId;
+        const initiatorPub = hexToBytes(input.initiatorX25519PublicKeyHex);
+        const circuitId = deriveCircuitId(routeId, initiatorPub);
+        const circuitIdHex = toHex(circuitId);
+        caseOk =
+          circuitIdHex === expected.circuitIdHex &&
+          circuitId.length === expected.circuitIdLengthBytes;
+        if (!caseOk) {
+          failures.push(`${v.name}: circuitId ${circuitIdHex} (len=${circuitId.length}) != ${expected.circuitIdHex}`);
+        }
+      } else if (v.name === "hop-keys-deterministic") {
+        const sharedSecret = hexToBytes(input.sharedSecretHex);
+        const hopIndex: number = input.hopIndex;
+        const circuitId = hexToBytes(input.circuitIdHex);
+        const { forwardingKey, returnKey } = deriveHopKeys(sharedSecret, hopIndex, circuitId);
+        const fwdHex = toHex(forwardingKey);
+        const retHex = toHex(returnKey);
+        caseOk =
+          fwdHex === expected.forwardingKeyHex &&
+          retHex === expected.returnKeyHex &&
+          forwardingKey.length === expected.keyLengthBytes;
+        if (!caseOk) {
+          failures.push(`${v.name}: fwd=${fwdHex} ret=${retHex} (expected fwd=${expected.forwardingKeyHex} ret=${expected.returnKeyHex})`);
+        }
+      } else if (v.name === "nonce-layout") {
+        const routeIdPrefix: number = input.routeIdPrefix;
+        const sequenceNumber = BigInt(input.sequenceNumber);
+        const nonce = buildNonce(routeIdPrefix, sequenceNumber);
+        const nonceHex = toHex(nonce);
+        caseOk =
+          nonceHex === expected.nonceHex &&
+          nonce.length === expected.nonceLengthBytes;
+        if (!caseOk) {
+          failures.push(`${v.name}: nonce ${nonceHex} (len=${nonce.length}) != ${expected.nonceHex}`);
+        }
+      } else if (v.name === "replay-guard-rejects-duplicate" || v.name === "replay-guard-rejects-lower") {
+        const guard = new CircuitReplayGuard();
+        const firstSeq = parseCallSeq(input.firstCall);
+        const secondSeq = parseCallSeq(input.secondCall);
+        const firstResult = guard.checkAndRecord(firstSeq);
+        const secondResult = guard.checkAndRecord(secondSeq);
+        const firstExpectedOk = expected.firstResult === "ok";
+        const secondExpectedOk = expected.secondResult === "ok";
+        caseOk = firstResult.ok === firstExpectedOk && secondResult.ok === secondExpectedOk;
+        if (caseOk && !secondResult.ok && expected.secondReason) {
+          // Verify the second-result reason mentions both seq numbers
+          // (the failing seq and the highest-so-far seq).
+          caseOk = secondResult.reason.includes(String(secondSeq)) && secondResult.reason.includes(String(firstSeq));
+        }
+        if (!caseOk) {
+          failures.push(`${v.name}: first=${JSON.stringify(firstResult)} second=${JSON.stringify(secondResult)}`);
+        }
+      } else {
+        throw new Error(`unknown circuit case name: ${v.name}`);
+      }
+
+      if (!caseOk) {
+        allOk = false;
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} circuit cases match`,
+    actual: allOk ? `${vectors.length} circuit cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+/** Parse `checkAndRecord(Nn)` → BigInt(N). Used by the circuit replay-guard cases. */
+function parseCallSeq(call: string): bigint {
+  const m = /checkAndRecord\(\s*(\d+)n?\s*\)/.exec(call);
+  if (!m) throw new Error(`could not parse checkAndRecord call: ${call}`);
+  return BigInt(m[1]);
+}
+
+// ---------------------------------------------------------------------------
+// V-GATEWAY-001 — Gateway policy evaluation (evaluateGatewayRequest).
+// Each case uses a FRESH GatewayCapacity (no state leakage between cases).
+// ---------------------------------------------------------------------------
+
+function verifyGatewayVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const now: number = data.referenceNowMs;
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const reqInput = v.input.request;
+      const polInput = v.input.policy;
+      const input: GatewayRequestInput = {
+        peerNodeId: reqInput.peerNodeId,
+        destination: reqInput.destination,
+        requestedBytes: reqInput.requestedBytes,
+      };
+      const policy: GatewayPolicy = {
+        allowedDestinations: polInput.allowedDestinations,
+        blockPrivateAddresses: polInput.blockPrivateAddresses,
+        blockLoopback: polInput.blockLoopback,
+        blockLinkLocal: polInput.blockLinkLocal,
+        blockSsrf: polInput.blockSsrf,
+        perPeerQuota: polInput.perPeerQuota,
+        globalQuota: polInput.globalQuota,
+        rateLimitPerSec: polInput.rateLimitPerSec,
+        bandwidthBps: polInput.bandwidthBps,
+        revokedPeers: polInput.revokedPeers,
+        enabled: polInput.enabled,
+      };
+      // Fresh capacity per case — no state leakage between cases.
+      const capacity: GatewayCapacity = defaultGatewayCapacity();
+      const result = evaluateGatewayRequest(input, policy, capacity, now);
+      const expected = v.expected;
+      let caseOk: boolean;
+      if (expected.decision === "ALLOW") {
+        caseOk = result.decision === "ALLOW";
+      } else {
+        caseOk = result.decision === "DENY" && result.reason === expected.reason;
+      }
+      if (!caseOk) {
+        allOk = false;
+        failures.push(`${v.name}: expected decision=${expected.decision} reason=${expected.reason ?? "(n/a)"}, got decision=${result.decision} reason=${result.reason ?? "(n/a)"}`);
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} gateway cases match`,
+    actual: allOk ? `${vectors.length} gateway cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// V-RECEIPT-001 — Bilateral receipt verification (createBilateralReceipt,
+// verifyBilateralReceipt). A receipt with only one valid signature is a
+// UNILATERAL claim — it creates NO credit (spec/11).
+// ---------------------------------------------------------------------------
+
+function verifyReceiptVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const gatewayPublicKey = hexToBytes(data.sharedKeys.gatewayPublicKeyHex);
+  const peerPublicKey = hexToBytes(data.sharedKeys.peerPublicKeyHex);
+
+  // The valid-receipt case keeps its signatures under `intermediate`. The
+  // mutation cases override them (or the receiptId) directly under `input`.
+  // We fall back to the valid case's signatures when the mutation case
+  // doesn't override them (which is how `tampered-receipt-id` works: both
+  // signatures are unchanged, but the receipt body is mutated).
+  const validCase = vectors.find((v: any) => v.name === "valid-receipt");
+  const defaultGatewaySigHex = validCase?.intermediate?.gatewaySignatureHex;
+  const defaultPeerSigHex = validCase?.intermediate?.peerSignatureHex;
+
+  let allOk = true;
+  const failures: string[] = [];
+
+  for (const v of vectors) {
+    try {
+      const input = v.input;
+      const gatewaySigHex = input.gatewaySignatureHex ?? defaultGatewaySigHex;
+      const peerSigHex = input.peerSignatureHex ?? defaultPeerSigHex;
+      if (!gatewaySigHex || !peerSigHex) {
+        throw new Error("missing gateway/peer signature");
+      }
+      const receipt: BilateralReceipt = {
+        receiptId: input.receiptId,
+        gatewayNodeId: input.gatewayNodeId,
+        peerNodeId: input.peerNodeId,
+        destination: input.destination,
+        bytesSent: input.bytesSent,
+        bytesReceived: input.bytesReceived,
+        sessionStart: input.sessionStart,
+        sessionEnd: input.sessionEnd,
+        httpStatus: input.httpStatus,
+        gatewaySignature: hexToBytes(gatewaySigHex),
+        peerSignature: hexToBytes(peerSigHex),
+      };
+      const result = verifyBilateralReceipt(receipt, gatewayPublicKey, peerPublicKey);
+      const expected = v.expected;
+      let caseOk: boolean;
+      if (expected.verificationResult === "ok") {
+        caseOk = result.ok === true;
+      } else {
+        // Expected fail — compare the actual reason to the
+        // actualVerificationResult string (after stripping "fail/" prefix).
+        if (!result.ok) {
+          const expectedReason = String(expected.actualVerificationResult).replace(/^fail\//, "");
+          caseOk = result.reason === expectedReason;
+        } else {
+          caseOk = false;
+        }
+      }
+      if (!caseOk) {
+        allOk = false;
+        failures.push(`${v.name}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(result)}`);
+      }
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} receipt cases match`,
+    actual: allOk ? `${vectors.length} receipt cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
 // Main
 const files = walkJsonFiles(vectorsDir);
 const results: VectorResult[] = [];
@@ -321,6 +730,16 @@ for (const file of files) {
     result = verifyHandshakeVector(data);
   } else if (data.id?.startsWith("V-ROUTE-COMMIT-")) {
     result = verifyRouteCommitVector(data);
+  } else if (data.id?.startsWith("V-HINT-")) {
+    result = verifyHintVector(data);
+  } else if (data.id?.startsWith("V-SVC-")) {
+    result = verifyServiceNegotiationVector(data);
+  } else if (data.id?.startsWith("V-CIRCUIT-")) {
+    result = verifyCircuitVector(data);
+  } else if (data.id?.startsWith("V-GATEWAY-")) {
+    result = verifyGatewayVector(data);
+  } else if (data.id?.startsWith("V-RECEIPT-")) {
+    result = verifyReceiptVector(data);
   } else if (data.id === "MANIFEST" || data.file === "MANIFEST.json") {
     // Manifest is metadata, not a protocol vector — skip it
     result = { id: data.id ?? file, passed: true, expected: "manifest metadata", actual: "manifest (not a protocol vector)" };

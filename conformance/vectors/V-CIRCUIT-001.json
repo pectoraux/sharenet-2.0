@@ -1,0 +1,85 @@
+{
+  "id": "V-CIRCUIT-001",
+  "status": "draft",
+  "spec": "spec/08-circuits.md, spec/00 §24, GATE-06",
+  "adr": "adr/0017-protocol-freeze-reconciliation.md (ORDERED_STREAM replay model frozen before R-009)",
+  "description": "Circuit byte-stability + replay guard. CircuitId = BLAKE3-256(SHARENET/CIRCUIT/ID/1 || route_id || initiator_x25519_pubkey). Per-hop AEAD keys are HKDF-SHA256-extracted from the X25519 shared secret, expanded with info = SHARENET/CIRCUIT/KEY/1 || u8(hopIndex) || circuit_id. Nonce layout = 4-byte route_id_prefix (BE) || 8-byte sequence (BE). Replay model = ORDERED_STREAM (strictly increasing, no out-of-order window).",
+  "constants": {
+    "circuitIdDomain": "SHARENET/CIRCUIT/ID/1",
+    "circuitKeyDomain": "SHARENET/CIRCUIT/KEY/1",
+    "replayModel": "ORDERED_STREAM",
+    "aeadNonceBytes": 12,
+    "hopKeyInfoLayout": "utf8(SHARENET/CIRCUIT/KEY/1) || u8(hopIndex) || circuit_id (32 bytes)",
+    "hkdfExtract": "HKDF-Extract(salt=empty, ikm=sharedSecret) via SHA-256",
+    "hkdfExpandLen": 64
+  },
+  "vectors": [
+    {
+      "name": "circuit-id-deterministic",
+      "description": "deriveCircuitId(routeId, initiatorX25519PublicKey) MUST produce a byte-stable 32-byte BLAKE3-256 output. The routeId here is the V-ROUTE-COMMIT-001 single-hop commitment root so the vectors cross-reference.",
+      "input": {
+        "routeId": "route:5eda2d028c04622ab972ec6f800dcffb5a6ab9a2f7095e0e832b2922db32d8b9",
+        "initiatorX25519PublicKeyHex": "11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff"
+      },
+      "expected": {
+        "circuitIdHex": "977d13d6875d8e05ac3a4fb759571b88d00ee708fffba7592d8ce6f6fbc717f6",
+        "circuitIdLengthBytes": 32
+      }
+    },
+    {
+      "name": "hop-keys-deterministic",
+      "description": "deriveHopKeys(sharedSecret, hopIndex, circuitId) MUST produce byte-stable 32-byte forwarding + return keys via HKDF-SHA256. info = utf8(SHARENET/CIRCUIT/KEY/1) || u8(hopIndex) || circuitId.",
+      "input": {
+        "sharedSecretHex": "deadbeefcafef00dba5e1f15feedface1234567890abcdef1234567890abcdef",
+        "hopIndex": 2,
+        "circuitIdHex": "977d13d6875d8e05ac3a4fb759571b88d00ee708fffba7592d8ce6f6fbc717f6"
+      },
+      "expected": {
+        "forwardingKeyHex": "2815bcd6574deeae4e4e87cc717be769788e3577e5b87c8e5f5de6c8c63337d7",
+        "returnKeyHex": "b5945f8bb4bc44773eb52aac77dbb23de94ccc769448e459481780cd8d232ff8",
+        "keyLengthBytes": 32
+      }
+    },
+    {
+      "name": "nonce-layout",
+      "description": "buildNonce(routeIdPrefix, sequenceNumber) returns 12 bytes: bytes 0-3 = u32be(routeIdPrefix), bytes 4-11 = u64be(sequenceNumber). The route_id_prefix binds the nonce to a specific circuit; the sequence number provides per-circuit replay protection.",
+      "input": {
+        "routeIdPrefix": 3735928559,
+        "sequenceNumber": "1234605616436508552"
+      },
+      "expected": {
+        "nonceHex": "deadbeef1122334455667788",
+        "nonceLengthBytes": 12,
+        "layout": "u32be(routeIdPrefix) || u64be(sequenceNumber)"
+      }
+    },
+    {
+      "name": "replay-guard-rejects-duplicate",
+      "description": "ORDERED_STREAM replay model: a fresh guard accepts checkAndRecord(1n). A second checkAndRecord(1n) (same sequence) MUST fail because seq ≤ highestSeq.",
+      "input": {
+        "firstCall": "checkAndRecord(1n)",
+        "secondCall": "checkAndRecord(1n)"
+      },
+      "expected": {
+        "firstResult": "ok",
+        "secondResult": "fail",
+        "secondReason": "sequence 1 ≤ highest 1 (replay/stale)"
+      }
+    },
+    {
+      "name": "replay-guard-rejects-lower",
+      "description": "ORDERED_STREAM replay model: checkAndRecord(5n) succeeds (highestSeq = 5). A subsequent checkAndRecord(3n) MUST fail because 3n ≤ 5n. There is no out-of-order / sliding-window acceptance (gap tolerance = 0).",
+      "input": {
+        "firstCall": "checkAndRecord(5n)",
+        "secondCall": "checkAndRecord(3n)"
+      },
+      "expected": {
+        "firstResult": "ok",
+        "secondResult": "fail",
+        "secondReason": "sequence 3 ≤ highest 5 (replay/stale)"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/circuit/circuit.ts — deriveCircuitId, deriveHopKeys, buildNonce, CircuitReplayGuard.",
+  "notes": "The fixed X25519 public key in circuit-id-deterministic is a deterministic test value — it is NOT the public half of any seed in this repo, and it is not used for ECDH. The sharedSecret in hop-keys-deterministic is a deterministic test value, not the output of any specific ECDH operation."
+}

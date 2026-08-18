@@ -1,0 +1,116 @@
+{
+  "id": "V-HINT-001",
+  "status": "draft",
+  "spec": "spec/06-topology.md §3, §4.2, §4.3; ADR-0007",
+  "description": "RemoteNodeHint — signed claim that one node makes about another. A hint is NEVER an AuthenticatedNodeRecord; verifying it only confirms the reporter's signature over the claimed body. The hint-to-record promotion path is FORBIDDEN (guarded by PROMOTE_HINT_TO_RECORD_FORBIDDEN).",
+  "constants": {
+    "hintSignatureDomain": "SHARENET/HINT/1",
+    "maxHintHops": 3,
+    "maxHintFreshnessSeconds": 3600,
+    "nonceLengthBytes": 16
+  },
+  "referenceNow": 1786876545,
+  "sharedKeys": {
+    "reporterPublicKeyHex": "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29",
+    "reporterNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+    "subjectNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+    "note": "Public key only — no secret key material is committed in this vector. Reporter's keypair was derived from a fixed test seed inside the generator script for byte stability."
+  },
+  "vectors": [
+    {
+      "name": "valid-hint",
+      "description": "Genuine RemoteNodeHint: reporter signs the canonical hint body, signature verifies under the reporter's public key, hopCount ≤ MAX_HINT_HOPS, timestamp within freshness window.",
+      "input": {
+        "reporterNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+        "subjectNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+        "subjectEndpointHint": "10.0.0.42:7788",
+        "claimedCapabilities": [
+          "MESH_RELAY",
+          "INTERNET_GATEWAY"
+        ],
+        "hopCount": 1,
+        "timestamp": 1786876545,
+        "nonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+      },
+      "intermediate": {
+        "hintHex": "a801783479763337667969366c6d71716d37676b33736b676465737a63326e67646a68327275656e6d6b666e326463326b7a74616b686961027834616368676f766376666533726876636a726f70626f6c75336236776968326e736f33726b7568356d647871353362783279616b71036e31302e302e302e34323a3737383804826a4d4553485f52454c415970494e5445524e45545f474154455741590501061a6a8192810750a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d60858401907d26203b153ebf63e8a4a2326a3e0edb357112f592fc77c1c9a8e83b8ac1fdb768fc030e0e5ccb309ce065f285f5148f699abfcacf53111d7277244289006",
+        "reporterSignatureHex": "1907d26203b153ebf63e8a4a2326a3e0edb357112f592fc77c1c9a8e83b8ac1fdb768fc030e0e5ccb309ce065f285f5148f699abfcacf53111d7277244289006"
+      },
+      "expected": {
+        "verificationResult": "ok",
+        "actualVerificationResult": "ok"
+      }
+    },
+    {
+      "name": "tampered-signature",
+      "description": "One byte of reporterSignature flipped. The canonical body remains unchanged, so the signature no longer matches the body and verification MUST fail.",
+      "input": {
+        "reporterNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+        "subjectNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+        "subjectEndpointHint": "10.0.0.42:7788",
+        "claimedCapabilities": [
+          "MESH_RELAY",
+          "INTERNET_GATEWAY"
+        ],
+        "hopCount": 1,
+        "timestamp": 1786876545,
+        "nonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "tamperedReporterSignatureHex": "e607d26203b153ebf63e8a4a2326a3e0edb357112f592fc77c1c9a8e83b8ac1fdb768fc030e0e5ccb309ce065f285f5148f699abfcacf53111d7277244289006",
+        "mutation": "reporterSignature[0] ^= 0xff"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "SIGNATURE_INVALID",
+        "actualVerificationResult": "fail/reporter signature invalid"
+      }
+    },
+    {
+      "name": "expired-hint",
+      "description": "Hint timestamp is MAX_HINT_FRESHNESS_SECONDS + 60 seconds in the past — outside the freshness window. Verification MUST fail.",
+      "input": {
+        "reporterNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+        "subjectNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+        "subjectEndpointHint": "10.0.0.42:7788",
+        "claimedCapabilities": [
+          "MESH_RELAY",
+          "INTERNET_GATEWAY"
+        ],
+        "hopCount": 1,
+        "timestamp": 1786872885,
+        "nonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "reporterSignatureHex": "1907d26203b153ebf63e8a4a2326a3e0edb357112f592fc77c1c9a8e83b8ac1fdb768fc030e0e5ccb309ce065f285f5148f699abfcacf53111d7277244289006",
+        "mutation": "timestamp = referenceNow - 3660"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "EXPIRED",
+        "actualVerificationResult": "fail/hint outside freshness window"
+      }
+    },
+    {
+      "name": "hop-overflow",
+      "description": "hopCount = 4 (MAX_HINT_HOPS + 1 = 4). The hint was created at hopCount = MAX_HINT_HOPS (the maximum createRemoteNodeHint accepts) and then mutated post-hoc to hopCount = 4. Verification MUST reject.",
+      "input": {
+        "reporterNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+        "subjectNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+        "subjectEndpointHint": "10.0.0.42:7788",
+        "claimedCapabilities": [
+          "MESH_RELAY",
+          "INTERNET_GATEWAY"
+        ],
+        "hopCount": 4,
+        "timestamp": 1786876545,
+        "nonceHex": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "reporterSignatureHex": "e0506bce1e0941947c37c8377d5acb7d7f75e6dff323dfb0a7eee67c57b197b9c67cc30b444f7ad0c2d5454054d67ec0d3422cd52df6c8d87ced6be78ad0850d",
+        "mutation": "hopCount = 3 → 4"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "HOP_COUNT_EXCEEDED",
+        "actualVerificationResult": "fail/hopCount 4 exceeds max 3"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/topology/remote-node-hint.ts — createRemoteNodeHint, hintToHex, verifyRemoteNodeHint.",
+  "notes": "The signature mutation, expired-timestamp mutation, and hop-overflow mutation are constructed by spreading a genuine RemoteNodeHint and overriding a single field. The brand is preserved so verifyRemoteNodeHint still treats the mutated object as a RemoteNodeHint — this exercises the runtime verification path, not the constructor's input validation."
+}

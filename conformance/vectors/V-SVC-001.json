@@ -1,0 +1,153 @@
+{
+  "id": "V-SVC-001",
+  "status": "draft",
+  "spec": "spec/09-internet-gateway.md §3, spec/07-routing.md, GATE-05",
+  "description": "Service negotiation policy check (checkPolicy). Exercises the gateway-capability branch: SSRF blocking, private-address blocking, loopback/link-local blocking, allowlist enforcement, capability matching, and revocation/adv-verified/link-up preconditions. Capability ≠ Policy ≠ Authorization (spec/00 §2).",
+  "referenceNow": 1786876545,
+  "defaults": {
+    "allowedDestinations": [
+      "example.com",
+      "*.sharenet.local"
+    ],
+    "revokedPeers": []
+  },
+  "vectors": [
+    {
+      "name": "valid-policy",
+      "description": "INTERNET_GATEWAY offer matches INTERNET_GATEWAY requirement; destination example.com is in the allowlist and is not SSRF/private/loopback/link-local. checkPolicy returns ok with policyVersion=1.",
+      "input": {
+        "requirement": {
+          "requiredCapability": "INTERNET_GATEWAY",
+          "destination": "example.com:443",
+          "maxHops": 3,
+          "bandwidthBps": 1024,
+          "expiry": 1786880145
+        },
+        "offer": {
+          "nodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+          "capability": "INTERNET_GATEWAY",
+          "endpoints": [
+            "10.0.0.1:7789"
+          ],
+          "linkUp": true,
+          "advVerifiedOnly": false
+        }
+      },
+      "expected": {
+        "result": "ok",
+        "policyVersion": 1,
+        "actualResult": "ok"
+      }
+    },
+    {
+      "name": "ssrf-blocked",
+      "description": "Destination host 169.254.169.254 is the AWS/GCP cloud-metadata endpoint. Even though the offer is valid and the destination is in the allowlist (it isn't here, but even with [\"*\"] it would be blocked), isSsrfTarget returns true and checkPolicy MUST deny with DESTINATION_BLOCKED_SSRF.",
+      "input": {
+        "requirement": {
+          "requiredCapability": "INTERNET_GATEWAY",
+          "destination": "169.254.169.254:80",
+          "maxHops": 3,
+          "bandwidthBps": 1024,
+          "expiry": 1786880145
+        },
+        "offer": {
+          "nodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+          "capability": "INTERNET_GATEWAY",
+          "endpoints": [
+            "10.0.0.1:7789"
+          ],
+          "linkUp": true,
+          "advVerifiedOnly": false
+        }
+      },
+      "expected": {
+        "result": "DENY",
+        "reason": "DESTINATION_BLOCKED_SSRF",
+        "actualResult": "fail/DESTINATION_BLOCKED_SSRF"
+      }
+    },
+    {
+      "name": "private-blocked",
+      "description": "Destination host 10.0.0.1 is an RFC 1918 private address. isPrivateAddress returns true and checkPolicy MUST deny with DESTINATION_BLOCKED_PRIVATE.",
+      "input": {
+        "requirement": {
+          "requiredCapability": "INTERNET_GATEWAY",
+          "destination": "10.0.0.1:80",
+          "maxHops": 3,
+          "bandwidthBps": 1024,
+          "expiry": 1786880145
+        },
+        "offer": {
+          "nodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+          "capability": "INTERNET_GATEWAY",
+          "endpoints": [
+            "10.0.0.1:7789"
+          ],
+          "linkUp": true,
+          "advVerifiedOnly": false
+        }
+      },
+      "expected": {
+        "result": "DENY",
+        "reason": "DESTINATION_BLOCKED_PRIVATE",
+        "actualResult": "fail/DESTINATION_BLOCKED_PRIVATE"
+      }
+    },
+    {
+      "name": "capability-mismatch",
+      "description": "Offer advertises MESH_RELAY but requirement asks for INTERNET_GATEWAY. checkPolicy MUST deny with CAPABILITY_MISMATCH (the precondition check happens before destination policy).",
+      "input": {
+        "requirement": {
+          "requiredCapability": "INTERNET_GATEWAY",
+          "destination": "example.com:443",
+          "maxHops": 3,
+          "bandwidthBps": 1024,
+          "expiry": 1786880145
+        },
+        "offer": {
+          "nodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+          "capability": "MESH_RELAY",
+          "endpoints": [
+            "10.0.0.1:7788"
+          ],
+          "linkUp": true,
+          "advVerifiedOnly": false
+        }
+      },
+      "expected": {
+        "result": "DENY",
+        "reason": "CAPABILITY_MISMATCH",
+        "actualResult": "fail/CAPABILITY_MISMATCH"
+      }
+    },
+    {
+      "name": "not-allowed",
+      "description": "Destination host evil.com is not in the allowlist [\"example.com\", \"*.sharenet.local\"]. checkPolicy MUST deny with DESTINATION_NOT_ALLOWED.",
+      "input": {
+        "requirement": {
+          "requiredCapability": "INTERNET_GATEWAY",
+          "destination": "evil.com:443",
+          "maxHops": 3,
+          "bandwidthBps": 1024,
+          "expiry": 1786880145
+        },
+        "offer": {
+          "nodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+          "capability": "INTERNET_GATEWAY",
+          "endpoints": [
+            "10.0.0.1:7789"
+          ],
+          "linkUp": true,
+          "advVerifiedOnly": false
+        }
+      },
+      "expected": {
+        "result": "DENY",
+        "reason": "DESTINATION_NOT_ALLOWED",
+        "actualResult": "fail/DESTINATION_NOT_ALLOWED"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/routing/service-negotiation.ts — checkPolicy.",
+  "notes": "Allowlist glob supports exact match, '*' (wildcard-any), and '*.suffix' suffix matching. The SSRF check runs BEFORE the allowlist check in the gateway branch — the cloud-metadata endpoint is blocked even when the host appears in the allowlist."
+}

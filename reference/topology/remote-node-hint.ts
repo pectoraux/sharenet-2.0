@@ -15,7 +15,7 @@
  */
 
 import { signMessage, verifySignature, isValidNodeIdFormat } from "../identity/keys";
-import { canonicalEncode, toHex, fromHex } from "../encoding/cbor";
+import { canonicalEncode, canonicalDecode, toHex, fromHex } from "../encoding/cbor";
 
 /** Domain-separation tag for hint signatures. FROZEN per spec/14 §4 + ADR-0017. */
 export const HINT_SIGNATURE_DOMAIN = "SHARENET/HINT/1";

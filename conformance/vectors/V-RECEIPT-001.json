@@ -1,0 +1,127 @@
+{
+  "id": "V-RECEIPT-001",
+  "status": "draft",
+  "spec": "spec/11-contribution.md, GATE-11, spec/00 §2 (Economics)",
+  "description": "Bilateral receipt — mutually-signed attestation that a service session occurred. BOTH the gateway AND the peer sign the receipt body (canonical CBOR map with integer keys, prefixed by the SHARENET/CONTRIBUTION/RECEIPT/1 domain tag). A receipt with only one valid signature is a UNILATERAL claim — it creates NO credit (spec/11).",
+  "constants": {
+    "receiptDomain": "SHARENET/CONTRIBUTION/RECEIPT/1",
+    "bodyEncoding": "canonical CBOR (RFC 8949 §4.2.2), integer-keyed map per ADR-0004",
+    "signingPayload": "utf8(RECEIPT_DOMAIN) || canonicalEncode(bodyMap)",
+    "bodyMapKeys": {
+      "1": "receiptId (string)",
+      "2": "gatewayNodeId (string)",
+      "3": "peerNodeId (string)",
+      "4": "destination (string)",
+      "5": "bytesSent (int)",
+      "6": "bytesReceived (int)",
+      "7": "sessionStart (int)",
+      "8": "sessionEnd (int)",
+      "9": "httpStatus (int)"
+    }
+  },
+  "referenceNow": 1786876545,
+  "sharedKeys": {
+    "gatewayPublicKeyHex": "4cb5abf6ad79fbf5abbccafcc269d85cd2651ed4b885b5869f241aedf0a5ba29",
+    "gatewayNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+    "peerPublicKeyHex": "7422b9887598068e32c4448a949adb290d0f4e35b9e01b0ee5f1a1e600fe2674",
+    "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+    "note": "Public keys only — no secret-key material is committed. Keypairs were derived from fixed test seeds inside the generator script."
+  },
+  "vectors": [
+    {
+      "name": "valid-receipt",
+      "description": "Both gateway and peer sign the canonical receipt body. verifyBilateralReceipt returns ok — both signatures verify against the canonical payload.",
+      "input": {
+        "receiptId": "d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718",
+        "gatewayNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+        "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+        "destination": "example.com:443",
+        "bytesSent": 4096,
+        "bytesReceived": 16384,
+        "sessionStart": 1786876485,
+        "sessionEnd": 1786876545,
+        "httpStatus": 200
+      },
+      "intermediate": {
+        "signingPayloadHex": "53484152454e45542f434f4e545249425554494f4e2f524543454950542f31a90178406431633262336134663565363037313864316332623361346635653630373138643163326233613466356536303731386431633262336134663565363037313802783479763337667969366c6d71716d37676b33736b676465737a63326e67646a68327275656e6d6b666e326463326b7a74616b686961037834616368676f766376666533726876636a726f70626f6c75336236776968326e736f33726b7568356d647871353362783279616b71046f6578616d706c652e636f6d3a3434330519100006194000071a6a819245081a6a8192810918c8",
+        "gatewaySignatureHex": "0752079d32802bf9d2171303be54ce2c035c43a8d79e68db307fc21d1414c2036dc08e9d439472ca19d272b694671e629329f91514f58a979b79544ba2a9660d",
+        "peerSignatureHex": "3739bbd077db5d0e1761e5cf081690c48489873168edefa87279c95d9919fb984c30dd56694a982a72badf7929b61211988dd0158955bf14efcc3d7f6b4b4506"
+      },
+      "expected": {
+        "verificationResult": "ok",
+        "actualVerificationResult": "ok"
+      }
+    },
+    {
+      "name": "tampered-gateway-sig",
+      "description": "One byte of gatewaySignature is flipped. The peerSignature still verifies, but the gatewaySignature no longer matches the canonical payload. verifyBilateralReceipt returns fail with reason 'gateway signature invalid'.",
+      "input": {
+        "receiptId": "d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718",
+        "gatewayNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+        "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+        "destination": "example.com:443",
+        "bytesSent": 4096,
+        "bytesReceived": 16384,
+        "sessionStart": 1786876485,
+        "sessionEnd": 1786876545,
+        "httpStatus": 200,
+        "gatewaySignatureHex": "f852079d32802bf9d2171303be54ce2c035c43a8d79e68db307fc21d1414c2036dc08e9d439472ca19d272b694671e629329f91514f58a979b79544ba2a9660d",
+        "peerSignatureHex": "3739bbd077db5d0e1761e5cf081690c48489873168edefa87279c95d9919fb984c30dd56694a982a72badf7929b61211988dd0158955bf14efcc3d7f6b4b4506",
+        "mutation": "gatewaySignature[0] ^= 0xff"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "GATEWAY_SIGNATURE_INVALID",
+        "actualVerificationResult": "fail/gateway signature invalid"
+      }
+    },
+    {
+      "name": "tampered-peer-sig",
+      "description": "One byte of peerSignature is flipped. The gatewaySignature still verifies, but the peerSignature no longer matches the canonical payload. verifyBilateralReceipt returns fail with reason 'peer signature invalid'.",
+      "input": {
+        "receiptId": "d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718d1c2b3a4f5e60718",
+        "gatewayNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+        "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+        "destination": "example.com:443",
+        "bytesSent": 4096,
+        "bytesReceived": 16384,
+        "sessionStart": 1786876485,
+        "sessionEnd": 1786876545,
+        "httpStatus": 200,
+        "gatewaySignatureHex": "0752079d32802bf9d2171303be54ce2c035c43a8d79e68db307fc21d1414c2036dc08e9d439472ca19d272b694671e629329f91514f58a979b79544ba2a9660d",
+        "peerSignatureHex": "c839bbd077db5d0e1761e5cf081690c48489873168edefa87279c95d9919fb984c30dd56694a982a72badf7929b61211988dd0158955bf14efcc3d7f6b4b4506",
+        "mutation": "peerSignature[0] ^= 0xff"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "PEER_SIGNATURE_INVALID",
+        "actualVerificationResult": "fail/peer signature invalid"
+      }
+    },
+    {
+      "name": "tampered-receipt-id",
+      "description": "receiptId is changed (a different 32-byte hex string). The original signatures no longer match the canonical payload of the mutated receipt, so BOTH signature checks fail. The first to fail (gateway signature) is reported.",
+      "input": {
+        "receiptId": "f0e1d2c3b4a5968778695a4b3c2d1e0f0011223344556677889900aabbccddee",
+        "gatewayNodeId": "yv37fyi6lmqqm7gk3skgdeszc2ngdjh2ruenmkfn2dc2kztakhia",
+        "peerNodeId": "achgovcvfe3rhvcjropbolu3b6wih2nso3rkuh5mdxq53bx2yakq",
+        "destination": "example.com:443",
+        "bytesSent": 4096,
+        "bytesReceived": 16384,
+        "sessionStart": 1786876485,
+        "sessionEnd": 1786876545,
+        "httpStatus": 200,
+        "gatewaySignatureHex": "0752079d32802bf9d2171303be54ce2c035c43a8d79e68db307fc21d1414c2036dc08e9d439472ca19d272b694671e629329f91514f58a979b79544ba2a9660d",
+        "peerSignatureHex": "3739bbd077db5d0e1761e5cf081690c48489873168edefa87279c95d9919fb984c30dd56694a982a72badf7929b61211988dd0158955bf14efcc3d7f6b4b4506",
+        "mutation": "receiptId changed to a different 32-byte hex string"
+      },
+      "expected": {
+        "verificationResult": "fail",
+        "errorCode": "RECEIPT_BODY_MISMATCH",
+        "actualVerificationResult": "fail/gateway signature invalid"
+      }
+    }
+  ],
+  "verification": "Reference implementation: reference/economics/contribution.ts — createBilateralReceipt, verifyBilateralReceipt, receiptSigningPayload.",
+  "notes": "A bilateral receipt is the prerequisite for a ContributionProof (createContributionProof). Self-reported traffic (one signature, or no signature) creates NO credit — see SELF_REPORTED_CONTRIBUTION_FORBIDDEN."
+}
