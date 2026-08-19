@@ -117,12 +117,34 @@ The destroyer proves it is the terminal hop using the same portable proof
 chain established in Stage 2 (`GatewayReturnAuthorization`):
 - **Layer 1 (identity binding):** `verifyNodeIdBinding(destroyerNodeId,
   destroyerEd25519PublicKey)` MUST hold — same two-layer model as initiator.
-- **Layer 2 (role binding):** the terminal `RouteAcceptance` signature
-  (signed by the terminal relay's Ed25519 key, binding `acceptorNodeId` +
-  `hopIndex`); the Merkle inclusion proof (proving the acceptance belongs to
-  `commitmentRoot`); the `routeId` derivation check; `destroyerNodeId`
-  matches the terminal acceptance's `acceptorNodeId`;
-  `destroyerEd25519PublicKey` verifies the acceptance signature.
+- **Layer 2 (role binding via portable proof chain):** the destroyer MUST
+  provide a serialized `GatewayReturnAuthorization` (`gatewayProofBytes`).
+  This is the SAME frozen proof chain from R-009 Stage 2 — the verifier
+  (`verifyTerminalHopProof`) checks from wire bytes alone (no
+  WeakSet/BrandedCommittedRoute dependency):
+  - the terminal `RouteAcceptance` Ed25519 signature (signed by the
+    `relayEd25519PublicKey` embedded in the proof)
+  - the Merkle inclusion proof (proving the acceptance belongs to the
+    `commitmentRoot`)
+  - the `commitmentRoot` matches `circuit.commitmentRoot` (the proof is
+    for THIS circuit's route, not a different route)
+  - the terminal hop identity (`hopIndex == hopNodeIds.length - 1` AND
+    `hopNodeIds[hopIndex] == terminalNodeId`)
+  - the terminal `CircuitSetupAck` Ed25519 signature (signed by the SAME
+    `relayEd25519PublicKey`)
+  - ack freshness (`ackExpiry > now` — defense-in-depth)
+  - the `routeId` derivation check
+  Additionally, the destroy's `destroyerEd25519PublicKey` MUST equal the
+  proof's `relayEd25519PublicKey` (the destroy signer IS the ack/acceptance
+  signer), and the destroy's `destroyerNodeId` MUST equal the proof's
+  `terminalNodeId`.
+
+  This replaces the previous caller-supplied-only check
+  (`destroyerNodeId === expectedGatewayNodeId`) which was insufficient
+  because `expectedGatewayNodeId` is a string parameter with no
+  cryptographic binding to the actual terminal hop (re-audit of 60e4364).
+  `expectedGatewayNodeId` is now checked only as a redundant defense-in-depth.
+  The proof chain is the SOLE authority for gateway authorization.
 
 This reuses the established portable proof model from Stage 2 — no new
 trust infrastructure.
@@ -205,7 +227,65 @@ revoked (the durable revocation record exists) returns success without
 re-consuming the replay nonce. The revocation tombstone is the source of
 truth — if it exists, the destroy is idempotent.
 
-### 7. Expiry as a durable terminal-state transition (fail-closed)
+### 12. CircuitDestroy freshness + clock skew (R-009 Stage 3 Phase 2)
+
+Per the re-audit of 60e4364: `processCircuitDestroy` receives `now` but did
+not enforce `issuedAt` / `expiry`. A validly signed but expired destroy could
+be processed (consuming the nonce + writing the tombstone) even though the
+destroy was stale. The freshness checks MUST be enforced BEFORE nonce
+consumption (so the nonce remains fresh for a valid retry).
+
+**Checks (all BEFORE step 7 — nonce consumption):**
+
+1. `issuedAt <= now + CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS` — the destroy
+   was not issued too far in the future. Permits clock skew between the
+   destroyer's clock and the receiver's clock.
+2. `now < expiry` (strict) — the destroy has not expired. Boundary:
+   `now == expiry` → REJECT (consistent with `circuit.expiry <= now` in
+   `processCircuitWireFrame`).
+3. `expiry <= circuit.expiry` — the destroy's expiry does not exceed the
+   circuit's actual expiry. Prevents an attacker from extending the circuit's
+   lifetime via a destroy with a later expiry.
+
+**Frozen clock skew:** `CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS = 300` (5
+minutes). This is generous for a delay-tolerant network with potentially
+drifted mesh-node clocks, while still being tight enough to prevent
+meaningful future-dated forgery. The skew applies ONLY to the `issuedAt`
+check — the `expiry` checks are strict (no skew).
+
+A validly signed but expired/future-dated destroy is rejected with an
+explicit reason. The nonce is NOT consumed — a retry with a valid (non-expired,
+non-future-dated) destroy with the SAME nonce will succeed.
+
+### 13. Atomic consume-nonce + revoke-tombstone (R-009 Stage 3 Phase 2)
+
+Per the re-audit of 60e4364: the previous design used two separate operations
+(`CircuitDestroyReplayStore.consume()` + `CircuitRevocationStore.revoke()`).
+If the nonce was consumed but the tombstone write failed, the circuit was left
+in a SPLIT security state: the nonce is spent (a retry would be rejected as a
+replay) but there is no tombstone (the circuit is not durably revoked). This
+is unsafe — the operator cannot retry, and the circuit is not durably dead.
+
+**Fix:** a new `CircuitDestroyStore` interface provides a SINGLE ATOMIC
+operation `consumeDestroyAndRevoke()` that consumes the nonce AND writes the
+tombstone in one transaction. Both succeed or both fail. There is no split
+state.
+
+The `processCircuitDestroy` pipeline (step 7) now calls
+`destroyStore.consumeDestroyAndRevoke()` instead of separate `consume()` +
+`revoke()`. The `destroyStore` is REQUIRED (not optional).
+
+**Atomicity guarantee:**
+- If the transaction commits: the nonce is consumed AND the tombstone exists.
+  A subsequent retry is idempotent (the tombstone already exists).
+- If the transaction aborts (persistence failure, unique-constraint violation):
+  NEITHER the nonce is consumed NOR the tombstone exists. The operator can
+  safely retry with the SAME destroy (the nonce is still fresh).
+
+**Durable implementation:** `DurableSqliteCircuitDestroyStore` uses a Prisma
+`$transaction` to atomically insert into `ConsumedCircuitDestroy` + upsert
+into `CircuitRevocation`. If either fails, the entire transaction rolls
+back — no split state.
 
 Expiry is NOT merely a local frame rejection. When `now > valid_until`:
 

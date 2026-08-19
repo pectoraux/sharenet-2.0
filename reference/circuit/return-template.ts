@@ -1671,4 +1671,195 @@ export async function verifyGatewayReturnAuthorization(
   return templateResult;
 }
 
+// -----------------------------------------------------------------------
+// verifyTerminalHopProof — reusable portable terminal-hop identity proof
+// (R-009 Stage 3 Phase 2: gateway destroy authorization)
+// -----------------------------------------------------------------------
+
+/**
+ * Result of verifying a portable terminal-hop identity proof.
+ *
+ * On success, carries the verified `terminalNodeId` + `relayEd25519PublicKey`
+ * so the caller can bind them to the destroyer's claimed identity.
+ */
+export type VerifyTerminalHopProofResult =
+  | { ok: true; terminalNodeId: string; relayEd25519PublicKey: Uint8Array; commitmentRoot: Uint8Array }
+  | { ok: false; reason: string };
+
+/**
+ * Verify the portable terminal-hop identity proof chain — from wire bytes alone.
+ *
+ * This is the IDENTITY-PROOF SUBSET of `verifyGatewayReturnAuthorization`. It
+ * verifies the chain frozen for GatewayReturnAuthorization (R-009 Stage 2):
+ *
+ *   1. Decode the inner GatewayReturnTemplate → extract `commitmentRoot`.
+ *   2. Verify the terminal CircuitSetupAck's Ed25519 signature (using the
+ *      embedded `relayEd25519PublicKey`). Proves the terminal relay signed
+ *      the ack — not forged.
+ *   3. Verify the terminal RouteAcceptance's Ed25519 signature (using the
+ *      SAME `relayEd25519PublicKey`). Proves the relay is the authorized
+ *      terminal hop of the committed route — not an intermediate relay.
+ *   4. Verify the terminalNodeId IS the actual terminal hop:
+ *      `hopIndex === hopNodeIds.length - 1` AND
+ *      `hopNodeIds[hopIndex] === terminalNodeId`. Blocks intermediate-relay
+ *      impersonation of the gateway.
+ *   5. Verify the Merkle inclusion proof: recompute the acceptance leaf from
+ *      the authorization's fields, verify the Merkle proof against the
+ *      `commitmentRoot` from the GatewayReturnTemplate. Proves the acceptance
+ *      is genuinely part of the committed route — not a fabricated acceptance.
+ *   6. Verify `routeId = "route:" + hex(commitmentRoot)` — the routeId in the
+ *      authorization is derived from the same commitmentRoot.
+ *   7. Verify `commitmentRoot === expectedCommitmentRoot` — the proof is for
+ *      THIS circuit's route (not a different route's proof replayed).
+ *   8. Verify the ack is not expired (`ackExpiry > now`) — defense-in-depth;
+ *      the circuit is alive so the ack should be too.
+ *
+ * This function does NOT perform:
+ *   - ECDH decryption of K_ret (return-template-specific — the destroy does
+ *     not carry a return template).
+ *   - Single-use consumption (the destroy has its own replay protection via
+ *     destroyNonce).
+ *   - The initiator's signature over the GatewayReturnTemplate (return-
+ *     template-specific — the destroy is signed by the gateway, not the
+ *     initiator).
+ *
+ * The caller (processCircuitDestroy) MUST additionally verify:
+ *   - `destroyerEd25519PublicKey === proof.relayEd25519PublicKey` (the destroy
+ *     signer is the ack/acceptance signer).
+ *   - `destroyerNodeId === proof.terminalNodeId` (the destroy claimer is the
+ *     terminal hop).
+ *   - `verifyNodeIdBinding(destroyerNodeId, destroyerEd25519PublicKey)`
+ *     (Layer 1 identity binding — the claimed NodeId derives from the key).
+ *
+ * @param authorization - the GatewayReturnAuthorization wire object (decoded)
+ * @param expectedCommitmentRoot - the circuit's commitmentRoot (the proof must
+ *   be for THIS route)
+ * @param now - current time (unix seconds, for ack freshness)
+ */
+export function verifyTerminalHopProof(
+  authorization: GatewayReturnAuthorization,
+  expectedCommitmentRoot: Uint8Array,
+  now: number,
+): VerifyTerminalHopProofResult {
+  // 1. Decode the inner GatewayReturnTemplate → extract commitmentRoot.
+  const decoded = decodeGatewayReturnTemplate(authorization.gatewayTemplateBytes);
+  if (!decoded.ok) {
+    return { ok: false, reason: `failed to decode inner GatewayReturnTemplate: ${decoded.reason}` };
+  }
+  const gt = decoded.gatewayTemplate;
+
+  // 2. Verify the terminal ack's Ed25519 signature.
+  //    Reconstruct the ack signing payload from the template's + authorization's fields.
+  const ackPayload = circuitAckSigningPayload(
+    authorization.routeId,
+    authorization.routeCommitmentDigestHex,
+    authorization.hopIndex,
+    gt.gatewayX25519PublicKey,              // relayX25519PublicKey (from the template)
+    gt.initiatorX25519PublicKey,            // initiatorX25519PublicKey (from the template)
+    authorization.possessionProofCiphertext,
+    authorization.possessionChallenge,
+    authorization.ackNonce,
+    authorization.ackTimestamp,
+    authorization.ackExpiry,
+  );
+  if (!verifySignature(authorization.relayEd25519PublicKey, ackPayload, authorization.relaySignature)) {
+    return { ok: false, reason: "terminal ack signature invalid (forged or tampered proof)" };
+  }
+
+  // 3. Verify the terminal RouteAcceptance's Ed25519 signature.
+  //    The acceptance is the relay's signed agreement to occupy the terminal
+  //    hop. Reconstructed from the authorization's fields, with the
+  //    terminalNodeId (claimed) bound as the acceptorNodeId.
+  const acceptancePayload = routeAcceptanceSigningPayload(
+    fromHex(authorization.acceptanceProposalDigestHex),
+    authorization.hopIndex,
+    fromHex(authorization.acceptanceHopDigestHex),
+    fromHex(authorization.acceptanceServiceDigestHex),
+    authorization.terminalNodeId,
+    authorization.acceptanceNonce,
+    authorization.acceptanceExpiry,
+  );
+  if (!verifySignature(
+    authorization.relayEd25519PublicKey,
+    acceptancePayload,
+    authorization.acceptanceSignature,
+  )) {
+    return { ok: false, reason: "terminal RouteAcceptance signature invalid" };
+  }
+
+  // 4. Verify the terminalNodeId IS the actual terminal hop.
+  //    hopIndex must be the LAST hop (the gateway), AND the hopNodeIds at that
+  //    index must equal the terminalNodeId. Blocks intermediate-relay
+  //    impersonation of the gateway.
+  if (authorization.hopIndex !== authorization.hopNodeIds.length - 1) {
+    return {
+      ok: false,
+      reason: `terminalNodeId is not the terminal hop: hopIndex ${authorization.hopIndex} is not the last index ${authorization.hopNodeIds.length - 1}`,
+    };
+  }
+  if (authorization.hopNodeIds[authorization.hopIndex] !== authorization.terminalNodeId) {
+    return {
+      ok: false,
+      reason: `terminalNodeId is not the terminal hop: hopNodeIds[${authorization.hopIndex}] is "${authorization.hopNodeIds[authorization.hopIndex]}", terminalNodeId is "${authorization.terminalNodeId}"`,
+    };
+  }
+
+  // 5. MERKLE INCLUSION PROOF.
+  //    Recompute the acceptance leaf from the authorization's fields, then
+  //    verify the Merkle proof against the commitmentRoot from the
+  //    GatewayReturnTemplate. If the acceptance is NOT part of the committed
+  //    route, the recomputed root will not match.
+  const acceptanceForProof: RouteAcceptance = {
+    proposalDigestHex: authorization.acceptanceProposalDigestHex,
+    hopIndex: authorization.hopIndex,
+    hopDigestHex: authorization.acceptanceHopDigestHex,
+    serviceDigestHex: authorization.acceptanceServiceDigestHex,
+    acceptorNodeId: authorization.terminalNodeId,
+    acceptanceNonce: authorization.acceptanceNonce,
+    expiry: authorization.acceptanceExpiry,
+    signature: authorization.acceptanceSignature,
+  };
+  const acceptanceLeaf = computeAcceptanceLeafForVerification(acceptanceForProof, authorization.hopIndex);
+  if (!verifyMerkleInclusionProof(acceptanceLeaf, authorization.merkleProof, gt.commitmentRoot)) {
+    return {
+      ok: false,
+      reason: "Merkle inclusion proof failed: terminal acceptance is NOT part of the committed route (acceptance not in commitmentRoot)",
+    };
+  }
+
+  // 6. Verify routeId is derived from commitmentRoot.
+  const expectedRouteId = "route:" + toHex(gt.commitmentRoot);
+  if (authorization.routeId !== expectedRouteId) {
+    return {
+      ok: false,
+      reason: `routeId does not match commitmentRoot: expected "${expectedRouteId}", got "${authorization.routeId}"`,
+    };
+  }
+
+  // 7. Verify the proof's commitmentRoot matches the expected (THIS circuit's) commitmentRoot.
+  //    This blocks replaying a terminal-hop proof from a DIFFERENT route
+  //    against this circuit.
+  if (!bytesEqual(gt.commitmentRoot, expectedCommitmentRoot)) {
+    return {
+      ok: false,
+      reason: "proof commitmentRoot does not match the circuit's commitmentRoot (proof is for a different route)",
+    };
+  }
+
+  // 8. Verify the ack is not expired (defense-in-depth).
+  if (authorization.ackExpiry <= now) {
+    return {
+      ok: false,
+      reason: `terminal ack expired: ackExpiry ${authorization.ackExpiry} ≤ now ${now}`,
+    };
+  }
+
+  return {
+    ok: true,
+    terminalNodeId: authorization.terminalNodeId,
+    relayEd25519PublicKey: authorization.relayEd25519PublicKey,
+    commitmentRoot: gt.commitmentRoot,
+  };
+}
+
 export { toHex };

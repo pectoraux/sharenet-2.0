@@ -502,14 +502,32 @@ public NodeId string could sign a forged destroy with their own keypair
 `destroyerNodeId` to the legitimate value; the signature would verify
 (against the attacker's own pubkey) and the role check below would pass.
 - **Layer 2 (role binding):** for INITIATOR, `destroyerNodeId` MUST equal
-  the circuit's `expectedInitiatorNodeId`; for GATEWAY, `destroyerNodeId`
-  MUST equal `expectedGatewayNodeId` (with the portable terminal-hop proof
-  chain from Stage 2).
+  the circuit's `expectedInitiatorNodeId`; for GATEWAY, the destroyer MUST
+  provide a serialized `GatewayReturnAuthorization` (`gatewayProofBytes`)
+  whose portable terminal-hop proof chain verifies — the terminal
+  `RouteAcceptance` signature → Merkle inclusion → `commitmentRoot` matches
+  `circuit.commitmentRoot` → terminal hop identity → terminal
+  `CircuitSetupAck` signature → `relayEd25519PublicKey` matches the destroy's
+  `destroyerEd25519PublicKey`. The proof works from wire bytes alone (no
+  WeakSet/BrandedCommittedRoute). `expectedGatewayNodeId` is checked only as
+  a redundant defense-in-depth (re-audit of 60e4364 — the proof chain is the
+  SOLE authority for gateway authorization).
 
 The portable verifier `verifyCircuitDestroy()` performs the signature
 check only; Layer 1 + Layer 2 are enforced by `processCircuitDestroy()`
 (which has the circuit context). This preserves the portable verifier's
 structure-only contract.
+
+**Freshness (R-009 Stage 3 Phase 2 — re-audit of 60e4364):**
+`processCircuitDestroy` enforces, BEFORE nonce consumption:
+1. `issuedAt <= now + CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS` (300s, FROZEN) —
+   not future-dated beyond clock skew.
+2. `now < expiry` (strict; `now == expiry` → REJECT) — not expired.
+3. `expiry <= circuit.expiry` — does not exceed the circuit's actual expiry.
+
+A validly signed but expired/future-dated destroy is rejected with an explicit
+reason. The nonce is NOT consumed — a retry with a valid destroy (same nonce)
+will succeed.
 
 **Reason codes:**
 - `0x01` = `OPERATOR_INITIATED`
@@ -518,10 +536,12 @@ structure-only contract.
 - `0x04` = `GATEWAY_DISAPPEARANCE`
 - `0x05` = `PROTOCOL_VIOLATION`
 
-**Replay protection:** Each participant durably consumes
-`(commitmentRoot, circuitId, destroyNonce)` — a separate namespace from
-setup-ack consumption. A replayed destroy is rejected unless the circuit
-is already revoked (idempotent).
+**Replay protection (R-009 Stage 3 Phase 2 — atomic):** Each participant
+atomically consumes `(commitmentRoot, circuitId, destroyNonce)` AND writes
+the revocation tombstone in a SINGLE durable transaction
+(`CircuitDestroyStore.consumeDestroyAndRevoke()`). Both succeed or both
+fail — no split security state. A replayed destroy is rejected unless the
+circuit is already revoked (idempotent — the tombstone already exists).
 
 ## 7. Invariants
 

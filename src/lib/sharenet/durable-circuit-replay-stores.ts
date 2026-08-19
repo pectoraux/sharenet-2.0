@@ -286,3 +286,159 @@ export class DurableSqliteCircuitDestroyReplayStore implements CircuitDestroyRep
     }
   }
 }
+
+// -----------------------------------------------------------------------
+// DurableSqliteCircuitDestroyStore (R-009 Stage 3 Phase 2 — atomic)
+// -----------------------------------------------------------------------
+
+import type {
+  CircuitDestroyStore,
+  ConsumeDestroyAndRevokeResult,
+} from "@reference/circuit/replay-stores";
+
+/**
+ * Durable SQLite-backed implementation of `CircuitDestroyStore`.
+ *
+ * Per the re-audit of 60e4364 (R-009 Stage 3 Phase 2): the previous design
+ * used two separate operations (`revoke()` + `consume()`) that could leave
+ * a SPLIT security state if one succeeded and the other failed. This
+ * implementation uses a single Prisma `$transaction` to atomically:
+ *   1. Insert into `ConsumedCircuitDestroy` (unique constraint on
+ *      `(commitmentRootHex, circuitIdHex, destroyNonceHex)` — catches replays).
+ *   2. Upsert into `CircuitRevocation` (idempotent — if the tombstone already
+ *      exists, the upsert is a no-op).
+ *
+ * If EITHER operation fails, the ENTIRE transaction rolls back — no split state.
+ * The nonce is NOT consumed if the tombstone cannot be written; the tombstone is
+ * NOT written if the nonce is a replay.
+ *
+ * Idempotency: if the tombstone already exists (the circuit was already
+ * revoked by a prior destroy), the operation returns `{ ok: true, idempotent: true }`
+ * WITHOUT attempting to insert the nonce (checked first via `isRevoked`).
+ *
+ * The `$transaction` uses the default isolation level (Read Committed in
+ * SQLite). The unique constraint on `ConsumedCircuitDestroy` provides the
+ * replay protection — a concurrent destroy with the same nonce will fail the
+ * insert (unique violation → transaction abort → rollback → no split state).
+ */
+export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
+  async isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean> {
+    const row = await db.circuitRevocation.findUnique({
+      where: {
+        circuitIdHex_commitmentRootHex: {
+          circuitIdHex: toHex(circuitId),
+          commitmentRootHex: toHex(commitmentRoot),
+        },
+      },
+    });
+    return row !== null;
+  }
+
+  async consumeDestroyAndRevoke(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    destroyNonce: Uint8Array,
+    destroyerNodeId: string,
+    destroyerRole: number,
+    destroyReason: number,
+  ): Promise<ConsumeDestroyAndRevokeResult> {
+    // Idempotency: if the tombstone already exists, return idempotent success
+    // WITHOUT consuming the nonce. The tombstone is the authoritative state.
+    const alreadyRevoked = await this.isRevoked(circuitId, commitmentRoot);
+    if (alreadyRevoked) {
+      return { ok: true, idempotent: true };
+    }
+
+    // ATOMIC transaction: consume the nonce + write the tombstone.
+    // If EITHER fails, the ENTIRE transaction rolls back — no split state.
+    try {
+      await db.$transaction([
+        // 1. Consume the destroy nonce (unique constraint catches replays).
+        db.consumedCircuitDestroy.create({
+          data: {
+            commitmentRootHex: toHex(commitmentRoot),
+            circuitIdHex: toHex(circuitId),
+            destroyNonceHex: toHex(destroyNonce),
+          },
+        }),
+        // 2. Write the revocation tombstone (upsert — idempotent if a concurrent
+        //    transaction wrote it first; the upsert avoids a unique-constraint
+        //    failure on the tombstone that would abort the whole transaction).
+        db.circuitRevocation.upsert({
+          where: {
+            circuitIdHex_commitmentRootHex: {
+              circuitIdHex: toHex(circuitId),
+              commitmentRootHex: toHex(commitmentRoot),
+            },
+          },
+          update: {}, // idempotent — don't overwrite if exists
+          create: {
+            circuitIdHex: toHex(circuitId),
+            commitmentRootHex: toHex(commitmentRoot),
+            destroyerNodeId,
+            destroyerRole,
+            destroyReason,
+            destroyNonceHex: toHex(destroyNonce),
+          },
+        }),
+      ]);
+      return { ok: true, idempotent: false };
+    } catch {
+      // Transaction failed (unique-constraint violation on the nonce → replay,
+      // OR a persistence failure → disk error, DB down, etc.). The ENTIRE
+      // transaction rolled back — no split state. The nonce was NOT consumed
+      // (unless the failure was a replay of the SAME nonce, in which case the
+      // tombstone would have been written by the first transaction). Either way,
+      // the caller MUST reject the destroy (fail-closed). A retry with the SAME
+      // nonce will be rejected as a replay (the nonce insert failed on the
+      // unique constraint, but the rollback removed it — a retry is safe ONLY
+      // if the first transaction fully committed; if it aborted, the nonce is
+      // still fresh and the retry will succeed).
+      return {
+        ok: false,
+        reason: "atomic consumeDestroyAndRevoke transaction failed (replay or persistence failure, fail-closed, no split state)",
+      };
+    }
+  }
+
+  /**
+   * Also implement `CircuitRevocationStore.revoke()` so this store can be
+   * passed to `processCircuitWireFrame` (which takes `CircuitRevocationStore`)
+   * AND `processCircuitDestroy` (which takes `CircuitDestroyStore`). The same
+   * `CircuitRevocation` DB table is shared, so a tombstone written by
+   * `consumeDestroyAndRevoke` is visible to `isRevoked` (called by
+   * `processCircuitWireFrame`). This is structural typing — no explicit
+   * `implements` needed.
+   */
+  async revoke(
+    circuitId: Uint8Array,
+    commitmentRoot: Uint8Array,
+    destroyerNodeId: string,
+    destroyerRole: number,
+    destroyReason: number,
+    destroyNonce: Uint8Array,
+  ): Promise<boolean> {
+    try {
+      await db.circuitRevocation.upsert({
+        where: {
+          circuitIdHex_commitmentRootHex: {
+            circuitIdHex: toHex(circuitId),
+            commitmentRootHex: toHex(commitmentRoot),
+          },
+        },
+        update: {}, // idempotent — don't overwrite if exists
+        create: {
+          circuitIdHex: toHex(circuitId),
+          commitmentRootHex: toHex(commitmentRoot),
+          destroyerNodeId,
+          destroyerRole,
+          destroyReason,
+          destroyNonceHex: toHex(destroyNonce),
+        },
+      });
+      return true;
+    } catch {
+      return false; // fail-closed
+    }
+  }
+}

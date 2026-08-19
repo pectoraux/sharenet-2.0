@@ -2407,3 +2407,40 @@ Stage Summary:
 - processCircuitDestroy owns the full teardown pipeline including zeroization (no caller obligation). Zeroization happens in both fresh + idempotent paths.
 - The durable CircuitRevocation tombstone is the single authoritative terminal-state source of truth (ACTIVE ≡ no tombstone; REVOKED ≡ tombstone exists). No competing state machine.
 - The audit inadvertently proved the bypass was real: 7 pre-existing tests (from 6936831) signed destroys with a relay's key while claiming the initiator's NodeId — they passed only because the bypass existed. After the fix, they correctly fail unless the real initiator keypair is used. All now use route.initiator.
+
+---
+Task ID: R009-S3-P2
+Agent: orchestrator
+Task: R-009 Stage 3 Phase 2 — fix gateway destroy authorization, CircuitDestroy freshness, + atomic consume/revoke before propagation.
+
+Work Log:
+- Read previous worklog + git log: confirmed at commit 60e4364 (R-009 Stage 3 re-audit: identity bypass + fail-closed expiry + zeroize ownership + authoritative tombstone).
+- Read the audit's three remaining issues: (1) gateway destroy authorization uses caller-supplied expectedGatewayNodeId only, (2) no freshness checks on issuedAt/expiry, (3) separate consume + revoke operations can leave split state.
+- Explored the existing portable proof chain: GatewayReturnAuthorization (return-template.ts:1170-1216) — already implements terminal RouteAcceptance signature, Merkle inclusion proof, terminal hop identity, terminal CircuitSetupAck signature, all from wire bytes alone (no WeakSet).
+- Designed verifyTerminalHopProof() as the identity-proof SUBSET of verifyGatewayReturnAuthorization — extracts steps 2/2b/2c/2e/2f + commitmentRoot binding + ack freshness, WITHOUT the ECDH/single-use parts (which are return-template-specific).
+
+Fixes applied:
+- Fix #1 (gateway destroy authorization via portable proof chain): Added verifyTerminalHopProof() to return-template.ts (reusable identity-proof verifier from wire bytes alone). Extended processCircuitDestroy signature with gatewayProofBytes?: Uint8Array (REQUIRED for GATEWAY role, IGNORED for INITIATOR). For GATEWAY role: decode gatewayProofBytes → verifyTerminalHopProof → verify destroyerEd25519PublicKey === proof.relayEd25519PublicKey → verify destroyerNodeId === proof.terminalNodeId → redundant defense-in-depth check against expectedGatewayNodeId. The proof chain is the SOLE authority — replaces the insufficient caller-supplied expectedGatewayNodeId check.
+- Fix #2 (CircuitDestroy freshness): Added CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS = 300 (FROZEN, 5 minutes). Three freshness checks BEFORE nonce consumption (step 4, before step 7): (a) issuedAt <= now + SKEW (not future-dated), (b) now < expiry (strict — boundary now == expiry → REJECT, consistent with processCircuitWireFrame), (c) expiry <= circuit.expiry (no lifetime extension). A validly signed but expired/future-dated destroy is rejected with an explicit reason; the nonce is NOT consumed (retry with same nonce succeeds).
+- Fix #3 (atomic consume + revoke): Created CircuitDestroyStore interface + ConsumeDestroyAndRevokeResult type + InMemoryCircuitDestroyStore in replay-stores.ts. Created DurableSqliteCircuitDestroyStore in durable-circuit-replay-stores.ts (uses Prisma $transaction: consumedCircuitDestroy.create + circuitRevocation.upsert — if either fails, the entire transaction rolls back, no split state). Both implementations also implement revoke() (structural compatibility with CircuitRevocationStore, so a single store can be passed to both processCircuitDestroy + processCircuitWireFrame). processCircuitDestroy now takes a single destroyStore: CircuitDestroyStore (replacing the separate revocationStore + destroyReplayStore), and calls consumeDestroyAndRevoke() (atomic) instead of separate consume() + revoke().
+
+Adversarial tests added (tests/r009-destroy.test.ts, +18 tests, +909 lines):
+- Gateway destroy authorization (6 tests): valid gateway destroy + valid proof → ACCEPT; gateway destroy WITHOUT proof → REJECT; gateway destroy + tampered proof → REJECT; gateway destroy + proof from ANOTHER route → REJECT (commitmentRoot mismatch); non-terminal relay with valid key + proof at non-terminal hopIndex → REJECT (hopIndex != last); valid key (own NodeId) + valid proof for real gateway → REJECT (destroyerEd25519PublicKey ≠ proof's relayEd25519PublicKey — identity mismatch).
+- CircuitDestroy freshness (6 tests): valid current destroy → ACCEPT; destroy issued in future (beyond skew) → REJECT before nonce consumption (nonce verified fresh via consumeDestroyAndRevoke); destroy expired (now >= expiry) → REJECT before nonce consumption; destroy expiry > circuit.expiry → REJECT (lifetime extension blocked); exact expiry boundary (now = expiry - 1 → ACCEPT, now = expiry → REJECT — vectorized); issuedAt within clock skew (issuedAt = now + SKEW, exactly at boundary) → ACCEPT.
+- Atomic operation (3 tests): atomic success → nonce consumed AND tombstone written (retry idempotent); atomic FAILURE (FailingCircuitDestroyStore test double) → no split state (tombstone NOT written, keys NOT zeroized, retained for retry); retry after atomic failure → succeeds (nonce still fresh — the failed transaction rolled back).
+- Durable SQLite atomic (3 tests): atomic consumeDestroyAndRevoke → both committed; replay (same nonce, different circuit) → independent; replay (same nonce + circuit, tombstone pre-exists) → idempotent.
+
+Test-hygiene: updated all 14 existing processCircuitDestroy call sites for the new signature (destroyStore replaces revocationStore + destroyReplayStore; gatewayProofBytes added for GATEWAY role). Updated makeRoute to include commitment + hopNodeIds + terminalAcceptance (needed for building gateway proofs). Added makeGatewayProof helper (builds a serialized GatewayReturnAuthorization via constructGatewayReturnAuthorization + encodeGatewayReturnAuthorization). Updated "expiry → durable revocation written" + "destroyed circuit → subsequent frame REJECTED" tests to use InMemoryCircuitDestroyStore (which structurally satisfies CircuitRevocationStore via the revoke() method, so a single store works for both processCircuitDestroy + processCircuitWireFrame).
+
+Verification (all five required suites):
+- Unit tests: 501 pass / 0 fail (was 483; +18 Phase 2 tests). 1751 expect() calls across 30 files in 3.91s.
+- Architecture tests: 24/24 pass (incl. #21 + #23 layer-separation — verifyTerminalHopProof in return-template.ts uses only existing imports, no new @/lib/db; CircuitDestroyStore in replay-stores.ts is interface-only).
+- TS conformance vectors: 40/40 pass (incl. V-CIRCUIT-DESTROY-001 — the portable verifyCircuitDestroy was NOT changed, so the frozen 8 destroy vectors pass unchanged).
+- Python conformance vectors: 40/40 pass.
+- Lint: clean (exit 0).
+
+Stage Summary:
+- All three Phase 2 issues closed. No propagation started (per the audit's stop condition).
+- Gateway destroy authorization now uses the SAME portable proof chain frozen for GatewayReturnAuthorization (R-009 Stage 2) — terminal RouteAcceptance → Merkle inclusion → commitmentRoot → terminal hop identity → terminal CircuitSetupAck → identity binding. Works from serialized protocol artifacts alone (no WeakSet/BrandedCommittedRoute).
+- CircuitDestroy freshness enforced before nonce consumption (issuedAt/expiry/circuit.expiry + 300s frozen clock skew). A stale destroy is rejected + the nonce remains fresh for a valid retry.
+- The consume-nonce + revoke-tombstone operation is now ATOMIC (single CircuitDestroyStore.consumeDestroyAndRevoke transaction). No split security state — both succeed or both fail. The operator can safely retry with the SAME destroy after a transaction failure (the nonce is still fresh).

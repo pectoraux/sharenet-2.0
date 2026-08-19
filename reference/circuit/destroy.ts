@@ -28,9 +28,10 @@
 import { randomBytes } from "@noble/hashes/utils.js";
 import { canonicalEncode, canonicalDecode, toHex, fromHex } from "../encoding/cbor";
 import { signMessage, verifySignature, verifyNodeIdBinding } from "../identity/keys";
-import type { CircuitRevocationStore, CircuitDestroyReplayStore } from "./replay-stores";
+import type { CircuitDestroyStore } from "./replay-stores";
 import type { ActiveCircuit } from "./circuit";
 import { zeroizeCircuit } from "./zeroize";
+import { verifyTerminalHopProof, decodeGatewayReturnAuthorization } from "./return-template";
 
 // -----------------------------------------------------------------------
 // Constants (R-009 Stage 3 — CircuitDestroy)
@@ -49,6 +50,28 @@ export const DESTROY_REASON_CIRCUIT_EXPIRED = 0x02 as const;
 export const DESTROY_REASON_LINK_FAILURE = 0x03 as const;
 export const DESTROY_REASON_GATEWAY_DISAPPEARANCE = 0x04 as const;
 export const DESTROY_REASON_PROTOCOL_VIOLATION = 0x05 as const;
+
+/**
+ * Maximum permitted clock skew for CircuitDestroy freshness (FROZEN per
+ * ADR-0022 §12 + spec/08 §6.5b).
+ *
+ * The destroyer's clock (which produced `issuedAt`) may be ahead of the
+ * receiver's clock (`now`) by up to this many seconds. A destroy with
+ * `issuedAt > now + SKEW` is rejected as "future-dated" — this prevents an
+ * attacker who compromises the destroyer's key from pre-signing destroys
+ * with arbitrary future timestamps (which could be used to confuse audit
+ * trails or to attempt to destroy a circuit before it was established).
+ *
+ * This skew applies ONLY to the `issuedAt` check. The `expiry` checks are
+ * strict (no skew): `now >= expiry` → reject (the destroy is stale), and
+ * `expiry > circuit.expiry` → reject (the destroy tries to extend the
+ * circuit's lifetime).
+ *
+ * Value: 300 seconds (5 minutes). This is generous for a delay-tolerant
+ * network with potentially drifted mesh-node clocks, while still being
+ * tight enough to prevent meaningful future-dated forgery.
+ */
+export const CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS = 300 as const;
 
 // -----------------------------------------------------------------------
 // CircuitDestroy wire object
@@ -367,24 +390,47 @@ export type ProcessCircuitDestroyResult =
 /**
  * Process a CircuitDestroy at a participant (initiator, relay, or gateway).
  *
- * This is the CANONICAL TEARDOWN PROTOCOL PATH. Per ADR-0022:
+ * This is the CANONICAL TEARDOWN PROTOCOL PATH. Per ADR-0022 (amended per the
+ * re-audit of 60e4364 — R-009 Stage 3 Phase 2):
  *
  *   1. Decode the wire bytes.
- *   2. Verify the CircuitDestroy (signature + routeId + role).
+ *   2. Verify the CircuitDestroy (signature + routeId + role) — portable verifier.
  *   3. Verify the circuit binding (circuitId + commitmentRoot match the
  *      local circuit context).
- *   4. Verify destroyer authorization (identity binding AND role binding):
+ *   4. FRESHNESS CHECKS (before nonce consumption — a validly signed but
+ *      expired/future-dated destroy MUST be rejected before consuming the nonce):
+ *      a. issuedAt <= now + SKEW (not future-dated beyond clock skew).
+ *      b. now < expiry (not expired — strict: now >= expiry → reject).
+ *      c. expiry <= circuit.expiry (destroy's expiry does not exceed the
+ *         circuit's actual expiry — prevents lifetime extension via destroy).
+ *   5. Verify destroyer authorization (TWO-LAYER identity + role model):
  *      a. verifyNodeIdBinding(destroyerNodeId, destroyerEd25519PublicKey) —
- *         the claimed NodeId MUST derive from the claimed public key.
- *         This closes the identity authorization bypass: an attacker cannot
- *         sign a destroy with their own key while claiming a legitimate
- *         NodeId (the destroyerNodeId string is public; the key is not).
- *      b. INITIATOR: destroyerNodeId must match the circuit's initiatorNodeId.
- *         GATEWAY: destroyerNodeId must match the terminal hop's nodeId.
- *   5. Check durable revocation (if already revoked → idempotent success +
+ *         Layer 1: the claimed NodeId MUST derive from the claimed public key.
+ *      b. INITIATOR (Layer 2): destroyerNodeId must match the circuit's
+ *         initiatorNodeId (expectedInitiatorNodeId — from the authenticated
+ *         committed route, verified during setup).
+ *      c. GATEWAY (Layer 2): the portable terminal-hop proof chain MUST be
+ *         provided (gatewayProofBytes) AND MUST verify — the terminal
+ *         RouteAcceptance signature → Merkle inclusion → commitmentRoot →
+ *         terminal hop identity → terminal CircuitSetupAck signature →
+ *         terminal gateway X25519/Node identity binding. The proof's
+ *         relayEd25519PublicKey MUST equal the destroy's
+ *         destroyerEd25519PublicKey (the destroy signer IS the ack/acceptance
+ *         signer). The proof's terminalNodeId MUST equal the destroy's
+ *         destroyerNodeId. expectedGatewayNodeId is checked as a redundant
+ *         defense-in-depth (the caller's local route knowledge must agree).
+ *
+ *         This replaces the previous caller-supplied-only check
+ *         (destroyerNodeId === expectedGatewayNodeId) which was insufficient
+ *         because expectedGatewayNodeId is a string parameter with no
+ *         cryptographic binding to the actual terminal hop. The proof chain
+ *         is the SOLE authority for gateway authorization — it works from
+ *         serialized protocol artifacts alone (no WeakSet/BrandedCommittedRoute).
+ *   6. Check durable revocation (if already revoked → idempotent success +
  *      zeroize, since the tombstone is authoritative and the circuit is dead).
- *   6. Consume the destroy nonce (durable, fail-closed).
- *   7. Write the durable revocation record.
+ *   7. ATOMICALLY consume the destroy nonce + write the durable revocation
+ *      tombstone (single transaction — both succeed or both fail, no split
+ *      security state). Fail-closed.
  *   8. Zeroize circuit key material (best-effort) — OWNED by this function.
  *      The caller is NOT responsible for calling zeroizeCircuit().
  *   9. Return the CircuitDestroy for propagation (unchanged — no re-signing).
@@ -392,19 +438,24 @@ export type ProcessCircuitDestroyResult =
  * @param wireBytes - the raw canonical-CBOR-encoded CircuitDestroy bytes
  * @param circuit - the local ActiveCircuit (for binding + authorization)
  * @param expectedInitiatorNodeId - the circuit's initiator NodeId (for INITIATOR auth)
- * @param expectedGatewayNodeId - the terminal hop's NodeId (for GATEWAY auth)
- * @param revocationStore - REQUIRED durable revocation store
- * @param destroyReplayStore - REQUIRED durable destroy replay store
+ * @param expectedGatewayNodeId - the terminal hop's NodeId (redundant defense-in-depth
+ *   for GATEWAY auth; the primary authority is the gatewayProofBytes proof chain)
+ * @param destroyStore - REQUIRED atomic CircuitDestroyStore (consumes nonce +
+ *   writes tombstone in a single transaction, no split state)
  * @param now - current time (unix seconds)
+ * @param gatewayProofBytes - OPTIONAL: serialized GatewayReturnAuthorization
+ *   CBOR bytes. REQUIRED when destroyerRole === GATEWAY (proves the destroyer
+ *   is the genuine terminal hop via the portable proof chain). IGNORED when
+ *   destroyerRole === INITIATOR.
  */
 export async function processCircuitDestroy(
   wireBytes: Uint8Array,
   circuit: ActiveCircuit,
   expectedInitiatorNodeId: string,
   expectedGatewayNodeId: string,
-  revocationStore: CircuitRevocationStore,
-  destroyReplayStore: CircuitDestroyReplayStore,
+  destroyStore: CircuitDestroyStore,
   now: number,
+  gatewayProofBytes?: Uint8Array,
 ): Promise<ProcessCircuitDestroyResult> {
   // 1. Decode.
   const decoded = decodeCircuitDestroy(wireBytes);
@@ -427,19 +478,41 @@ export async function processCircuitDestroy(
     return { ok: false, reason: "commitmentRoot mismatch: destroy does not match this circuit" };
   }
 
-  // 4. Verify destroyer authorization.
+  // 4. FRESHNESS CHECKS (R-009 Stage 3 Phase 2 — before nonce consumption).
+  //    A validly signed but expired/future-dated destroy MUST be rejected
+  //    BEFORE consuming the nonce (so the nonce remains fresh for a valid
+  //    retry with a non-expired destroy).
   //
-  // 4a. IDENTITY BINDING (closes the identity authorization bypass).
-  // The destroyerNodeId is a PUBLIC string (it appears in route advertisements,
-  // circuit setup records, etc.). An attacker who learns a legitimate
-  // initiator's or gateway's NodeId CANNOT use it to forge a destroy, because
-  // the destroy must ALSO carry a destroyerEd25519PublicKey that cryptographically
-  // derives that NodeId (BLAKE3-256 over the public key). An attacker signing
-  // with their OWN key will have a destroyerEd25519PublicKey that derives a
-  // DIFFERENT NodeId than the legitimate one they're claiming — this check
-  // catches that. Without this check, the destroyerNodeId === expectedInitiatorNodeId
-  // comparison below would pass for any attacker who knows the initiator's
-  // public NodeId string.
+  // 4a. issuedAt must not be too far in the future (clock skew permitted).
+  if (destroy.issuedAt > now + CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS) {
+    return {
+      ok: false,
+      reason: `destroy freshness: issuedAt ${destroy.issuedAt} > now ${now} + skew ${CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS} (future-dated destroy rejected before nonce consumption)`,
+    };
+  }
+  // 4b. The destroy must not have expired (now < expiry, strict).
+  //     Boundary: now == expiry → REJECT (consistent with circuit expiry's
+  //     `circuit.expiry <= now` convention in processCircuitWireFrame).
+  if (now >= destroy.expiry) {
+    return {
+      ok: false,
+      reason: `destroy freshness: now ${now} >= expiry ${destroy.expiry} (expired destroy rejected before nonce consumption)`,
+    };
+  }
+  // 4c. The destroy's expiry must not exceed the circuit's actual expiry
+  //     (prevents an attacker from extending the circuit's lifetime via a
+  //     destroy with a later expiry — the destroy is evidence of the circuit's
+  //     lifetime, and it MUST NOT contradict the circuit's established expiry).
+  if (destroy.expiry > circuit.expiry) {
+    return {
+      ok: false,
+      reason: `destroy freshness: destroy expiry ${destroy.expiry} > circuit.expiry ${circuit.expiry} (destroy tries to extend circuit lifetime — rejected)`,
+    };
+  }
+
+  // 5. Verify destroyer authorization (TWO-LAYER identity + role model).
+
+  // 5a. IDENTITY BINDING (Layer 1 — closes the identity authorization bypass).
   if (!verifyNodeIdBinding(destroy.destroyerNodeId, destroy.destroyerEd25519PublicKey)) {
     return {
       ok: false,
@@ -447,8 +520,13 @@ export async function processCircuitDestroy(
     };
   }
 
-  // 4b. ROLE AUTHORIZATION (the claimed identity is the authorized one).
+  // 5b. ROLE AUTHORIZATION (Layer 2).
   if (destroy.destroyerRole === DESTROYER_ROLE_INITIATOR) {
+    // INITIATOR: the destroyerNodeId must match the circuit's initiatorNodeId.
+    // expectedInitiatorNodeId comes from the authenticated committed route
+    // (verified during setup). The Layer 1 check proves the destroy's key
+    // derives the claimed NodeId; this check proves the claimed NodeId IS the
+    // circuit's initiator.
     if (destroy.destroyerNodeId !== expectedInitiatorNodeId) {
       return {
         ok: false,
@@ -456,18 +534,75 @@ export async function processCircuitDestroy(
       };
     }
   } else if (destroy.destroyerRole === DESTROYER_ROLE_GATEWAY) {
+    // GATEWAY: the portable terminal-hop proof chain MUST verify.
+    // This replaces the previous caller-supplied-only check
+    // (destroyerNodeId === expectedGatewayNodeId) which was insufficient
+    // because expectedGatewayNodeId is a string parameter with no
+    // cryptographic binding to the actual terminal hop.
+    //
+    // The proof chain (a serialized GatewayReturnAuthorization) verifies:
+    //   - terminal RouteAcceptance signature (by relayEd25519PublicKey)
+    //   - Merkle inclusion (acceptance is in commitmentRoot)
+    //   - commitmentRoot matches circuit.commitmentRoot (proof is for THIS route)
+    //   - terminal hop identity (hopIndex == last, hopNodeIds[hopIndex] == terminalNodeId)
+    //   - terminal CircuitSetupAck signature (by relayEd25519PublicKey)
+    //   - ack freshness (ackExpiry > now — defense-in-depth)
+    // All from serialized protocol artifacts — NO WeakSet/BrandedCommittedRoute.
+    if (!gatewayProofBytes) {
+      return {
+        ok: false,
+        reason: "unauthorized: gateway destroy requires portable terminal-hop proof (gatewayProofBytes) — caller-supplied expectedGatewayNodeId alone is insufficient",
+      };
+    }
+    const proofDecoded = decodeGatewayReturnAuthorization(gatewayProofBytes);
+    if (!proofDecoded.ok) {
+      return { ok: false, reason: `unauthorized: failed to decode gateway proof: ${proofDecoded.reason}` };
+    }
+    const proofResult = verifyTerminalHopProof(
+      proofDecoded.authorization,
+      circuit.commitmentRoot,
+      now,
+    );
+    if (!proofResult.ok) {
+      return {
+        ok: false,
+        reason: `unauthorized: gateway terminal-hop proof chain verification failed: ${proofResult.reason}`,
+      };
+    }
+    // The destroy's destroyerEd25519PublicKey MUST be the SAME key that signed
+    // the terminal ack + acceptance. This proves the destroy was signed by
+    // the genuine terminal hop (the relay that acked + accepted the route),
+    // not an attacker who merely learned the gateway's NodeId string.
+    if (!bytesEqual(destroy.destroyerEd25519PublicKey, proofResult.relayEd25519PublicKey)) {
+      return {
+        ok: false,
+        reason: "unauthorized: destroyerEd25519PublicKey does not match the terminal-hop proof's relayEd25519PublicKey (the destroy signer is NOT the ack/acceptance signer)",
+      };
+    }
+    // The destroy's destroyerNodeId MUST match the proof's terminalNodeId.
+    // (This is implied by Layer 1 + the pubkey match, but check explicitly
+    // for defense-in-depth + a clear error message.)
+    if (destroy.destroyerNodeId !== proofResult.terminalNodeId) {
+      return {
+        ok: false,
+        reason: `unauthorized: destroyerNodeId "${destroy.destroyerNodeId}" does not match the terminal-hop proof's terminalNodeId "${proofResult.terminalNodeId}"`,
+      };
+    }
+    // Redundant defense-in-depth: the caller's expectedGatewayNodeId must agree
+    // with the proof's terminalNodeId. If they disagree, something is wrong
+    // (either the proof is forged or the caller's route is wrong) — reject.
     if (destroy.destroyerNodeId !== expectedGatewayNodeId) {
       return {
         ok: false,
-        reason: `unauthorized: destroyerNodeId "${destroy.destroyerNodeId}" is not the terminal gateway "${expectedGatewayNodeId}"`,
+        reason: `unauthorized: destroyerNodeId "${destroy.destroyerNodeId}" matches the proof but not the caller's expectedGatewayNodeId "${expectedGatewayNodeId}" (defense-in-depth: caller's route knowledge disagrees with the proof)`,
       };
     }
   } else {
     return { ok: false, reason: `unauthorized: invalid destroyerRole ${destroy.destroyerRole}` };
   }
 
-  // 5. Check durable revocation (idempotent).
-  const alreadyRevoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
+  // 6. Check durable revocation (idempotent).
+  const alreadyRevoked = await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
   if (alreadyRevoked) {
     // Idempotent: the circuit is already revoked. The durable tombstone is
     // the authoritative terminal-state record (per ADR-0022 §5 + spec/08
@@ -479,52 +614,39 @@ export async function processCircuitDestroy(
     return { ok: true, idempotent: true, circuitDestroy: destroy };
   }
 
-  // 6. Consume the destroy nonce (durable, fail-closed).
-  const consumed = await destroyReplayStore.consume(
+  // 7. ATOMICALLY consume the destroy nonce + write the durable revocation
+  //    tombstone (single transaction — no split security state).
+  //    Per the re-audit of 60e4364 (Phase 2): the previous design used two
+  //    separate operations (consume + revoke) that could leave a SPLIT state
+  //    if one succeeded and the other failed. The atomic operation ensures
+  //    both succeed or both fail. Fail-closed: if the transaction fails,
+  //    NEITHER the nonce is consumed NOR the tombstone is written — the
+  //    operator can safely retry with the SAME destroy (the nonce is still fresh).
+  const atomicResult = await destroyStore.consumeDestroyAndRevoke(
     circuit.commitmentRoot,
     circuit.circuitId,
     destroy.destroyNonce,
-  );
-  if (!consumed) {
-    return {
-      ok: false,
-      reason: "destroy replay: (commitmentRoot, circuitId, destroyNonce) already consumed or persistence failed (fail-closed)",
-    };
-  }
-
-  // 7. Write the durable revocation record.
-  const revoked = await revocationStore.revoke(
-    circuit.circuitId,
-    circuit.commitmentRoot,
     destroy.destroyerNodeId,
     destroy.destroyerRole,
     destroy.destroyReason,
-    destroy.destroyNonce,
   );
-  if (!revoked) {
-    // Persistence failure — fail closed. The destroy nonce has been consumed
-    // (step 6) but the tombstone was NOT persisted. The circuit is in an
-    // inconsistent state: the nonce is spent but there is no tombstone.
-    // The correct response is to REJECT (the destroy did not complete the
-    // durable terminal-state transition). The destroy nonce consumption is
-    // irrecoverable, which is the safe outcome — a replayed destroy will now
-    // be rejected by step 6, and the operator must issue a NEW destroy with
-    // a fresh nonce if they wish to retry.
+  if (!atomicResult.ok) {
+    // Transaction failed — fail closed. NO split state: the nonce was NOT
+    // consumed (the transaction rolled back). The operator can retry with the
+    // SAME destroy (the nonce is still fresh).
     return {
       ok: false,
-      reason: "failed to write durable revocation record (persistence failure, fail-closed) — destroy nonce consumed but tombstone NOT persisted",
+      reason: `atomic consumeDestroyAndRevoke failed: ${atomicResult.reason} (fail-closed, no split state — nonce NOT consumed, tombstone NOT written, safe to retry)`,
     };
   }
 
   // 8. Zeroize circuit key material (best-effort) — OWNED by processCircuitDestroy.
-  // Per the re-audit of 6936831: the caller is NOT responsible for calling
-  // zeroizeCircuit(). This function owns the full teardown pipeline, including
-  // zeroization. The tombstone is confirmed persisted (step 7), so it is safe
-  // to destroy the keys.
+  // The tombstone is confirmed persisted (step 7's atomic transaction committed),
+  // so it is safe to destroy the keys.
   zeroizeCircuit(circuit);
 
   // 9. Return the CircuitDestroy for propagation (unchanged).
-  return { ok: true, idempotent: false, circuitDestroy: destroy };
+  return { ok: true, idempotent: atomicResult.idempotent, circuitDestroy: destroy };
 }
 
 /** Constant-time byte equality. */

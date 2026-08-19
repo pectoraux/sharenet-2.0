@@ -43,16 +43,26 @@ import {
   DESTROYER_ROLE_GATEWAY,
   DESTROY_REASON_OPERATOR_INITIATED,
   DESTROY_REASON_CIRCUIT_EXPIRED,
+  CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS,
   type CircuitDestroy,
 } from "@reference/circuit/destroy";
 import {
   InMemoryCircuitSequenceFloorStore,
   InMemoryCircuitRevocationStore,
   InMemoryCircuitDestroyReplayStore,
+  InMemoryCircuitDestroyStore,
   type CircuitRevocationStore,
+  type CircuitDestroyStore,
 } from "@reference/circuit/replay-stores";
+import {
+  constructReturnOnionTemplate,
+  signGatewayReturnTemplate,
+  constructGatewayReturnAuthorization,
+  encodeGatewayReturnAuthorization,
+} from "@reference/circuit/return-template";
+import { handleCircuitSetup } from "@reference/circuit/distributed-setup";
 import { db } from "@/lib/db";
-import { DurableSqliteCircuitRevocationStore, DurableSqliteCircuitDestroyReplayStore } from "@/lib/sharenet/durable-circuit-replay-stores";
+import { DurableSqliteCircuitRevocationStore, DurableSqliteCircuitDestroyReplayStore, DurableSqliteCircuitDestroyStore } from "@/lib/sharenet/durable-circuit-replay-stores";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
@@ -65,7 +75,65 @@ function makeRoute(numHops = 2) {
     hpk: ctx.hopPublicKeys,
     commitmentRoot: ctx.branded.commitmentRoot,
     initiator: ctx.initiator,
+    // Per R-009 Stage 3 Phase 2 (gateway destroy authorization): the
+    // gateway proof requires the committed route's acceptances + hopNodeIds
+    // to build the portable terminal-hop proof chain.
+    commitment: ctx.commitment,
+    hopNodeIds: ctx.branded.hops.map((h) => h.nodeId),
+    terminalAcceptance: ctx.commitment.acceptances[ctx.commitment.acceptances.length - 1]!,
   };
+}
+
+/**
+ * Build a serialized GatewayReturnAuthorization (the portable terminal-hop
+ * proof chain) for the gateway of the given route + circuit.
+ *
+ * This is the proof a gateway attaches to a GATEWAY-originated CircuitDestroy.
+ * The receiver decodes + verifies it via verifyTerminalHopProof (called inside
+ * processCircuitDestroy) — no WeakSet/BrandedCommittedRoute dependency.
+ */
+function makeGatewayProof(
+  route: ReturnType<typeof makeRoute>,
+  circuit: ReturnType<typeof setupCircuit>,
+): Uint8Array {
+  const terminalHopIndex = route.branded.hops.length - 1;
+  const relayKp = route.kps[terminalHopIndex]!;
+  const gatewayNodeId = route.branded.hops[terminalHopIndex]!.nodeId;
+  const initiatorKp = route.initiator;
+
+  // Generate a genuine terminal CircuitSetupAck.
+  const ackResult = handleCircuitSetup(
+    {
+      route: route.branded,
+      hopIndex: terminalHopIndex,
+      initiatorX25519PublicKey: circuit.initiatorX25519PublicKey,
+      setupNonce: randomBytes(16),
+    },
+    relayKp.secretKey,
+    route.commitmentRoot,
+    NOW,
+  );
+  if (!ackResult.ok) throw new Error(`terminal ack setup failed: ${ackResult.reason}`);
+  const terminalAck = ackResult.ack;
+  const relayEd25519PublicKey = relayKp.publicKey;
+  const gatewayX25519PublicKey = ackResult.state.relayX25519PublicKey;
+
+  // Construct the GatewayReturnTemplate (signed by the initiator).
+  const template = constructReturnOnionTemplate(circuit);
+  const gatewayTemplate = signGatewayReturnTemplate(
+    template, route.branded.expiry, gatewayNodeId,
+    gatewayX25519PublicKey,
+    circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+    initiatorKp.secretKey, initiatorKp.publicKey,
+  );
+
+  // Bundle into a GatewayReturnAuthorization (the portable proof).
+  const auth = constructGatewayReturnAuthorization(
+    gatewayTemplate, terminalAck, relayEd25519PublicKey,
+    route.terminalAcceptance, route.hopNodeIds,
+    route.commitment.proposal, route.commitment.acceptances,
+  );
+  return encodeGatewayReturnAuthorization(auth);
 }
 
 function makeRelayX25519Keys(route: { hops: Array<{ nodeId: string }> }) {
@@ -374,8 +442,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const initiatorKp = route.initiator; // the route helper's REAL initiator keypair (its publicKey derives route.initiator.nodeId)
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -394,7 +461,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
       wireBytes, circuit,
       route.initiator.nodeId, // expectedInitiatorNodeId
       gatewayNodeId, // expectedGatewayNodeId
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(result.ok).toBe(true);
@@ -402,7 +469,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     expect(result.idempotent).toBe(false);
 
     // Circuit is now durably revoked.
-    const isRevoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
+    const isRevoked = await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
     expect(isRevoked).toBe(true);
   });
 
@@ -410,8 +477,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const gatewayKp = route.kps[1]!;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -425,18 +491,21 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
       gatewayKp.secretKey, gatewayKp.publicKey,
     );
     const wireBytes = encodeCircuitDestroy(destroy);
+    // GATEWAY destroy REQUIRES the portable terminal-hop proof chain.
+    const gatewayProofBytes = makeGatewayProof(route, circuit);
 
     const result = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
+      gatewayProofBytes,
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.idempotent).toBe(false);
 
-    const isRevoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
+    const isRevoked = await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
     expect(isRevoked).toBe(true);
   });
 
@@ -444,8 +513,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const relayKp = route.kps[0]!;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -465,14 +533,14 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
       wireBytes, circuit,
       route.initiator.nodeId, // expectedInitiatorNodeId (doesn't match)
       gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("unauthorized");
 
     // Circuit must NOT be revoked.
-    const isRevoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
+    const isRevoked = await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
     expect(isRevoked).toBe(false);
   });
 
@@ -480,8 +548,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -500,7 +567,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const r1 = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(r1.ok).toBe(true);
@@ -509,7 +576,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const r2 = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(r2.ok).toBe(true);
@@ -521,8 +588,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -542,7 +608,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const result = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(result.ok).toBe(false);
@@ -553,8 +619,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -571,7 +636,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const destroyResult = await processCircuitDestroy(
       encodeCircuitDestroy(destroy), circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(destroyResult.ok).toBe(true);
@@ -580,7 +645,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const plaintext = new TextEncoder().encode("post-destroy frame");
     const sealed = sealForwardFrame(circuit, 1, plaintext);
     const wireBytes = encodeCircuitFrame(sealed);
-    const frameResult = await processCircuitWireFrame(circuit, 0, wireBytes, revocationStore, NOW);
+    const frameResult = await processCircuitWireFrame(circuit, 0, wireBytes, destroyStore, NOW);
     expect(frameResult.ok).toBe(false);
     if (!frameResult.ok) expect(frameResult.reason).toContain("revoked");
   });
@@ -613,7 +678,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const route = makeRoute(1);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
 
     const plaintext = new TextEncoder().encode("expired frame");
@@ -621,17 +686,19 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const wireBytes = encodeCircuitFrame(sealed);
 
     // now > expiry → reject + write durable revocation.
-    const result = await processCircuitWireFrame(circuit, 0, wireBytes, revocationStore, route.branded.expiry + 1);
+    // InMemoryCircuitDestroyStore structurally satisfies CircuitRevocationStore
+    // (it has isRevoked + revoke), so it can be passed to processCircuitWireFrame.
+    const result = await processCircuitWireFrame(circuit, 0, wireBytes, destroyStore, route.branded.expiry + 1);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("expired");
 
     // Durable revocation record was written.
-    const isRevoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
+    const isRevoked = await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
     expect(isRevoked).toBe(true);
 
     // Simulate restart: create a NEW revocation store (same in-memory state is gone,
     // but the record persists in the store — for a durable store, it would persist in the DB).
-    const restartedStore = revocationStore; // in-memory: same object (durable would be new instance from DB)
+    const restartedStore = destroyStore; // in-memory: same object (durable would be new instance from DB)
     const isStillRevoked = await restartedStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
     expect(isStillRevoked).toBe(true);
   });
@@ -674,8 +741,7 @@ describe("R-009 Stage 3 re-audit (6936831): identity authorization bypass is clo
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -695,7 +761,7 @@ describe("R-009 Stage 3 re-audit (6936831): identity authorization bypass is clo
     const result = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(result.ok).toBe(true);
@@ -703,15 +769,14 @@ describe("R-009 Stage 3 re-audit (6936831): identity authorization bypass is clo
     expect(result.idempotent).toBe(false);
 
     // Circuit is durably revoked.
-    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
   });
 
   test("attacker key + legitimate initiator NodeId → REJECT (identity binding fails)", async () => {
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
 
@@ -735,7 +800,7 @@ describe("R-009 Stage 3 re-audit (6936831): identity authorization bypass is clo
     const result = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(result.ok).toBe(false);
@@ -745,22 +810,25 @@ describe("R-009 Stage 3 re-audit (6936831): identity authorization bypass is clo
     }
 
     // CRITICAL: the circuit MUST NOT be revoked by a forged destroy.
-    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
 
-    // And the destroy nonce MUST NOT have been consumed (we rejected before step 6).
+    // And the destroy nonce MUST NOT have been consumed (we rejected before step 7).
     // A retry with the SAME nonce would still be accepted on a genuine destroy.
-    const reConsume = await destroyReplayStore.consume(
+    // Verify by calling consumeDestroyAndRevoke — it should succeed (first use,
+    // NOT idempotent — the forged destroy did not consume the nonce).
+    const reConsume = await destroyStore.consumeDestroyAndRevoke(
       circuit.commitmentRoot, circuit.circuitId, destroy.destroyNonce,
+      "test-verify", 0x01, 0x01,
     );
-    expect(reConsume).toBe(true); // first use — the forged destroy did not consume it
+    expect(reConsume.ok).toBe(true);
+    if (reConsume.ok) expect(reConsume.idempotent).toBe(false); // first use — the forged destroy did not consume it
   });
 
   test("attacker key + legitimate gateway NodeId → REJECT (identity binding fails)", async () => {
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
 
@@ -780,22 +848,21 @@ describe("R-009 Stage 3 re-audit (6936831): identity authorization bypass is clo
     const result = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toContain("identity binding failed");
     }
-    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
   });
 
   test("valid gateway destroy → ACCEPT (legitimate gateway key derives gateway NodeId)", async () => {
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const gatewayKp = route.kps[1]!;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -810,17 +877,20 @@ describe("R-009 Stage 3 re-audit (6936831): identity authorization bypass is clo
       gatewayKp.secretKey, gatewayKp.publicKey,
     );
     const wireBytes = encodeCircuitDestroy(destroy);
+    // GATEWAY destroy REQUIRES the portable terminal-hop proof chain.
+    const gatewayProofBytes = makeGatewayProof(route, circuit);
 
     const result = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
+      gatewayProofBytes,
     );
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.idempotent).toBe(false);
-    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
   });
 });
 
@@ -878,8 +948,7 @@ describe("R-009 Stage 3 re-audit (6936831): processCircuitDestroy owns zeroizati
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -906,7 +975,7 @@ describe("R-009 Stage 3 re-audit (6936831): processCircuitDestroy owns zeroizati
     const result = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(result.ok).toBe(true);
@@ -930,15 +999,14 @@ describe("R-009 Stage 3 re-audit (6936831): processCircuitDestroy owns zeroizati
     expect(circuit.circuitId.some((b) => b !== 0)).toBe(true);
 
     // And the circuit is durably revoked.
-    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
   });
 
   test("idempotent destroy (already revoked) → keys still zeroized + no re-consume", async () => {
     const route = makeRoute(2);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
-    const revocationStore = new InMemoryCircuitRevocationStore();
-    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
@@ -957,7 +1025,7 @@ describe("R-009 Stage 3 re-audit (6936831): processCircuitDestroy owns zeroizati
     const r1 = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(r1.ok).toBe(true);
@@ -974,7 +1042,7 @@ describe("R-009 Stage 3 re-audit (6936831): processCircuitDestroy owns zeroizati
     const r2 = await processCircuitDestroy(
       wireBytes, circuit,
       route.initiator.nodeId, gatewayNodeId,
-      revocationStore, destroyReplayStore,
+      destroyStore,
       NOW,
     );
     expect(r2.ok).toBe(true);
@@ -983,5 +1051,736 @@ describe("R-009 Stage 3 re-audit (6936831): processCircuitDestroy owns zeroizati
     // Keys are zeroized again (idempotent zeroize is a no-op on already-zero keys,
     // but here we deliberately re-mangled them, so this proves the function ran).
     expect(circuit.hops[0]!.forwardingKey.every((b) => b === 0)).toBe(true);
+  });
+});
+
+// =====================================================================
+// R-009 Stage 3 Phase 2 re-audit of 60e4364:
+//   1. Gateway destroy authorization via portable terminal-hop proof chain.
+//   2. CircuitDestroy freshness (issuedAt/expiry/circuit.expiry + clock skew).
+//   3. Atomic consume-nonce + revoke-tombstone (no split state).
+// =====================================================================
+
+/**
+ * Test double: a CircuitDestroyStore whose consumeDestroyAndRevoke ALWAYS fails.
+ *
+ * Simulates a durable persistence failure (DB transaction abort, disk full, etc.).
+ * Used to prove the atomic operation is fail-closed with NO split state: the
+ * nonce is NOT consumed and the tombstone is NOT written. A retry with the SAME
+ * destroy + a WORKING store should succeed (the nonce is still fresh).
+ */
+class FailingCircuitDestroyStore implements CircuitDestroyStore {
+  async isRevoked(): Promise<boolean> {
+    return false;
+  }
+  async consumeDestroyAndRevoke(): Promise<{ ok: false; reason: string }> {
+    return { ok: false, reason: "simulated persistence failure (FailingCircuitDestroyStore)" };
+  }
+}
+
+// ---- Fix #1: Gateway destroy authorization via portable proof chain --------
+
+describe("R-009 Stage 3 Phase 2: gateway destroy authorization via portable terminal-hop proof", () => {
+  test("valid gateway destroy + valid proof → ACCEPT", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayKp = route.kps[1]!;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      gatewayNodeId,
+      DESTROYER_ROLE_GATEWAY,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      gatewayKp.secretKey, gatewayKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+    const gatewayProofBytes = makeGatewayProof(route, circuit);
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+      gatewayProofBytes,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.idempotent).toBe(false);
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+  });
+
+  test("gateway destroy WITHOUT proof → REJECT (proof required)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayKp = route.kps[1]!;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      gatewayNodeId,
+      DESTROYER_ROLE_GATEWAY,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      gatewayKp.secretKey, gatewayKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    // No gatewayProofBytes — the caller-supplied expectedGatewayNodeId alone
+    // is no longer sufficient.
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+      // gatewayProofBytes omitted
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("gateway destroy requires portable terminal-hop proof");
+    }
+    // Circuit MUST NOT be revoked.
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+  });
+
+  test("gateway destroy + tampered proof (corrupted bytes) → REJECT", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayKp = route.kps[1]!;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      gatewayNodeId,
+      DESTROYER_ROLE_GATEWAY,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      gatewayKp.secretKey, gatewayKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    // Tamper the proof: flip a byte in the serialized GatewayReturnAuthorization.
+    const gatewayProofBytes = makeGatewayProof(route, circuit);
+    const tamperedProof = new Uint8Array(gatewayProofBytes);
+    tamperedProof[tamperedProof.length - 1] ^= 0x01;
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+      tamperedProof,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("terminal-hop proof chain verification failed");
+    }
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+  });
+
+  test("gateway destroy + proof from ANOTHER route → REJECT (commitmentRoot mismatch)", async () => {
+    // Route A: the circuit's actual route.
+    const routeA = makeRoute(2);
+    const relayKeysA = makeRelayX25519Keys(routeA.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(routeA.branded, relayKeysA, NOW, floorStore);
+    const gatewayKpA = routeA.kps[1]!;
+    const gatewayNodeIdA = routeA.branded.hops[1]!.nodeId;
+
+    // Route B: a DIFFERENT route with a different commitmentRoot.
+    const routeB = makeRoute(2);
+    const relayKeysB = makeRelayX25519Keys(routeB.branded);
+    const circuitB = setupCircuit(routeB.branded, relayKeysB, NOW, floorStore);
+
+    // The gateway of route A signs a destroy for circuit A (correct circuit).
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      gatewayNodeIdA,
+      DESTROYER_ROLE_GATEWAY,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, routeA.branded.expiry,
+      gatewayKpA.secretKey, gatewayKpA.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    // But attaches a proof from ROUTE B (different commitmentRoot).
+    // The proof is validly signed for route B, but its commitmentRoot does NOT
+    // match circuit A's commitmentRoot.
+    const gatewayProofFromRouteB = makeGatewayProof(routeB, circuitB);
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      routeA.initiator.nodeId, gatewayNodeIdA,
+      destroyStore,
+      NOW,
+      gatewayProofFromRouteB,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("commitmentRoot does not match");
+    }
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+  });
+
+  test("non-terminal relay with valid key + proof at non-terminal hopIndex → REJECT", async () => {
+    const route = makeRoute(3); // 3 hops: relay 0, relay 1, gateway 2
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Relay 0 (a NON-terminal relay) tries to destroy as GATEWAY.
+    const relay0Kp = route.kps[0]!;
+    const relay0NodeId = route.branded.hops[0]!.nodeId;
+    const gatewayNodeId = route.branded.hops[2]!.nodeId;
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      relay0NodeId, // claims its own NodeId
+      DESTROYER_ROLE_GATEWAY,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      relay0Kp.secretKey, relay0Kp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    // Relay 0 constructs a proof using its OWN acceptance at hopIndex 0.
+    // The proof is validly signed, but the terminal-hop check will fail
+    // (hopIndex 0 != last index 2).
+    const terminalHopIndex = 0; // relay 0 is NOT terminal
+    const relayKp = route.kps[terminalHopIndex]!;
+    const initiatorKp = route.initiator;
+    const ackResult = handleCircuitSetup(
+      {
+        route: route.branded,
+        hopIndex: terminalHopIndex,
+        initiatorX25519PublicKey: circuit.initiatorX25519PublicKey,
+        setupNonce: randomBytes(16),
+      },
+      relayKp.secretKey,
+      route.commitmentRoot,
+      NOW,
+    );
+    if (!ackResult.ok) throw new Error(`relay ack setup failed: ${ackResult.reason}`);
+    const relayAck = ackResult.ack;
+    const relayEd25519PublicKey = relayKp.publicKey;
+    const relayX25519PublicKey = ackResult.state.relayX25519PublicKey;
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayTemplate = signGatewayReturnTemplate(
+      template, route.branded.expiry, relay0NodeId,
+      relayX25519PublicKey,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    // Use relay 0's acceptance (NOT the terminal acceptance).
+    const relay0Acceptance = route.commitment.acceptances[0]!;
+    const fakeAuth = constructGatewayReturnAuthorization(
+      gatewayTemplate, relayAck, relayEd25519PublicKey,
+      relay0Acceptance, route.hopNodeIds,
+      route.commitment.proposal, route.commitment.acceptances,
+    );
+    const fakeProofBytes = encodeGatewayReturnAuthorization(fakeAuth);
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+      fakeProofBytes,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      // The proof chain rejects: hopIndex 0 is not the terminal hop (last index 2).
+      expect(result.reason).toContain("terminal-hop proof chain verification failed");
+      expect(result.reason).toContain("not the terminal hop");
+    }
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+  });
+
+  test("valid key (own NodeId) + valid proof for real gateway → REJECT (identity mismatch)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // The attacker generates their OWN valid keypair → derives their own valid
+    // NodeId X (NOT the gateway's). Layer 1 (verifyNodeIdBinding(X, attackerKey))
+    // PASSES — the key genuinely derives X.
+    const attackerKp = generateNodeKeypair();
+    const attackerNodeId = attackerKp.nodeId;
+
+    // The attacker signs a destroy as GATEWAY, claiming their OWN NodeId X.
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      attackerNodeId, // ← the attacker's OWN NodeId (Layer 1 passes)
+      DESTROYER_ROLE_GATEWAY,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      attackerKp.secretKey, attackerKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    // The attacker attaches a VALID proof for the REAL gateway (e.g., intercepted
+    // during setup, or obtained via a compromised relay). The proof verifies —
+    // it's genuinely for this circuit's route + terminal hop.
+    const gatewayProofBytes = makeGatewayProof(route, circuit);
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+      gatewayProofBytes,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      // REJECTED: the destroy's destroyerEd25519PublicKey (attacker's key) does
+      // NOT match the proof's relayEd25519PublicKey (real gateway's key). The
+      // destroy signer is NOT the ack/acceptance signer.
+      expect(result.reason).toContain("destroyerEd25519PublicKey does not match");
+      expect(result.reason).toContain("terminal-hop proof");
+    }
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+  });
+});
+
+// ---- Fix #2: CircuitDestroy freshness ---------------------------------
+
+describe("R-009 Stage 3 Phase 2: CircuitDestroy freshness (issuedAt / expiry / circuit.expiry)", () => {
+  test("valid current destroy → ACCEPT", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // issuedAt = NOW (current), expiry = circuit.expiry (matches circuit).
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy), circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  test("destroy issued in the future (beyond skew) → REJECT before nonce consumption", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // issuedAt = NOW + SKEW + 1 (beyond the permitted clock skew).
+    const futureIssuedAt = NOW + CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS + 1;
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      futureIssuedAt, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy), circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("future-dated");
+      expect(result.reason).toContain("before nonce consumption");
+    }
+    // CRITICAL: the nonce MUST NOT have been consumed (rejected before step 7).
+    // Verify by calling consumeDestroyAndRevoke — it should succeed (first use).
+    const reConsume = await destroyStore.consumeDestroyAndRevoke(
+      circuit.commitmentRoot, circuit.circuitId, destroy.destroyNonce,
+      "test-verify", 0x01, 0x01,
+    );
+    expect(reConsume.ok).toBe(true);
+    if (reConsume.ok) expect(reConsume.idempotent).toBe(false);
+  });
+
+  test("destroy expired (now >= expiry) → REJECT before nonce consumption", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // Sign a destroy with expiry in the past (expired). The circuit itself is
+    // still alive (circuit.expiry > NOW), but the destroy's expiry is NOW - 1.
+    const expiredExpiry = NOW - 1;
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, expiredExpiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy), circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("expired");
+      expect(result.reason).toContain("before nonce consumption");
+    }
+    // Nonce NOT consumed.
+    const reConsume = await destroyStore.consumeDestroyAndRevoke(
+      circuit.commitmentRoot, circuit.circuitId, destroy.destroyNonce,
+      "test-verify", 0x01, 0x01,
+    );
+    expect(reConsume.ok).toBe(true);
+    if (reConsume.ok) expect(reConsume.idempotent).toBe(false);
+  });
+
+  test("destroy expiry > circuit.expiry → REJECT (lifetime extension blocked)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // Sign a destroy with expiry = circuit.expiry + 1 (exceeds the circuit's expiry).
+    const extendedExpiry = route.branded.expiry + 1;
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, extendedExpiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy), circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("destroy tries to extend circuit lifetime");
+    }
+    // Nonce NOT consumed.
+    const reConsume = await destroyStore.consumeDestroyAndRevoke(
+      circuit.commitmentRoot, circuit.circuitId, destroy.destroyNonce,
+      "test-verify", 0x01, 0x01,
+    );
+    expect(reConsume.ok).toBe(true);
+    if (reConsume.ok) expect(reConsume.idempotent).toBe(false);
+  });
+
+  test("exact expiry boundary: now = expiry - 1 → ACCEPT; now = expiry → REJECT", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore1 = new InMemoryCircuitDestroyStore();
+    const destroyStore2 = new InMemoryCircuitDestroyStore();
+    const circuit1 = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    // Need a second circuit with the same keys but a separate store — use a fresh circuit.
+    const floorStore2 = new InMemoryCircuitSequenceFloorStore();
+    const relayKeys2 = makeRelayX25519Keys(route.branded);
+    const circuit2 = setupCircuit(route.branded, relayKeys2, NOW, floorStore2);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // Both destroys have expiry = circuit.expiry (the boundary value).
+    // Test 1: now = expiry - 1 → ACCEPT (now < expiry).
+    const destroy1 = signCircuitDestroy(
+      circuit1.circuitId, circuit1.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result1 = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy1), circuit1,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore1,
+      route.branded.expiry - 1, // now = expiry - 1 → ACCEPT
+    );
+    expect(result1.ok).toBe(true);
+
+    // Test 2: now = expiry → REJECT (now >= expiry, boundary).
+    const destroy2 = signCircuitDestroy(
+      circuit2.circuitId, circuit2.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result2 = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy2), circuit2,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore2,
+      route.branded.expiry, // now = expiry → REJECT (boundary)
+    );
+    expect(result2.ok).toBe(false);
+    if (!result2.ok) {
+      expect(result2.reason).toContain("expired");
+    }
+  });
+
+  test("issuedAt within clock skew (issuedAt = now + SKEW) → ACCEPT", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // issuedAt = NOW + SKEW (exactly at the boundary — permitted).
+    const issuedAtAtSkewBoundary = NOW + CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS;
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      issuedAtAtSkewBoundary, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy), circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+    );
+    expect(result.ok).toBe(true); // exactly at the skew boundary → ACCEPT
+  });
+});
+
+// ---- Fix #3: Atomic consume-nonce + revoke-tombstone (no split state) ----
+
+describe("R-009 Stage 3 Phase 2: atomic consumeDestroyAndRevoke (no split state)", () => {
+  test("atomic operation success → nonce consumed AND tombstone written", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy), circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+    );
+    expect(result.ok).toBe(true);
+
+    // Both the tombstone AND the nonce were committed atomically.
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+    // A second consumeDestroyAndRevoke with the same nonce → idempotent (tombstone exists).
+    const retry = await destroyStore.consumeDestroyAndRevoke(
+      circuit.commitmentRoot, circuit.circuitId, destroy.destroyNonce,
+      "test-retry", 0x01, 0x01,
+    );
+    expect(retry.ok).toBe(true);
+    if (retry.ok) expect(retry.idempotent).toBe(true); // tombstone already exists
+  });
+
+  test("atomic operation FAILURE → no split state (nonce NOT consumed, tombstone NOT written)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const failingStore = new FailingCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // Snapshot key material — to prove it is retained on atomic failure.
+    expect(circuit.hops[0]!.forwardingKey.some((b) => b !== 0)).toBe(true);
+    const fwdKeySnapshot = new Uint8Array(circuit.hops[0]!.forwardingKey);
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy), circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      failingStore, // ALWAYS fails
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("consumeDestroyAndRevoke failed");
+      expect(result.reason).toContain("no split state");
+      expect(result.reason).toContain("safe to retry");
+    }
+
+    // CRITICAL: no split state — the tombstone was NOT written.
+    expect(await failingStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+
+    // CRITICAL: keys were NOT zeroized (the atomic transaction failed, so the
+    // terminal state was not durably recorded — keys retained for retry).
+    expect(circuit.hops[0]!.forwardingKey).toEqual(fwdKeySnapshot);
+    expect(circuit.hops[0]!.forwardingKey.every((b) => b === 0)).toBe(false);
+  });
+
+  test("retry after atomic failure → succeeds (nonce still fresh)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const failingStore = new FailingCircuitDestroyStore();
+    const workingStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    // First attempt: fails (FailingCircuitDestroyStore).
+    const r1 = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      failingStore,
+      NOW,
+    );
+    expect(r1.ok).toBe(false);
+
+    // Keys were NOT zeroized by the failed attempt — re-mangle to prove the
+    // retry's zeroization is fresh.
+    expect(circuit.hops[0]!.forwardingKey.some((b) => b !== 0)).toBe(true);
+
+    // Second attempt: the SAME destroy (same nonce) with a WORKING store.
+    // The nonce is STILL FRESH (the failed transaction rolled back) — the
+    // retry should SUCCEED. This is the key property of the atomic operation:
+    // no split state means the nonce was not consumed by the failure.
+    const r2 = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      workingStore,
+      NOW,
+    );
+    expect(r2.ok).toBe(true);
+    if (!r2.ok) return;
+    expect(r2.idempotent).toBe(false); // first successful processing
+
+    // The tombstone is now written.
+    expect(await workingStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+    // Keys are zeroized by the successful retry.
+    expect(circuit.hops[0]!.forwardingKey.every((b) => b === 0)).toBe(true);
+  });
+});
+
+// ---- Durable SQLite atomic operation ----------------------------------------
+
+describe("R-009 Stage 3 Phase 2: DurableSqliteCircuitDestroyStore (atomic transaction)", () => {
+  let destroyStore: DurableSqliteCircuitDestroyStore;
+
+  beforeAll(async () => {
+    destroyStore = new DurableSqliteCircuitDestroyStore();
+    await db.circuitRevocation.deleteMany({});
+    await db.consumedCircuitDestroy.deleteMany({});
+  });
+
+  afterAll(async () => {
+    await db.circuitRevocation.deleteMany({});
+    await db.consumedCircuitDestroy.deleteMany({});
+  });
+
+  test("atomic consumeDestroyAndRevoke → both committed (tombstone + nonce)", async () => {
+    const cid = randomBytes(32);
+    const cr = randomBytes(32);
+    const nonce = randomBytes(16);
+
+    const result = await destroyStore.consumeDestroyAndRevoke(cr, cid, nonce, "initiator", 0x01, 0x01);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.idempotent).toBe(false);
+
+    // Tombstone exists.
+    expect(await destroyStore.isRevoked(cid, cr)).toBe(true);
+
+    // The nonce was consumed (a second consume with the same nonce fails — but
+    // since the tombstone exists, consumeDestroyAndRevoke returns idempotent).
+    const retry = await destroyStore.consumeDestroyAndRevoke(cr, cid, nonce, "gateway", 0x02, 0x01);
+    expect(retry.ok).toBe(true);
+    if (retry.ok) expect(retry.idempotent).toBe(true);
+  });
+
+  test("atomic consumeDestroyAndRevoke → replay (same nonce, different circuit) → independent", async () => {
+    const cr = randomBytes(32);
+    const nonce = randomBytes(16);
+
+    const r1 = await destroyStore.consumeDestroyAndRevoke(cr, randomBytes(32), nonce, "initiator", 0x01, 0x01);
+    expect(r1.ok).toBe(true);
+
+    const r2 = await destroyStore.consumeDestroyAndRevoke(cr, randomBytes(32), nonce, "initiator", 0x01, 0x01);
+    expect(r2.ok).toBe(true); // different circuitId → independent (not a replay)
+  });
+
+  test("atomic consumeDestroyAndRevoke → replay (same nonce + circuit) → REJECT", async () => {
+    const cid = randomBytes(32);
+    const cr = randomBytes(32);
+    const nonce = randomBytes(16);
+
+    // Pre-revoke the circuit (simulate a prior destroy that wrote the tombstone).
+    await destroyStore.revoke(cid, cr, "initiator", 0x01, 0x01, nonce);
+
+    // Now a SECOND destroy with the same nonce → idempotent (tombstone exists).
+    const result = await destroyStore.consumeDestroyAndRevoke(cr, cid, nonce, "initiator", 0x01, 0x01);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.idempotent).toBe(true);
   });
 });

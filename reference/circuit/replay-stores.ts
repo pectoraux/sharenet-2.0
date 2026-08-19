@@ -518,3 +518,182 @@ export class InMemoryCircuitDestroyReplayStore implements CircuitDestroyReplaySt
     return true;
   }
 }
+
+// -----------------------------------------------------------------------
+// CircuitDestroyStore — atomic consume-nonce + revoke-tombstone (R-009 Stage 3 Phase 2)
+// -----------------------------------------------------------------------
+
+/**
+ * Result of an atomic consume-destroy-nonce + write-revocation-tombstone.
+ *
+ * - `{ ok: true, idempotent: false }`: the destroy nonce was consumed AND the
+ *   tombstone was durably written in a single atomic transaction. The circuit
+ *   is now durably revoked. This is the first processing of this destroy.
+ * - `{ ok: true, idempotent: true }`: the tombstone already existed (the
+ *   circuit was already revoked by a prior destroy). The nonce was NOT
+ *   re-consumed. Idempotent success — the circuit is still revoked.
+ * - `{ ok: false, reason }`: the atomic transaction FAILED (persistence
+ *   failure). NEITHER the nonce was consumed NOR the tombstone was written.
+ *   No split security state. The caller MUST reject the destroy (fail-closed).
+ */
+export type ConsumeDestroyAndRevokeResult =
+  | { ok: true; idempotent: boolean }
+  | { ok: false; reason: string };
+
+/**
+ * Durable, ATOMIC circuit-destroy store.
+ *
+ * Per the re-audit of 60e4364 (R-009 Stage 3 Phase 2): the previous design
+ * used two separate stores (`CircuitRevocationStore` + `CircuitDestroyReplayStore`)
+ * with two separate operations (`revoke()` + `consume()`). If the nonce was
+ * consumed but the tombstone write failed, the circuit was left in a SPLIT
+ * security state: the nonce is spent (a retry would be rejected as a replay)
+ * but there is no tombstone (the circuit is not durably revoked). This is
+ * unsafe — the operator cannot retry, and the circuit is not durably dead.
+ *
+ * This interface provides a SINGLE ATOMIC operation that consumes the nonce
+ * AND writes the tombstone in one transaction. Both succeed or both fail.
+ * There is no split state.
+ *
+ * The atomicity guarantee:
+ *   - If the transaction commits: the nonce is consumed AND the tombstone
+ *     exists. A subsequent retry is idempotent (the tombstone already exists).
+ *   - If the transaction aborts (persistence failure, unique-constraint
+ *     violation, etc.): NEITHER the nonce is consumed NOR the tombstone
+ *     exists. The operator can safely retry with the SAME destroy (the
+ *     nonce is still fresh).
+ *
+ * Idempotency: if the tombstone already exists (the circuit was already
+ * revoked by a prior destroy), the operation returns `{ ok: true, idempotent: true }`
+ * without re-consuming the nonce. The tombstone is the authoritative terminal
+ * state — if it exists, the circuit is REVOKED regardless of the nonce state.
+ *
+ * ARCHITECTURE: this interface lives in the protocol core (`reference/`) with
+ * NO Prisma dependency. The durable SQLite implementation (in `src/lib/sharenet/`)
+ * uses a Prisma `$transaction` to atomically insert into `ConsumedCircuitDestroy`
+ * + upsert into `CircuitRevocation`. A protocol engineer in Rust/Kotlin
+ * implements the same interface against any durable substrate (LMDB, RocksDB,
+ * SQLite, etc.) using a native transaction.
+ */
+export interface CircuitDestroyStore {
+  /**
+   * Check if a circuit is revoked (durable tombstone exists).
+   *
+   * Per ADR-0022: the tombstone is the authoritative terminal-state record.
+   * `CIRCUIT_REVOKED ≡ isRevoked() === true`.
+   */
+  isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean>;
+
+  /**
+   * ATOMICALLY consume the destroy nonce AND write the revocation tombstone.
+   *
+   * Single transaction: both succeed or both fail. Fail-closed: if the
+   * transaction cannot complete, returns `{ ok: false, reason }` and NEITHER
+   * the nonce is consumed NOR the tombstone is written (no split state).
+   *
+   * Idempotent: if the tombstone already exists, returns
+   * `{ ok: true, idempotent: true }` without re-consuming the nonce.
+   *
+   * @param commitmentRoot - the 32-byte route commitment root
+   * @param circuitId - the 32-byte circuit ID (instance identity)
+   * @param destroyNonce - the 16-byte destroy nonce (replay protection)
+   * @param destroyerNodeId - the destroyer's NodeId (evidence in the tombstone)
+   * @param destroyerRole - 0x01 (INITIATOR) or 0x02 (GATEWAY)
+   * @param destroyReason - enumerated reason code
+   * @returns `{ ok: true, idempotent }` on success; `{ ok: false, reason }` on
+   *   persistence failure (fail-closed, no split state).
+   */
+  consumeDestroyAndRevoke(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    destroyNonce: Uint8Array,
+    destroyerNodeId: string,
+    destroyerRole: number,
+    destroyReason: number,
+  ): Promise<ConsumeDestroyAndRevokeResult>;
+}
+
+/**
+ * In-memory `CircuitDestroyStore` for tests + conformance vectors.
+ *
+ * Does NOT survive process restart. The atomic operation is implemented as a
+ * single synchronous check + insert (single-threaded JS — no race). For
+ * production / restart-survival integration tests, use
+ * `DurableSqliteCircuitDestroyStore` (in `src/lib/sharenet/`).
+ */
+export class InMemoryCircuitDestroyStore implements CircuitDestroyStore {
+  // Tombstone: keyed by (circuitIdHex, commitmentRootHex).
+  private revoked = new Map<string, { destroyerNodeId: string; destroyerRole: number; destroyReason: number; destroyNonce: Uint8Array }>();
+  // Consumed nonces: keyed by (commitmentRootHex, circuitIdHex, destroyNonceHex).
+  private consumed = new Set<string>();
+
+  private tombstoneKey(cid: Uint8Array, cr: Uint8Array): string {
+    return `${toHex(cid)}:${toHex(cr)}`;
+  }
+  private nonceKey(cr: Uint8Array, cid: Uint8Array, nonce: Uint8Array): string {
+    return `${toHex(cr)}:${toHex(cid)}:${toHex(nonce)}`;
+  }
+
+  async isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean> {
+    return this.revoked.has(this.tombstoneKey(circuitId, commitmentRoot));
+  }
+
+  async consumeDestroyAndRevoke(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    destroyNonce: Uint8Array,
+    destroyerNodeId: string,
+    destroyerRole: number,
+    destroyReason: number,
+  ): Promise<ConsumeDestroyAndRevokeResult> {
+    const tKey = this.tombstoneKey(circuitId, commitmentRoot);
+    const nKey = this.nonceKey(commitmentRoot, circuitId, destroyNonce);
+
+    // Idempotency: if the tombstone already exists, the circuit is already
+    // revoked. Return idempotent success WITHOUT re-consuming the nonce.
+    if (this.revoked.has(tKey)) {
+      return { ok: true, idempotent: true };
+    }
+
+    // Atomic check + insert (single-threaded JS — no race between check + insert).
+    // If the nonce was already consumed (but no tombstone — shouldn't happen in
+    // normal operation since we always write the tombstone with the nonce, but
+    // could happen if a prior transaction was rolled back after the nonce insert
+    // in a non-atomic implementation), reject as a replay.
+    if (this.consumed.has(nKey)) {
+      return {
+        ok: false,
+        reason: "destroy replay: (commitmentRoot, circuitId, destroyNonce) already consumed but no tombstone exists (inconsistent state — reject as replay, fail-closed)",
+      };
+    }
+
+    // Atomic: consume the nonce AND write the tombstone. In single-threaded JS,
+    // these two mutations are atomic (no interleaving possible). In a durable
+    // implementation, this is a single DB transaction.
+    this.consumed.add(nKey);
+    this.revoked.set(tKey, { destroyerNodeId, destroyerRole, destroyReason, destroyNonce });
+    return { ok: true, idempotent: false };
+  }
+
+  /**
+   * Also implement `CircuitRevocationStore.revoke()` so this store can be
+   * passed to `processCircuitWireFrame` (which takes `CircuitRevocationStore`)
+   * AND `processCircuitDestroy` (which takes `CircuitDestroyStore`). This is
+   * structural typing — no explicit `implements` needed. The same tombstone
+   * Map is shared, so a tombstone written by `consumeDestroyAndRevoke` is
+   * visible to `isRevoked` (called by `processCircuitWireFrame`).
+   */
+  async revoke(
+    circuitId: Uint8Array,
+    commitmentRoot: Uint8Array,
+    destroyerNodeId: string,
+    destroyerRole: number,
+    destroyReason: number,
+    destroyNonce: Uint8Array,
+  ): Promise<boolean> {
+    const tKey = this.tombstoneKey(circuitId, commitmentRoot);
+    if (this.revoked.has(tKey)) return true; // idempotent
+    this.revoked.set(tKey, { destroyerNodeId, destroyerRole, destroyReason, destroyNonce });
+    return true;
+  }
+}
