@@ -2474,3 +2474,58 @@ Stage Summary:
 - The CircuitRevocation create (not upsert) is the AUTHORITATIVE atomic ACTIVE→REVOKED transition. Concurrent destroys for the same circuit produce EXACTLY ONE terminal transition; all subsequent requests are idempotent/already-revoked. The destroy nonce is recorded in the same DB transaction (no split state).
 - The issuedAt <= expiry semantic validity check is enforced at the portable verifier level (verifyCircuitDestroy), with frozen conformance mutation coverage (V-CIRCUIT-DESTROY-002: issuedAt > expiry → REJECT, issuedAt == expiry → ACCEPT boundary).
 - Expiry tombstones are explicitly documented as SYSTEM-generated revocations (no signature, no nonce, destroyerNodeId="system"), distinct from initiator/gateway-authenticated CircuitDestroy evidence.
+
+---
+Task ID: R009-S3-P3
+Agent: orchestrator
+Task: R-009 Stage 3 Phase 3 — destroy propagation + true multi-process teardown.
+
+Work Log:
+- Read previous worklog + git log: confirmed at commit 893c491 (R-009 Stage 3 Phase 2 final: authoritative tombstone transition + issuedAt<=expiry + SYSTEM-generated expiry docs).
+- Read the audit's Phase 3 requirements: ADR-0023 (propagation semantics), propagation API (direction derived from protocol state, not caller-supplied), byte-for-byte propagation invariant, replay/duplicate suppression, zeroize-before-propagate order, multi-process topology (4 independent processes), negative tests, replay/restart tests, failure modes.
+- Inspected the existing multi-process infrastructure (tests/r009-multiprocess.test.ts): child_process.spawn("bun", ["-e", script]) with stdin/stdout JSON IPC. Each participant runs in an independent V8 isolate. Circuit context serialized as hex strings. No BrandedCommittedRoute/WeakSet crosses the boundary.
+
+Phase 1 — ADR-0023 (propagation semantics):
+- Created adr/0023-circuit-destroy-propagation-semantics.md.
+- Froze: originators (INITIATOR + GATEWAY only; relays MUST NOT originate/rewrite/re-sign), propagation direction (derived from signed destroyerRole — FORWARD for INITIATOR, BACKWARD for GATEWAY — NOT caller-supplied), propagated artifact (byte-for-byte unchanged — the caller forwards the original wireBytes), local effect order (decode → verify → revoke → zeroize → propagate — NOT propagated before local revoke succeeds), replay semantics (per-participant stores — ORIGIN replay vs PROPAGATION duplicate suppression — existing namespace (commitmentRoot, circuitId, destroyNonce) retained), failure modes (local revoke succeeds + downstream fails → local remains REVOKED; local persistence fails → no claim of propagation, safe to retry), duplicate propagation suppressed (propagate: false on idempotent — prevents infinite loops).
+
+Phase 2+6 — processCircuitDestroy refactor + propagationDirection helper:
+- Added `propagationDirection(destroy): "FORWARD" | "BACKWARD"` — derives the direction from the signed destroyerRole (INITIATOR→FORWARD, GATEWAY→BACKWARD). This is the SOLE source of direction — no caller-supplied propagate/origin parameter. The direction is bound by the destroyer's signature.
+- Refactored ProcessCircuitDestroyResult to include: `action: "REVOKED" | "ALREADY_REVOKED"`, `propagate: boolean` (true on fresh revoke, false on idempotent), `wireBytes: Uint8Array` (the ORIGINAL input wire bytes for byte-for-byte propagation). Kept `idempotent` + `circuitDestroy` for backwards compat (existing 56 tests pass unchanged).
+- Updated both return paths (idempotent + fresh revoke) to set action/propagate/wireBytes. The zeroize-before-propagate order is explicit (step 8 before step 9 return — the destroy is NOT propagated before the local participant has established its own revoked state).
+
+Phase 4 — propagation authentication (bytes unchanged):
+- The child process verifies `bytesIdentical` (result.wireBytes === input wireBytes) at every hop. Canonical CBOR is deterministic (re-encoding produces identical bytes). A relay that tampers with ANY field breaks the signature (caught by verifyCircuitDestroy at the next hop).
+
+Phase 5 — replay semantics:
+- Documented in ADR-0023 §5: the existing namespace (commitmentRoot, circuitId, destroyNonce) is per-participant (each participant has its own durable store). ORIGIN replay: same destroy to same participant → idempotent (tombstone exists). PROPAGATION: each participant consumes the nonce independently in its OWN store. No global nonce record — the destroy event is identified by the nonce, each participant records its own consumption + tombstone. The namespace is retained unchanged.
+
+Phases 7-15 — multi-process propagation tests (tests/r009-destroy-propagation.test.ts, +19 tests, new file):
+- Phase 8 (initiator forward): INITIATOR → relay0 → relay1 → GATEWAY, 4 independent processes, all REVOKED, bytes byte-for-byte identical, keys zeroized, direction=FORWARD.
+- Phase 9 (gateway backward): GATEWAY → relay1 → relay0 → INITIATOR, 4 independent processes, all REVOKED, bytes identical, direction=BACKWARD, gateway proof required + verified at every hop.
+- Phase 4 (bytes unchanged): wire bytes byte-for-byte identical at every hop (Promise.all 4 processes); canonical CBOR deterministic re-encoding proof.
+- Phase 10 (negative): relay origin → REJECT, tamper destroyerNodeId → REJECT (signature), relay re-signs as itself → REJECT (identity binding), tamper destroyReason → REJECT (signature), tamper commitmentRoot → REJECT (routeId), tamper circuitId → REJECT (circuit binding), wrong route → REJECT (circuitId mismatch), gateway proof from wrong route → REJECT (commitmentRoot), expired destroy → REJECT (freshness), persistence failure → no claim of propagation.
+- Phase 11 (replay/duplicate): same destroy to same participant (fresh process) → independently verifiable; same circuit + different nonce after already revoked → idempotent (in-process with persistent store).
+- Phase 12 (restart): DurableSqliteCircuitDestroyStore — after revoke, a NEW store instance (simulating restart) reads the tombstone from the DB → isRevoked=true; old circuit frame → REJECT (revoked); old destroy → idempotent (ALREADY_REVOKED, propagate=false).
+- Phase 15 (failure modes): local revoke succeeds + downstream transport fails → local remains REVOKED (tombstone authoritative, retry safe); local persistence fails → no claim of propagation (ok:false, no propagate/wireBytes fields), safe to retry with a working store (nonce still fresh).
+
+Multi-process test infrastructure:
+- runDestroyParticipant(): spawns a child process (bun -e) that reads JSON from stdin (serialized circuit context + destroy wire bytes + params), reconstructs a minimal ActiveCircuit from hex strings ONLY (no WeakSet/BrandedCommittedRoute), calls processCircuitDestroy with a fresh InMemoryCircuitDestroyStore, and writes the result (action, propagate, wireHex, isRevoked, keysZeroized, bytesIdentical, direction) to stdout as JSON.
+- Each spawn is a SEPARATE process with its own V8 isolate — no shared memory. Only serialized protocol artifacts cross the boundary.
+- The test verifies the propagation invariant: result.wireBytes is byte-for-byte identical to the input (bytesIdentical=true at every hop).
+
+Verification (all five required suites):
+- Unit tests: 528 pass / 0 fail (was 509; +19 Phase 3 propagation tests). 1890 expect() calls across 31 files in 7.43s.
+- Architecture tests: 24/24 pass (incl. #21 + #23 layer-separation).
+- TS conformance vectors: 41/41 pass.
+- Python conformance vectors: 41/41 pass.
+- Lint: clean (exit 0).
+
+Stage Summary:
+- R-009 Stage 3 Phase 3 (destroy propagation + true multi-process teardown) is implemented. No failure detection or recovery started (per the audit's Phase 16 stop condition).
+- The propagation direction is PROTOCOL STATE (derived from signed destroyerRole), NOT caller-supplied. An unauthorized relay cannot redirect propagation.
+- The byte-for-byte propagation invariant is verifiable: result.wireBytes === input wireBytes at every hop (canonical CBOR is deterministic).
+- The local-effect ordering (revoke → zeroize → propagate) ensures a persistence failure does not falsely propagate. A persistence failure returns { ok: false } — no propagate/wireBytes fields.
+- Per-participant replay namespace (commitmentRoot, circuitId, destroyNonce) retained. ORIGIN replay + PROPAGATION duplicate suppression both handled. Duplicate propagation suppressed (propagate: false on idempotent — no infinite loops).
+- True multi-process: 4 independent processes (initiator, relay0, relay1, gateway) each with their own memory + destroyStore. Only serialized wire bytes cross boundaries.
+- Restart survival: the DurableSqliteCircuitDestroyStore tombstone persists across a "restart" (new store instance, same DB). Old frames rejected (revoked); old destroys idempotent.

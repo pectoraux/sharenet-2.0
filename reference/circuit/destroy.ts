@@ -400,9 +400,66 @@ export function decodeCircuitDestroy(bytes: Uint8Array): { ok: true; circuitDest
 // processCircuitDestroy — the canonical teardown protocol path (R-009 Stage 3)
 // -----------------------------------------------------------------------
 
-/** Result of processing a CircuitDestroy. */
+/**
+ * The propagation direction, derived from the signed `destroyerRole`.
+ *
+ * Per ADR-0023: the direction is PROTOCOL STATE, not caller-supplied.
+ * - INITIATOR (0x01) → FORWARD (initiator → hop 0 → ... → gateway).
+ * - GATEWAY (0x02) → BACKWARD (gateway → hop N-1 → ... → initiator).
+ *
+ * A relay does NOT choose the direction — the `destroyerRole` field (signed by
+ * the destroyer, verified by every participant) determines it. This makes it
+ * impossible for an unauthorized relay to redirect propagation.
+ */
+export type PropagationDirection = "FORWARD" | "BACKWARD";
+
+/**
+ * Derive the propagation direction from the signed `destroyerRole`.
+ *
+ * This is the SOLE source of propagation direction — there is NO caller-supplied
+ * `propagate` or `origin` parameter. The direction is bound by the destroyer's
+ * signature (which covers `destroyerRole`); an attacker cannot change the
+ * direction without invalidating the signature.
+ */
+export function propagationDirection(destroy: CircuitDestroy): PropagationDirection {
+  if (destroy.destroyerRole === DESTROYER_ROLE_INITIATOR) return "FORWARD";
+  if (destroy.destroyerRole === DESTROYER_ROLE_GATEWAY) return "BACKWARD";
+  throw new Error(`invalid destroyerRole: ${destroy.destroyerRole}`);
+}
+
+/**
+ * Result of processing a CircuitDestroy.
+ *
+ * Per ADR-0023 (R-009 Stage 3 Phase 3): the result includes the propagation
+ * action + direction + the ORIGINAL wire bytes (byte-for-byte for propagation).
+ *
+ * - `action: "REVOKED"` — this participant performed the ACTIVE→REVOKED
+ *   terminal transition (fresh destroy). The destroy SHOULD be propagated
+ *   (`propagate: true`) to the next hop in the direction derived from
+ *   `propagationDirection(circuitDestroy)`.
+ * - `action: "ALREADY_REVOKED"` — the circuit was already revoked (the
+ *   tombstone existed). Idempotent success. Propagation is suppressed
+ *   (`propagate: false`) to prevent infinite loops.
+ * - `{ ok: false, reason }` — the destroy was rejected (decode / signature /
+ *   freshness / authorization / persistence failure). NOT propagated.
+ *
+ * `wireBytes` is the ORIGINAL input wire bytes — the caller forwards them
+ * byte-for-byte without re-encoding (the propagation invariant, ADR-0023 §3).
+ */
 export type ProcessCircuitDestroyResult =
-  | { ok: true; idempotent: boolean; circuitDestroy: CircuitDestroy }
+  | {
+      ok: true;
+      /** @deprecated use `action` — `idempotent` = (action === "ALREADY_REVOKED"). */
+      idempotent: boolean;
+      /** "REVOKED" (fresh terminal transition) or "ALREADY_REVOKED" (idempotent). */
+      action: "REVOKED" | "ALREADY_REVOKED";
+      /** true on fresh revoke (should propagate), false on idempotent (suppress). */
+      propagate: boolean;
+      /** The decoded CircuitDestroy (for convenience — NOT for re-encoding). */
+      circuitDestroy: CircuitDestroy;
+      /** The ORIGINAL wire bytes — forward these byte-for-byte to the next hop. */
+      wireBytes: Uint8Array;
+    }
   | { ok: false; reason: string };
 
 /**
@@ -628,8 +685,19 @@ export async function processCircuitDestroy(
     // local transient state. Return success without re-consuming the nonce
     // or re-writing the revocation. Zeroize is idempotent (re-filling zeros
     // is a no-op if keys were already zeroized by the prior destroy).
+    //
+    // Per ADR-0023 §4: propagation is SUPPRESSED on idempotent receipt
+    // (propagate: false) to prevent infinite propagation loops. The destroy
+    // has already been forwarded by a prior receipt.
     zeroizeCircuit(circuit);
-    return { ok: true, idempotent: true, circuitDestroy: destroy };
+    return {
+      ok: true,
+      idempotent: true,
+      action: "ALREADY_REVOKED",
+      propagate: false,
+      circuitDestroy: destroy,
+      wireBytes,
+    };
   }
 
   // 7. ATOMICALLY consume the destroy nonce + write the durable revocation
@@ -661,10 +729,26 @@ export async function processCircuitDestroy(
   // 8. Zeroize circuit key material (best-effort) — OWNED by processCircuitDestroy.
   // The tombstone is confirmed persisted (step 7's atomic transaction committed),
   // so it is safe to destroy the keys.
+  //
+  // Per ADR-0023 §4: zeroize happens BEFORE propagation. The destroy MUST NOT
+  // be propagated before the local participant has established its own revoked
+  // state. A persistence failure (step 7) returns { ok: false } — NOT propagated.
   zeroizeCircuit(circuit);
 
-  // 9. Return the CircuitDestroy for propagation (unchanged).
-  return { ok: true, idempotent: atomicResult.idempotent, circuitDestroy: destroy };
+  // 9. Return the CircuitDestroy + the ORIGINAL wire bytes for propagation.
+  //    Per ADR-0023 §3: the caller forwards `wireBytes` byte-for-byte without
+  //    re-encoding. The propagation direction is derived from `destroyerRole`
+  //    via `propagationDirection(circuitDestroy)` — NOT caller-supplied.
+  //    `propagate: true` signals the caller to forward; the caller/transport
+  //    layer decides whether there IS a next hop (topology concern, not protocol).
+  return {
+    ok: true,
+    idempotent: atomicResult.idempotent,
+    action: atomicResult.idempotent ? "ALREADY_REVOKED" : "REVOKED",
+    propagate: !atomicResult.idempotent,
+    circuitDestroy: destroy,
+    wireBytes,
+  };
 }
 
 /** Constant-time byte equality. */
