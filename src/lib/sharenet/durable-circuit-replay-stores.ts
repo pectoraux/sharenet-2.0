@@ -157,6 +157,7 @@ export function createDurableCircuitReplayStores(): {
 // -----------------------------------------------------------------------
 
 import { db } from "@/lib/db";
+import { PrismaClient } from "@prisma/client";
 import type { GatewayAuthorizationReplayStore } from "@reference/circuit/replay-stores";
 
 /**
@@ -210,8 +211,23 @@ import type {
  * restart. Idempotent: if the circuit is already revoked, revoke() returns true.
  */
 export class DurableSqliteCircuitRevocationStore implements CircuitRevocationStore {
+  /**
+   * Optional per-instance Prisma client. Defaults to the app-global `db`.
+   *
+   * Per R-009 Stage 3 Phase 3 (real multi-process propagation): each
+   * participant process needs its OWN durable store / DB namespace. A test
+   * (or production deployment) can pass a dedicated `PrismaClient` pointing
+   * at a per-participant SQLite file. Production code that uses the default
+   * app-global `db` is unaffected.
+   */
+  private readonly client: PrismaClient;
+
+  constructor(client?: PrismaClient) {
+    this.client = client ?? db;
+  }
+
   async isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean> {
-    const row = await db.circuitRevocation.findUnique({
+    const row = await this.client.circuitRevocation.findUnique({
       where: {
         circuitIdHex_commitmentRootHex: {
           circuitIdHex: toHex(circuitId),
@@ -231,7 +247,7 @@ export class DurableSqliteCircuitRevocationStore implements CircuitRevocationSto
     destroyNonce: Uint8Array,
   ): Promise<boolean> {
     try {
-      await db.circuitRevocation.upsert({
+      await this.client.circuitRevocation.upsert({
         where: {
           circuitIdHex_commitmentRootHex: {
             circuitIdHex: toHex(circuitId),
@@ -332,8 +348,23 @@ import type {
  *   - false → genuine persistence failure → return fail-closed.
  */
 export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
+  /**
+   * Optional per-instance Prisma client. Defaults to the app-global `db`.
+   *
+   * Per R-009 Stage 3 Phase 3 (real multi-process propagation): each
+   * participant process needs its OWN durable store / DB namespace. A test
+   * (or production deployment) can pass a dedicated `PrismaClient` pointing
+   * at a per-participant SQLite file. Production code that uses the default
+   * app-global `db` is unaffected.
+   */
+  private readonly client: PrismaClient;
+
+  constructor(client?: PrismaClient) {
+    this.client = client ?? db;
+  }
+
   async isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean> {
-    const row = await db.circuitRevocation.findUnique({
+    const row = await this.client.circuitRevocation.findUnique({
       where: {
         circuitIdHex_commitmentRootHex: {
           circuitIdHex: toHex(circuitId),
@@ -362,9 +393,9 @@ export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
     // ATOMIC transaction: consume the nonce + create the tombstone (authoritative
     // ACTIVE→REVOKED transition). Both in the SAME transaction — no split state.
     try {
-      await db.$transaction([
+      await this.client.$transaction([
         // 1. Consume the destroy nonce (unique constraint catches replays).
-        db.consumedCircuitDestroy.create({
+        this.client.consumedCircuitDestroy.create({
           data: {
             commitmentRootHex: toHex(commitmentRoot),
             circuitIdHex: toHex(circuitId),
@@ -375,7 +406,7 @@ export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
         //    (circuitIdHex, commitmentRootHex) is the AUTHORITATIVE transition:
         //    exactly ONE transaction's create succeeds. Concurrent transactions'
         //    create fails → rollback → re-check isRevoked → idempotent.
-        db.circuitRevocation.create({
+        this.client.circuitRevocation.create({
           data: {
             circuitIdHex: toHex(circuitId),
             commitmentRootHex: toHex(commitmentRoot),
@@ -440,7 +471,7 @@ export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
     destroyNonce: Uint8Array,
   ): Promise<boolean> {
     try {
-      await db.circuitRevocation.upsert({
+      await this.client.circuitRevocation.upsert({
         where: {
           circuitIdHex_commitmentRootHex: {
             circuitIdHex: toHex(circuitId),

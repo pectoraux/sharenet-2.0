@@ -2529,3 +2529,50 @@ Stage Summary:
 - Per-participant replay namespace (commitmentRoot, circuitId, destroyNonce) retained. ORIGIN replay + PROPAGATION duplicate suppression both handled. Duplicate propagation suppressed (propagate: false on idempotent — no infinite loops).
 - True multi-process: 4 independent processes (initiator, relay0, relay1, gateway) each with their own memory + destroyStore. Only serialized wire bytes cross boundaries.
 - Restart survival: the DurableSqliteCircuitDestroyStore tombstone persists across a "restart" (new store instance, same DB). Old frames rejected (revoked); old destroys idempotent.
+
+---
+Task ID: R009-S3-P3-tcp
+Agent: orchestrator
+Task: R-009 Stage 3 Phase 3 — REAL TCP transport destroy propagation (re-audit of 5f62f21).
+
+Work Log:
+- Read previous worklog + git log: confirmed at commit 5f62f21 (R-009 Stage 3 Phase 3: destroy propagation + true multi-process teardown).
+- Read the audit's verdict: the previous multi-process test spawned independent processes but used the PARENT TEST PROCESS as the router (stdin/stdout IPC for each hop). The destroy artifact did NOT cross a real transport boundary. InMemoryCircuitDestroyStore was used (not the production durable store).
+- Requirement: real TCP transport between independent processes, each with its OWN DurableSqliteCircuitDestroyStore (own SQLite DB namespace), byte-for-byte wire propagation, transport-failure + restart + concurrency tests.
+
+Root-cause investigation (PrismaClient + Bun dynamic datasource):
+- The DurableSqliteCircuitDestroyStore originally used the app-global `db` (single DATABASE_URL). For per-participant DB namespaces, each child process needs its own PrismaClient pointing at a per-participant SQLite file.
+- Tested `new PrismaClient({ datasources: { db: { url: 'file:...' } } })` in a child process spawned via `bun -e` → FAILED with "Cannot find module '.prisma/client/default'" — a Bun + Prisma issue when the datasource URL is overridden at runtime in a child process (the generated client resolves relative to the original DATABASE_URL).
+- Solution: pass `DATABASE_URL` as a PROCESS ENVIRONMENT VARIABLE to each child (`spawn({ env: { ...process.env, DATABASE_URL: 'file:<per-participant-path>' } })`). The child uses the default `new DurableSqliteCircuitDestroyStore()` (which uses the app-global `db`, which picks up `DATABASE_URL` from the process env). This is the clean per-process durable namespace.
+- For the schema: each per-participant DB file is initialized via `prisma db push --accept-data-loss --skip-generate` with `DATABASE_URL=file:<path>` (run synchronously before spawning the participant). This creates all tables with the correct schema (including the `id` cuid primary key on ConsumedCircuitDestroy).
+
+DurableSqliteCircuitDestroyStore + DurableSqliteCircuitRevocationStore refactor (src/lib/sharenet/durable-circuit-replay-stores.ts):
+- Both classes now accept an OPTIONAL `PrismaClient` constructor parameter. Defaults to the app-global `db`. A test (or production deployment) can pass a dedicated client pointing at a per-participant DB file. Production code that uses the default is unaffected.
+- All `db.*` calls replaced with `this.client.*` (the per-instance client). The $transaction + create + upsert + findUnique all use `this.client`.
+- 56 existing tests pass unchanged (the default constructor behavior is preserved).
+
+Real TCP transport propagation tests (tests/r009-destroy-propagation-tcp.test.ts, +5 tests, new file):
+- Each participant is an INDEPENDENT PROCESS (child_process.spawn("bun", ["-e", script], { env: { DATABASE_URL: 'file:<per-participant-db>' } })). Each process runs its OWN TCP server (node:net createServer) that listens for length-prefixed destroy wire bytes over a real TCP socket (127.0.0.1:<allocated-port>).
+- Wire protocol: [4 bytes big-endian length][length bytes destroy wire] — a real length-prefixed TCP framing protocol.
+- Each participant: reads wire bytes over TCP → reconstructs ActiveCircuit from hex artifacts → calls processCircuitDestroy with its OWN DurableSqliteCircuitDestroyStore (own SQLite DB) → if ok + propagate: forwards result.wireBytes (byte-for-byte) to the next hop over TCP → reports result (action, isRevoked, keysZeroized, bytesIdentical, inputHex, outputHex, direction) to the parent over stdout.
+- The ORIGINATOR (initiator for forward, gateway for backward) does NOT listen — it directly processes the destroy locally + sends result.wireBytes to the first relay over TCP.
+
+Tests:
+1. INITIATOR destroy FORWARD (4 processes, real TCP): INITIATOR → relay0 → relay1 → GATEWAY. Each hop is a TCP server. The destroy wire bytes cross a real TCP socket at every hop. All 4 participants durably revoke + zeroize. Bytes byte-for-byte identical (inputHex === outputHex === original destroyWireHex at every hop). direction=FORWARD.
+2. GATEWAY destroy BACKWARD (4 processes, real TCP): GATEWAY → relay1 → relay0 → INITIATOR. Same structure, reverse direction. direction=BACKWARD. Gateway proof required + verified at every hop.
+3. Transport failure (real TCP): local revoke succeeds + next-hop transport fails (nobody listening on relay0Port) → local tombstone persists (verified via verifyTombstone helper). Retry: spawn relay0 + manually send the destroy over TCP → relay0 receives + revokes (fresh). Bytes unchanged.
+4. Restart with durable store (real TCP): revoke → kill participant → restart with SAME DB file → send SAME destroy → idempotent (ALREADY_REVOKED, propagate=false). Tombstone verified in the DB.
+5. Concurrent multi-process destroy (real TCP): two destroys with DIFFERENT nonces sent CONCURRENTLY over separate TCP connections to the SAME participant → exactly ONE ACTIVE→REVOKED transition (the CREATE tombstone wins), the other is idempotent (ALREADY_REVOKED). Tombstone verified.
+
+verifyTombstone helper: uses DurableSqliteCircuitRevocationStore with a per-file PrismaClient (the parent process resolves the generated client fine — the issue was only in child processes spawned via bun -e).
+
+Verification (all five required suites):
+- Unit tests: 533 pass / 0 fail (was 528; +5 TCP propagation tests). 1952 expect() calls across 32 files in 24.00s.
+- Architecture tests: 24/24 pass (incl. #21 + #23 layer-separation).
+- TS conformance vectors: 41/41 pass.
+- Python conformance vectors: 41/41 pass.
+- Lint: clean (exit 0).
+
+Stage Summary:
+- R-009 Stage 3 Phase 3 is now closed for real: the destroy artifact crosses a REAL TCP transport boundary between independent participant processes. Each process uses its OWN DurableSqliteCircuitDestroyStore (own SQLite DB namespace, initialized via prisma db push). No InMemoryCircuitDestroyStore in the propagation path. The wire bytes are byte-for-byte identical at every hop. Transport failure + restart + concurrency all fail safely.
+- The closure criterion is satisfied: "An INITIATOR- or GATEWAY-originated CircuitDestroy traverses the actual authenticated transport path across independent participant processes, unchanged byte-for-byte, each participant durably revokes and zeroizes locally, and restart/replay/persistence/transport failure remain safe."
