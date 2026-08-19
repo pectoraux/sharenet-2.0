@@ -27,9 +27,10 @@
 
 import { randomBytes } from "@noble/hashes/utils.js";
 import { canonicalEncode, canonicalDecode, toHex, fromHex } from "../encoding/cbor";
-import { signMessage, verifySignature } from "../identity/keys";
+import { signMessage, verifySignature, verifyNodeIdBinding } from "../identity/keys";
 import type { CircuitRevocationStore, CircuitDestroyReplayStore } from "./replay-stores";
 import type { ActiveCircuit } from "./circuit";
+import { zeroizeCircuit } from "./zeroize";
 
 // -----------------------------------------------------------------------
 // Constants (R-009 Stage 3 — CircuitDestroy)
@@ -372,13 +373,20 @@ export type ProcessCircuitDestroyResult =
  *   2. Verify the CircuitDestroy (signature + routeId + role).
  *   3. Verify the circuit binding (circuitId + commitmentRoot match the
  *      local circuit context).
- *   4. Verify destroyer authorization:
- *      - INITIATOR: destroyerNodeId must match the circuit's initiatorNodeId.
- *      - GATEWAY: destroyerNodeId must match the terminal hop's nodeId.
- *   5. Check durable revocation (if already revoked → idempotent success).
+ *   4. Verify destroyer authorization (identity binding AND role binding):
+ *      a. verifyNodeIdBinding(destroyerNodeId, destroyerEd25519PublicKey) —
+ *         the claimed NodeId MUST derive from the claimed public key.
+ *         This closes the identity authorization bypass: an attacker cannot
+ *         sign a destroy with their own key while claiming a legitimate
+ *         NodeId (the destroyerNodeId string is public; the key is not).
+ *      b. INITIATOR: destroyerNodeId must match the circuit's initiatorNodeId.
+ *         GATEWAY: destroyerNodeId must match the terminal hop's nodeId.
+ *   5. Check durable revocation (if already revoked → idempotent success +
+ *      zeroize, since the tombstone is authoritative and the circuit is dead).
  *   6. Consume the destroy nonce (durable, fail-closed).
  *   7. Write the durable revocation record.
- *   8. Zeroize circuit key material (best-effort).
+ *   8. Zeroize circuit key material (best-effort) — OWNED by this function.
+ *      The caller is NOT responsible for calling zeroizeCircuit().
  *   9. Return the CircuitDestroy for propagation (unchanged — no re-signing).
  *
  * @param wireBytes - the raw canonical-CBOR-encoded CircuitDestroy bytes
@@ -420,6 +428,26 @@ export async function processCircuitDestroy(
   }
 
   // 4. Verify destroyer authorization.
+  //
+  // 4a. IDENTITY BINDING (closes the identity authorization bypass).
+  // The destroyerNodeId is a PUBLIC string (it appears in route advertisements,
+  // circuit setup records, etc.). An attacker who learns a legitimate
+  // initiator's or gateway's NodeId CANNOT use it to forge a destroy, because
+  // the destroy must ALSO carry a destroyerEd25519PublicKey that cryptographically
+  // derives that NodeId (BLAKE3-256 over the public key). An attacker signing
+  // with their OWN key will have a destroyerEd25519PublicKey that derives a
+  // DIFFERENT NodeId than the legitimate one they're claiming — this check
+  // catches that. Without this check, the destroyerNodeId === expectedInitiatorNodeId
+  // comparison below would pass for any attacker who knows the initiator's
+  // public NodeId string.
+  if (!verifyNodeIdBinding(destroy.destroyerNodeId, destroy.destroyerEd25519PublicKey)) {
+    return {
+      ok: false,
+      reason: "unauthorized: destroyerEd25519PublicKey does not derive destroyerNodeId (identity binding failed) — forged destroy rejected",
+    };
+  }
+
+  // 4b. ROLE AUTHORIZATION (the claimed identity is the authorized one).
   if (destroy.destroyerRole === DESTROYER_ROLE_INITIATOR) {
     if (destroy.destroyerNodeId !== expectedInitiatorNodeId) {
       return {
@@ -441,8 +469,13 @@ export async function processCircuitDestroy(
   // 5. Check durable revocation (idempotent).
   const alreadyRevoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
   if (alreadyRevoked) {
-    // Idempotent: the circuit is already revoked. Return success without
-    // re-consuming the nonce or re-writing the revocation.
+    // Idempotent: the circuit is already revoked. The durable tombstone is
+    // the authoritative terminal-state record (per ADR-0022 §5 + spec/08
+    // §6.3): if it exists, the circuit is CIRCUIT_REVOKED regardless of any
+    // local transient state. Return success without re-consuming the nonce
+    // or re-writing the revocation. Zeroize is idempotent (re-filling zeros
+    // is a no-op if keys were already zeroized by the prior destroy).
+    zeroizeCircuit(circuit);
     return { ok: true, idempotent: true, circuitDestroy: destroy };
   }
 
@@ -469,15 +502,26 @@ export async function processCircuitDestroy(
     destroy.destroyNonce,
   );
   if (!revoked) {
+    // Persistence failure — fail closed. The destroy nonce has been consumed
+    // (step 6) but the tombstone was NOT persisted. The circuit is in an
+    // inconsistent state: the nonce is spent but there is no tombstone.
+    // The correct response is to REJECT (the destroy did not complete the
+    // durable terminal-state transition). The destroy nonce consumption is
+    // irrecoverable, which is the safe outcome — a replayed destroy will now
+    // be rejected by step 6, and the operator must issue a NEW destroy with
+    // a fresh nonce if they wish to retry.
     return {
       ok: false,
-      reason: "failed to write durable revocation record (persistence failure, fail-closed)",
+      reason: "failed to write durable revocation record (persistence failure, fail-closed) — destroy nonce consumed but tombstone NOT persisted",
     };
   }
 
-  // 8. Zeroize circuit key material (best-effort).
-  // The caller is responsible for calling zeroizeCircuit(circuit) from forwarding.ts.
-  // We don't import it here to avoid a circular dependency — the caller does it.
+  // 8. Zeroize circuit key material (best-effort) — OWNED by processCircuitDestroy.
+  // Per the re-audit of 6936831: the caller is NOT responsible for calling
+  // zeroizeCircuit(). This function owns the full teardown pipeline, including
+  // zeroization. The tombstone is confirmed persisted (step 7), so it is safe
+  // to destroy the keys.
+  zeroizeCircuit(circuit);
 
   // 9. Return the CircuitDestroy for propagation (unchanged).
   return { ok: true, idempotent: false, circuitDestroy: destroy };

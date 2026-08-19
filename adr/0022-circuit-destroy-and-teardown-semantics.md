@@ -47,10 +47,25 @@ CIRCUIT_ACTIVE
 expiry lead to the same terminal state. `CIRCUIT_EXPIRED` is NOT a separate
 terminal state — it is an event that transitions to `CIRCUIT_REVOKED`.
 
+**The durable `CircuitRevocation` tombstone is the AUTHORITATIVE terminal
+security state** (re-audit of 6936831, finalizing lifecycle semantics):
+
+- `CIRCUIT_ACTIVE` ≡ no durable tombstone exists for `(circuitId, commitmentRoot)`.
+- `CIRCUIT_REVOKED` ≡ a durable tombstone exists for `(circuitId, commitmentRoot)`.
+
+There is exactly ONE state machine and ONE source of truth. A local
+implementation MAY have an implementation-only transient cleanup state
+(e.g., an in-memory `DESTROYING` flag for async key erasure bookkeeping),
+but that transient state MUST NEVER contradict the durable tombstone: if
+the tombstone exists, the circuit is `CIRCUIT_REVOKED` (full stop); if it
+does not exist, the circuit is `CIRCUIT_ACTIVE` (subject to expiry).
+No second competing state machine is permitted.
+
 **No `CIRCUIT_DESTROYING` intermediate wire state:** The destroyer signs +
 sends the destroy. Each recipient verifies + revokes locally. The destroy
 IS the revocation. (A `DESTROYING` intermediate state may exist in local
-memory for async key cleanup, but it is not wire-visible.)
+memory for async key cleanup, but it is not wire-visible and does not
+affect the authoritative tombstone.)
 
 **No `CIRCUIT_PENDING` in the production path:** `CIRCUIT_PENDING` exists
 only during setup. Once `establishDistributedCircuit` returns an
@@ -76,21 +91,38 @@ boundaries** — no WeakSet or in-process `BrandedCommittedRoute` dependency.
 
 **Initiator destroy authorization:**
 The destroyer proves it is the circuit's initiator by signing the destroy
-with the same Ed25519 key that established the circuit. The binding is:
-- `destroyerNodeId` matches the route's `initiatorNodeId`.
-- `destroyerEd25519PublicKey` is the initiator's node identity key.
-- The signature is verified using `destroyerEd25519PublicKey`.
+with the same Ed25519 key that established the circuit. The binding is
+TWO-LAYERED (re-audit of 6936831 — closes the identity authorization bypass):
+- **Layer 1 (identity binding):** `verifyNodeIdBinding(destroyerNodeId,
+  destroyerEd25519PublicKey)` MUST hold — the claimed `destroyerNodeId` MUST
+  be the canonical BLAKE3-256 derivation of the claimed public key. This is
+  enforced inside `processCircuitDestroy()` BEFORE the role check. Without
+  this layer, an attacker who merely learns a legitimate initiator's public
+  NodeId string could sign a forged destroy with their own keypair while
+  setting `destroyerNodeId` to the legitimate value; the signature would
+  verify (against the attacker's own pubkey in the destroy) and the role
+  check (`destroyerNodeId === expectedInitiatorNodeId`) would pass.
+- **Layer 2 (role binding):** `destroyerNodeId` matches the route's
+  `initiatorNodeId`; `destroyerEd25519PublicKey` is the initiator's node
+  identity key; the signature is verified using `destroyerEd25519PublicKey`.
+
+The portable verifier `verifyCircuitDestroy()` performs Layer 2's
+signature check only (it is structure + signature verification); Layer 1
+(identity binding) + the role authorization are enforced by the production
+path `processCircuitDestroy()`, which is the only path that has the circuit
+context (`expectedInitiatorNodeId` / `expectedGatewayNodeId`).
 
 **Gateway destroy authorization:**
 The destroyer proves it is the terminal hop using the same portable proof
 chain established in Stage 2 (`GatewayReturnAuthorization`):
-- The terminal `RouteAcceptance` signature (signed by the terminal relay's
-  Ed25519 key, binding `acceptorNodeId` + `hopIndex`).
-- The Merkle inclusion proof (proving the acceptance belongs to
-  `commitmentRoot`).
-- The `routeId` derivation check (`routeId = "route:" + hex(commitmentRoot)`).
-- `destroyerNodeId` matches the terminal acceptance's `acceptorNodeId`.
-- `destroyerEd25519PublicKey` verifies the acceptance signature.
+- **Layer 1 (identity binding):** `verifyNodeIdBinding(destroyerNodeId,
+  destroyerEd25519PublicKey)` MUST hold — same two-layer model as initiator.
+- **Layer 2 (role binding):** the terminal `RouteAcceptance` signature
+  (signed by the terminal relay's Ed25519 key, binding `acceptorNodeId` +
+  `hopIndex`); the Merkle inclusion proof (proving the acceptance belongs to
+  `commitmentRoot`); the `routeId` derivation check; `destroyerNodeId`
+  matches the terminal acceptance's `acceptorNodeId`;
+  `destroyerEd25519PublicKey` verifies the acceptance signature.
 
 This reuses the established portable proof model from Stage 2 — no new
 trust infrastructure.
@@ -173,14 +205,26 @@ revoked (the durable revocation record exists) returns success without
 re-consuming the replay nonce. The revocation tombstone is the source of
 truth — if it exists, the destroy is idempotent.
 
-### 7. Expiry as a durable terminal-state transition
+### 7. Expiry as a durable terminal-state transition (fail-closed)
 
 Expiry is NOT merely a local frame rejection. When `now > valid_until`:
 
 1. The circuit transitions to `CIRCUIT_REVOKED`.
 2. A durable revocation record is written (reason = `CIRCUIT_EXPIRED`).
-3. Keys are zeroized (best-effort).
+3. Keys are zeroized (best-effort) — **only AFTER the tombstone is confirmed persisted**.
 4. The replay floor is RETAINED.
+
+**Fail-closed (re-audit of 6936831):** if the durable revocation write
+FAILS (the `CircuitRevocationStore.revoke()` call returns `false`), the
+production path MUST:
+- reject the frame with an explicit persistence-failure reason;
+- NOT claim the circuit is "durably revoked" (no false success state);
+- NOT zeroize keys (the terminal state was not durably recorded; the
+  operator may retry, and zeroized keys cannot be recovered).
+
+There is no false "durably revoked" state. Either the tombstone is
+persisted (and the circuit is durably dead + keys destroyed), or it is
+not (and the circuit is still live-but-expired, awaiting a retry).
 
 After a process restart, the durable revocation record ensures the
 circuit is still known to be dead.
@@ -206,7 +250,25 @@ The frozen ordering (AEAD → commit → forward) is preserved. Expiry/revocatio
 checks happen BEFORE AEAD — a rejected frame due to expiry/revocation never
 reaches the replay floor. No replay state advances on a rejected frame.
 
-### 9. Key zeroization (best-effort)
+### 9. Key zeroization (best-effort) — OWNED by processCircuitDestroy
+
+`processCircuitDestroy()` owns the full teardown pipeline, including
+zeroization (re-audit of 6936831). The pipeline is:
+
+```
+decode → verify signature → verify circuit binding →
+  verifyNodeIdBinding (Layer 1) →
+  authorize role (Layer 2) →
+  check durable revocation (idempotent? zeroize + return) →
+  consume destroy nonce (durable, fail-closed) →
+  write durable revocation record (fail-closed: reject if not persisted) →
+  zeroize keys →
+  return CircuitDestroy for propagation
+```
+
+The caller is NOT responsible for calling `zeroizeCircuit()`. The canonical
+teardown path performs it itself, in both the fresh-destroy and idempotent
+(re-destroy of an already-revoked circuit) branches.
 
 When a circuit is revoked:
 - `forwardingKey[]` → zeroized (filled with zeros)

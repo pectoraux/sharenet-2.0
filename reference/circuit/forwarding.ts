@@ -53,10 +53,21 @@ import {
 import type { ActiveCircuit } from "./circuit";
 import type { CircuitRevocationStore } from "./replay-stores";
 import {
+  DESTROYER_ROLE_INITIATOR,
+  DESTROY_REASON_CIRCUIT_EXPIRED,
+} from "./destroy";
+import { zeroizeCircuit as zeroizeCircuitImpl } from "./zeroize";
+import {
   peelReturnEnvelopeLayer,
   decryptReturnPayload,
   encodeReturnFramePayload,
 } from "./return-template";
+
+// Re-export zeroizeCircuit for backwards compatibility with existing imports
+// (e.g. tests that do `import { zeroizeCircuit } from "@reference/circuit/forwarding"`).
+// The canonical home is now ./zeroize.ts so that BOTH destroy.ts (processCircuitDestroy)
+// and forwarding.ts (processCircuitWireFrame) can call it without a circular import.
+export { zeroizeCircuitImpl as zeroizeCircuit };
 
 // -----------------------------------------------------------------------
 // Forwarding result (AEAD-only, no durable commit)
@@ -270,19 +281,34 @@ export async function processCircuitWireFrame(
   // Expiry performs a DURABLE terminal-state transition: write a revocation
   // record (reason CIRCUIT_EXPIRED) + zeroize keys. This ensures the
   // circuit is still known to be dead after a process restart.
+  //
+  // FAIL-CLOSED (re-audit of 6936831): if the durable revocation write FAILS,
+  // the production path MUST NOT claim the circuit is "durably revoked" and
+  // MUST NOT zeroize keys (we cannot confirm the terminal state was recorded;
+  // the operator may need to retry, and zeroized keys cannot be recovered).
+  // The frame is rejected with an explicit persistence-failure reason.
+  // There is no false "durably revoked" state.
   if (circuit.expiry <= now) {
-    // Durable revoke-if-active (idempotent: if already revoked, this is a no-op).
-    await revocationStore.revoke(
+    const revoked = await revocationStore.revoke(
       circuit.circuitId,
       circuit.commitmentRoot,
       "system", // expiry is system-initiated
-      0x01, // DESTROYER_ROLE_INITIATOR (the circuit owner's context)
-      0x02, // DESTROY_REASON_CIRCUIT_EXPIRED
+      DESTROYER_ROLE_INITIATOR, // the circuit owner's context
+      DESTROY_REASON_CIRCUIT_EXPIRED,
       new Uint8Array(16), // zero nonce for expiry (no wire destroy message)
     );
-    // Best-effort zeroize.
-    zeroizeCircuit(circuit);
-    return { ok: false, reason: `circuit expired: expiry ${circuit.expiry} ≤ now ${now}` };
+    if (!revoked) {
+      // Persistence failure — fail closed. Do NOT zeroize (the terminal state
+      // was not durably recorded; the operator may retry). Do NOT claim expiry
+      // succeeded. Return an explicit persistence-failure reason.
+      return {
+        ok: false,
+        reason: `circuit expired BUT durable revocation persistence FAILED (fail-closed): expiry ${circuit.expiry} ≤ now ${now} — tombstone NOT persisted, keys retained for retry`,
+      };
+    }
+    // Tombstone persisted — safe to zeroize + reject.
+    zeroizeCircuitImpl(circuit);
+    return { ok: false, reason: `circuit expired: expiry ${circuit.expiry} ≤ now ${now} (durably revoked)` };
   }
 
   // Step 0b (R-009 Stage 3): check durable revocation.
@@ -390,33 +416,12 @@ export function processWireFrame(
 // -----------------------------------------------------------------------
 // Key zeroization (R-009 Stage 3 — best-effort)
 // -----------------------------------------------------------------------
-
-/**
- * Best-effort zeroization of circuit key material.
- *
- * Per spec/08 §6.4 + ADR-0022: when a circuit is revoked, all derived keys
- * MUST be zeroized. This function fills each key array with zeros IN-PLACE.
- *
- * NOT guaranteed: the GC may have copied keys; the OS may have paged them.
- * This is defense-in-depth, not a hard memory-erasure guarantee.
- *
- * After zeroize, the circuit object's keys are all zeros. Any attempt to
- * use them for AEAD will fail (wrong key → AEAD tag failure).
- */
-export function zeroizeCircuit(circuit: ActiveCircuit): void {
-  for (const hop of circuit.hops) {
-    hop.forwardingKey.fill(0);
-    hop.returnKey.fill(0);
-    if (hop.relayX25519PublicKey) {
-      hop.relayX25519PublicKey.fill(0);
-    }
-  }
-  circuit.initiatorX25519SecretKey.fill(0);
-  circuit.noncePrefix.fill(0);
-  // circuit.commitmentRoot is NOT zeroized — it's the route identity,
-  // needed for replay floor lookups + revocation checks.
-  // circuit.circuitId is NOT zeroized — it's the circuit identity,
-  // needed for revocation checks.
-}
+//
+// zeroizeCircuit() now lives in ./zeroize.ts (see the re-export at the top
+// of this file). It was moved so that processCircuitDestroy() in destroy.ts
+// can call it without creating a circular import (destroy.ts ↔ forwarding.ts).
+// Both the canonical teardown path (processCircuitDestroy) and the expiry
+// path (processCircuitWireFrame, step 0a above) own their own zeroization —
+// neither requires the caller to invoke zeroizeCircuit() separately.
 
 export { encodeCircuitFrame };

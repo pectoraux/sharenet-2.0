@@ -49,6 +49,7 @@ import {
   InMemoryCircuitSequenceFloorStore,
   InMemoryCircuitRevocationStore,
   InMemoryCircuitDestroyReplayStore,
+  type CircuitRevocationStore,
 } from "@reference/circuit/replay-stores";
 import { db } from "@/lib/db";
 import { DurableSqliteCircuitRevocationStore, DurableSqliteCircuitDestroyReplayStore } from "@/lib/sharenet/durable-circuit-replay-stores";
@@ -376,7 +377,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const revocationStore = new InMemoryCircuitRevocationStore();
     const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
-    const initiatorKp = route.kps[0]!; // use the route helper's initiator keypair
+    const initiatorKp = route.initiator; // the route helper's REAL initiator keypair (its publicKey derives route.initiator.nodeId)
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
 
     const destroy = signCircuitDestroy(
@@ -482,7 +483,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const revocationStore = new InMemoryCircuitRevocationStore();
     const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
-    const initiatorKp = route.kps[0]!;
+    const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
 
     const destroy = signCircuitDestroy(
@@ -523,7 +524,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const revocationStore = new InMemoryCircuitRevocationStore();
     const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
-    const initiatorKp = route.kps[0]!;
+    const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
 
     // Sign for a DIFFERENT circuitId.
@@ -555,7 +556,7 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const revocationStore = new InMemoryCircuitRevocationStore();
     const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
-    const initiatorKp = route.kps[0]!;
+    const initiatorKp = route.initiator;
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
 
     // Destroy the circuit.
@@ -633,5 +634,354 @@ describe("R-009 Stage 3: processCircuitDestroy (canonical teardown path)", () =>
     const restartedStore = revocationStore; // in-memory: same object (durable would be new instance from DB)
     const isStillRevoked = await restartedStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
     expect(isStillRevoked).toBe(true);
+  });
+});
+
+// =====================================================================
+// R-009 Stage 3 re-audit of 6936831: identity authorization bypass +
+// fail-closed expiry + zeroize ownership.
+//
+// Four gaps flagged by the re-audit:
+//   1. CircuitDestroy checked destroyerNodeId == expectedInitiatorNodeId
+//      but NOT that destroyerEd25519PublicKey derives destroyerNodeId.
+//   2. processCircuitWireFrame ignored the boolean result of
+//      revocationStore.revoke() during expiry.
+//   3. processCircuitDestroy did not own zeroization (caller obligation).
+//   4. Lifecycle semantics needed a single authoritative state machine.
+// =====================================================================
+
+/**
+ * Test double: a CircuitRevocationStore whose revoke() ALWAYS fails.
+ *
+ * Simulates a durable persistence failure (DB write error, disk full, unique
+ * constraint violation that is NOT the idempotent case, etc.). Used to prove
+ * the expiry path is fail-closed: a failed revoke() MUST NOT be claimed as
+ * "durably revoked" and MUST NOT zeroize keys.
+ */
+class FailingCircuitRevocationStore implements CircuitRevocationStore {
+  async isRevoked(): Promise<boolean> {
+    return false; // never revoked — so the expiry path actually attempts revoke()
+  }
+  async revoke(): Promise<boolean> {
+    return false; // ALWAYS fails — simulates persistence failure
+  }
+}
+
+// ---- Fix #1: identity authorization bypass is closed ------------------
+
+describe("R-009 Stage 3 re-audit (6936831): identity authorization bypass is closed", () => {
+  test("valid initiator destroy → ACCEPT (legitimate key derives legitimate NodeId)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const revocationStore = new InMemoryCircuitRevocationStore();
+    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // Legitimate: initiator signs with their own key + claims their own NodeId.
+    // verifyNodeIdBinding(initiator.nodeId, initiatorKp.publicKey) → true.
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      revocationStore, destroyReplayStore,
+      NOW,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.idempotent).toBe(false);
+
+    // Circuit is durably revoked.
+    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+  });
+
+  test("attacker key + legitimate initiator NodeId → REJECT (identity binding fails)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const revocationStore = new InMemoryCircuitRevocationStore();
+    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // ATTACK: the attacker generates their OWN Ed25519 keypair, but sets
+    // destroyerNodeId to the LEGITIMATE initiator's public NodeId string.
+    // The signature verifies (against the attacker's own pubkey, which the
+    // attacker honestly places in destroyerEd25519PublicKey). Without the
+    // identity-binding check, destroyerNodeId === expectedInitiatorNodeId
+    // would PASS and the forged destroy would be accepted.
+    const attackerKp = generateNodeKeypair();
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId, // ← attacker claims the LEGITIMATE initiator's NodeId
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      attackerKp.secretKey, attackerKp.publicKey, // ← but signs with ATTACKER's key
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      revocationStore, destroyReplayStore,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("identity binding failed");
+      expect(result.reason).toContain("forged destroy rejected");
+    }
+
+    // CRITICAL: the circuit MUST NOT be revoked by a forged destroy.
+    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+
+    // And the destroy nonce MUST NOT have been consumed (we rejected before step 6).
+    // A retry with the SAME nonce would still be accepted on a genuine destroy.
+    const reConsume = await destroyReplayStore.consume(
+      circuit.commitmentRoot, circuit.circuitId, destroy.destroyNonce,
+    );
+    expect(reConsume).toBe(true); // first use — the forged destroy did not consume it
+  });
+
+  test("attacker key + legitimate gateway NodeId → REJECT (identity binding fails)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const revocationStore = new InMemoryCircuitRevocationStore();
+    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // ATTACK: same as above but targeting the GATEWAY role. The attacker
+    // claims the legitimate gateway's NodeId while signing with their own key.
+    const attackerKp = generateNodeKeypair();
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      gatewayNodeId, // ← attacker claims the LEGITIMATE gateway's NodeId
+      DESTROYER_ROLE_GATEWAY,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      attackerKp.secretKey, attackerKp.publicKey, // ← but signs with ATTACKER's key
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      revocationStore, destroyReplayStore,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("identity binding failed");
+    }
+    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
+  });
+
+  test("valid gateway destroy → ACCEPT (legitimate gateway key derives gateway NodeId)", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const revocationStore = new InMemoryCircuitRevocationStore();
+    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayKp = route.kps[1]!;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // Legitimate: gateway signs with their own key + claims their own NodeId.
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      gatewayNodeId,
+      DESTROYER_ROLE_GATEWAY,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      gatewayKp.secretKey, gatewayKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      revocationStore, destroyReplayStore,
+      NOW,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.idempotent).toBe(false);
+    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+  });
+});
+
+// ---- Fix #2: expiry revocation is fail-closed -------------------------
+
+describe("R-009 Stage 3 re-audit (6936831): expiry revocation is fail-closed", () => {
+  test("revocation persistence failure → frame rejected, fail-closed, keys NOT zeroized", async () => {
+    const route = makeRoute(1);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+
+    // Snapshot key material BEFORE the expiry attempt — to prove it is retained.
+    expect(circuit.hops[0]!.forwardingKey.some((b) => b !== 0)).toBe(true);
+    expect(circuit.initiatorX25519SecretKey.some((b) => b !== 0)).toBe(true);
+    const fwdKeySnapshot = new Uint8Array(circuit.hops[0]!.forwardingKey);
+    const initSecretSnapshot = new Uint8Array(circuit.initiatorX25519SecretKey);
+
+    const plaintext = new TextEncoder().encode("expired frame, failing store");
+    const sealed = sealForwardFrame(circuit, 1, plaintext);
+    const wireBytes = encodeCircuitFrame(sealed);
+
+    // now > expiry, BUT the revocation store ALWAYS fails to persist.
+    const failingStore = new FailingCircuitRevocationStore();
+    const result = await processCircuitWireFrame(circuit, 0, wireBytes, failingStore, route.branded.expiry + 1);
+
+    // The frame MUST be rejected.
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      // The reason MUST explicitly indicate a persistence failure (fail-closed),
+      // NOT a false "circuit expired (durably revoked)".
+      expect(result.reason).toContain("persistence FAILED");
+      expect(result.reason).toContain("fail-closed");
+      expect(result.reason).not.toContain("durably revoked");
+    }
+
+    // CRITICAL: keys MUST NOT be zeroized. The terminal state was NOT durably
+    // recorded, so destroying the keys would be unsafe (the operator may
+    // retry; zeroized keys cannot be recovered). The keys are retained for retry.
+    expect(circuit.hops[0]!.forwardingKey.every((b) => b === 0)).toBe(false);
+    expect(circuit.initiatorX25519SecretKey.every((b) => b === 0)).toBe(false);
+    // The keys are byte-identical to the snapshot (untouched).
+    expect(circuit.hops[0]!.forwardingKey).toEqual(fwdKeySnapshot);
+    expect(circuit.initiatorX25519SecretKey).toEqual(initSecretSnapshot);
+
+    // The replay floor MUST NOT advance (the frame was rejected before AEAD).
+    expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
+  });
+});
+
+// ---- Fix #3: processCircuitDestroy owns zeroization --------------------
+
+describe("R-009 Stage 3 re-audit (6936831): processCircuitDestroy owns zeroization", () => {
+  test("processCircuitDestroy succeeds → all key material zeroized WITHOUT caller-side zeroize", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const revocationStore = new InMemoryCircuitRevocationStore();
+    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // Keys are non-zero BEFORE the destroy.
+    expect(circuit.hops[0]!.forwardingKey.some((b) => b !== 0)).toBe(true);
+    expect(circuit.hops[1]!.forwardingKey.some((b) => b !== 0)).toBe(true);
+    expect(circuit.hops[0]!.returnKey.some((b) => b !== 0)).toBe(true);
+    expect(circuit.initiatorX25519SecretKey.some((b) => b !== 0)).toBe(true);
+    expect(circuit.noncePrefix.some((b) => b !== 0)).toBe(true);
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    // Call processCircuitDestroy — the CANONICAL teardown path. The caller
+    // does NOT invoke zeroizeCircuit() afterwards. The function owns it.
+    const result = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      revocationStore, destroyReplayStore,
+      NOW,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.idempotent).toBe(false);
+
+    // CRITICAL: every private/derived key is all zeros AFTER processCircuitDestroy,
+    // WITHOUT any caller-side zeroizeCircuit() call in this test.
+    for (const hop of circuit.hops) {
+      expect(hop.forwardingKey.every((b) => b === 0)).toBe(true);
+      expect(hop.returnKey.every((b) => b === 0)).toBe(true);
+      if (hop.relayX25519PublicKey) {
+        expect(hop.relayX25519PublicKey.every((b) => b === 0)).toBe(true);
+      }
+    }
+    expect(circuit.initiatorX25519SecretKey.every((b) => b === 0)).toBe(true);
+    expect(circuit.noncePrefix.every((b) => b === 0)).toBe(true);
+
+    // commitmentRoot + circuitId are NOT zeroized (needed for revocation checks).
+    expect(circuit.commitmentRoot.some((b) => b !== 0)).toBe(true);
+    expect(circuit.circuitId.some((b) => b !== 0)).toBe(true);
+
+    // And the circuit is durably revoked.
+    expect(await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
+  });
+
+  test("idempotent destroy (already revoked) → keys still zeroized + no re-consume", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const revocationStore = new InMemoryCircuitRevocationStore();
+    const destroyReplayStore = new InMemoryCircuitDestroyReplayStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    // First destroy — fresh teardown. Keys zeroized.
+    const r1 = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      revocationStore, destroyReplayStore,
+      NOW,
+    );
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+    expect(r1.idempotent).toBe(false);
+    expect(circuit.hops[0]!.forwardingKey.every((b) => b === 0)).toBe(true);
+
+    // Re-mangle a key to prove the second (idempotent) destroy re-zeroizes.
+    circuit.hops[0]!.forwardingKey.fill(0xAB);
+    expect(circuit.hops[0]!.forwardingKey.some((b) => b !== 0)).toBe(true);
+
+    // Second destroy — idempotent (circuit already revoked). processCircuitDestroy
+    // STILL owns zeroization: it re-fills the keys with zeros (idempotent zeroize).
+    const r2 = await processCircuitDestroy(
+      wireBytes, circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      revocationStore, destroyReplayStore,
+      NOW,
+    );
+    expect(r2.ok).toBe(true);
+    if (!r2.ok) return;
+    expect(r2.idempotent).toBe(true); // already revoked — idempotent success
+    // Keys are zeroized again (idempotent zeroize is a no-op on already-zero keys,
+    // but here we deliberately re-mangled them, so this proves the function ran).
+    expect(circuit.hops[0]!.forwardingKey.every((b) => b === 0)).toBe(true);
   });
 });

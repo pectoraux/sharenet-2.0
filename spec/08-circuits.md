@@ -274,13 +274,23 @@ A circuit carries `valid_until = min(hop.accepted_expiry for hop in
 route)`. Once `now > valid_until`, the circuit MUST be torn down.
 
 Per ADR-0022 (R-009 Stage 3): expiry is NOT merely a local frame
-rejection. It is a **durable terminal-state transition**:
+rejection. It is a **durable terminal-state transition** (fail-closed):
 
 1. The circuit transitions to `CIRCUIT_REVOKED` (§6).
 2. A durable revocation record is written (keyed by `circuitId +
    commitmentRoot`), with reason `CIRCUIT_EXPIRED`.
-3. Keys are best-effort zeroized.
+3. Keys are best-effort zeroized — **only AFTER the tombstone is confirmed
+   persisted**. If the durable write FAILS (`CircuitRevocationStore.revoke()`
+   returns `false`), the production path MUST:
+   - reject the frame with an explicit persistence-failure reason;
+   - NOT claim the circuit is "durably revoked" (no false success state);
+   - NOT zeroize keys (the terminal state was not durably recorded; the
+     operator may retry, and zeroized keys cannot be recovered).
 4. The replay floor is RETAINED.
+
+There is no false "durably revoked" state. Either the tombstone is
+persisted (circuit is durably dead + keys destroyed) or it is not (circuit
+is still live-but-expired, awaiting retry).
 
 After a process restart, the durable revocation record ensures the
 circuit is still known to be dead. A revoked circuit MUST NOT be
@@ -402,12 +412,26 @@ CIRCUIT_ACTIVE  → CIRCUIT_REVOKED    (CircuitDestroy or expiry)
 
 `CIRCUIT_REVOKED` is terminal. No transitions out. No resurrection.
 
-### 6.3 Revocation is durable
+### 6.3 Revocation is durable (authoritative terminal state)
+
+The durable `CircuitRevocation` tombstone is the **authoritative terminal
+security state**. There is exactly ONE state machine and ONE source of truth:
+
+- `CIRCUIT_ACTIVE` ≡ no durable tombstone exists for `(circuitId, commitmentRoot)`.
+- `CIRCUIT_REVOKED` ≡ a durable tombstone exists for `(circuitId, commitmentRoot)`.
+
+A local implementation MAY have an implementation-only transient cleanup
+state (e.g., an in-memory `DESTROYING` flag for async key-erasure
+bookkeeping), but that transient state MUST NEVER contradict the durable
+tombstone: if the tombstone exists, the circuit is `CIRCUIT_REVOKED`; if it
+does not exist, the circuit is `CIRCUIT_ACTIVE` (subject to expiry). No
+second competing state machine is permitted.
 
 When a circuit transitions to `CIRCUIT_REVOKED`:
 1. A durable revocation record is written (keyed by `circuitId +
    commitmentRoot`).
-2. All derived keys are best-effort zeroized.
+2. All derived keys are best-effort zeroized — only AFTER the tombstone is
+   confirmed persisted (fail-closed; see §4.7).
 3. The sequence floor is RETAINED (for re-key/recovery protection).
 4. The circuit identity + route identity + destroy evidence are retained.
 
@@ -464,6 +488,28 @@ issuedAt || expiry`.
 
 Relays (intermediate hops) CANNOT originate a destroy. They MAY
 propagate an authenticated destroy unchanged.
+
+**Identity authorization (TWO-LAYERED — closes the bypass re-audited in 6936831):**
+The production path `processCircuitDestroy()` enforces authorization in
+two layers, BOTH of which MUST hold:
+
+- **Layer 1 (identity binding):** `verifyNodeIdBinding(destroyerNodeId,
+  destroyerEd25519PublicKey)` — the claimed `destroyerNodeId` MUST be the
+canonical BLAKE3-256 derivation of the claimed public key. Without this
+layer, an attacker who merely learns a legitimate initiator's or gateway's
+public NodeId string could sign a forged destroy with their own keypair
+(putting their own public key in `destroyerEd25519PublicKey`) while setting
+`destroyerNodeId` to the legitimate value; the signature would verify
+(against the attacker's own pubkey) and the role check below would pass.
+- **Layer 2 (role binding):** for INITIATOR, `destroyerNodeId` MUST equal
+  the circuit's `expectedInitiatorNodeId`; for GATEWAY, `destroyerNodeId`
+  MUST equal `expectedGatewayNodeId` (with the portable terminal-hop proof
+  chain from Stage 2).
+
+The portable verifier `verifyCircuitDestroy()` performs the signature
+check only; Layer 1 + Layer 2 are enforced by `processCircuitDestroy()`
+(which has the circuit context). This preserves the portable verifier's
+structure-only contract.
 
 **Reason codes:**
 - `0x01` = `OPERATOR_INITIATED`
