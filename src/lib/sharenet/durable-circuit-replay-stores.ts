@@ -151,3 +151,45 @@ export function createDurableCircuitReplayStores(): {
     ackStore: new DurableSqliteCircuitAckReplayStore(),
   };
 }
+
+// -----------------------------------------------------------------------
+// DurableSqliteGatewayAuthorizationReplayStore (R-009 Stage 2 final)
+// -----------------------------------------------------------------------
+
+import { db } from "@/lib/db";
+import type { GatewayAuthorizationReplayStore } from "@reference/circuit/replay-stores";
+
+/**
+ * Durable SQLite-backed implementation of `GatewayAuthorizationReplayStore`.
+ *
+ * Backed by the Prisma `ConsumedGatewayAuthorization` model with a unique
+ * constraint on `(commitmentRootHex, circuitIdHex, ackNonceHex)`. Survives
+ * process restart because consumed authorizations are persisted in the
+ * database.
+ *
+ * The `consume` operation is atomic: the insert relies on the unique
+ * constraint. A second insert with the same key fails (unique violation)
+ * and returns `false` — the authorization is a replay. Fail-closed: if the
+ * insert cannot complete for any reason, `false` is returned and the
+ * authorization is rejected.
+ */
+export class DurableSqliteGatewayAuthorizationReplayStore implements GatewayAuthorizationReplayStore {
+  async consume(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    ackNonce: Uint8Array,
+  ): Promise<boolean> {
+    try {
+      await db.consumedGatewayAuthorization.create({
+        data: {
+          commitmentRootHex: toHex(commitmentRoot),
+          circuitIdHex: toHex(circuitId),
+          ackNonceHex: toHex(ackNonce),
+        },
+      });
+      return true; // first use — successfully consumed
+    } catch {
+      return false; // unique constraint violation — already consumed (replay)
+    }
+  }
+}

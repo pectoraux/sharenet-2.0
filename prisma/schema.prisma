@@ -362,6 +362,31 @@ model ConsumedCircuitAck {
 }
 
 // ---------------------------------------------------------------------
+// Consumed Gateway Return Authorizations (single-use replay protection)
+// ---------------------------------------------------------------------
+
+/// Per R-009 Stage 2 final hardening: a GatewayReturnAuthorization is
+/// single-use. Once the gateway has accepted an authorization with a given
+/// (commitmentRoot, circuitId, ackNonce), the same authorization MUST NOT
+/// be accepted again — even after process restart. This table records
+/// consumed authorizations for durable replay detection.
+model ConsumedGatewayAuthorization {
+  id                String   @id @default(cuid())
+  /// Hex of the 32-byte commitment_root.
+  commitmentRootHex String
+  /// Hex of the 32-byte circuit_id (instance identity, not route).
+  circuitIdHex      String
+  /// Hex of the 16-byte ackNonce from the CircuitSetupAck.
+  ackNonceHex       String
+  /// When the authorization was consumed.
+  consumedAt        DateTime @default(now())
+
+  /// Unique constraint: (commitmentRoot, circuitId, ackNonce) is single-use.
+  @@unique([commitmentRootHex, circuitIdHex, ackNonceHex])
+  @@index([consumedAt])
+}
+
+// ---------------------------------------------------------------------
 // Gateway Policy (stub — ADR-0011)
 // ---------------------------------------------------------------------
 
