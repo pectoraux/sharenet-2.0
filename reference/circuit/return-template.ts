@@ -88,7 +88,11 @@ import {
 import {
   routeAcceptanceSigningPayload,
   verifyRouteAcceptance,
+  generateMerkleInclusionProof,
+  verifyMerkleInclusionProof,
+  computeAcceptanceLeafForVerification,
   type RouteAcceptance,
+  type RouteProposal,
 } from "../routing/route";
 import { fromHex } from "../encoding/cbor";
 
@@ -1201,6 +1205,13 @@ export interface GatewayReturnAuthorization {
   acceptanceSignature: Uint8Array;
   /** The list of hop NodeIds in the route (so the gateway can verify hopIndex is terminal). */
   hopNodeIds: string[];
+  /**
+   * The Merkle inclusion proof for the terminal acceptance leaf.
+   * Each element is a (sibling, isLeft) pair. The gateway recomputes the
+   * commitmentRoot from the acceptance leaf + this proof, then verifies it
+   * matches the commitmentRoot in the GatewayReturnTemplate.
+   */
+  merkleProof: { sibling: Uint8Array; isLeft: boolean }[];
 }
 
 /** CBOR map keys for GatewayReturnAuthorization (per ADR-0004). */
@@ -1223,6 +1234,7 @@ const GA_KEY_ACCEPTANCE_NONCE = 16;
 const GA_KEY_ACCEPTANCE_EXPIRY = 17;
 const GA_KEY_ACCEPTANCE_SIGNATURE = 18;
 const GA_KEY_HOP_NODE_IDS = 19;
+const GA_KEY_MERKLE_PROOF = 20;
 
 /**
  * Construct a GatewayReturnAuthorization from a GatewayReturnTemplate + the
@@ -1242,7 +1254,13 @@ export function constructGatewayReturnAuthorization(
   relayEd25519PublicKey: Uint8Array,
   terminalAcceptance: RouteAcceptance,
   hopNodeIds: string[],
+  proposal: RouteProposal,
+  acceptances: RouteAcceptance[],
 ): GatewayReturnAuthorization {
+  // Generate the Merkle inclusion proof for the terminal acceptance.
+  const { proof: merkleProof } = generateMerkleInclusionProof(
+    proposal, acceptances, terminalAck.hopIndex,
+  );
   return {
     gatewayTemplateBytes: encodeGatewayReturnTemplate(gatewayTemplate),
     relayEd25519PublicKey,
@@ -1263,6 +1281,7 @@ export function constructGatewayReturnAuthorization(
     acceptanceExpiry: terminalAcceptance.expiry,
     acceptanceSignature: terminalAcceptance.signature,
     hopNodeIds,
+    merkleProof,
   };
 }
 
@@ -1290,6 +1309,7 @@ export function encodeGatewayReturnAuthorization(ga: GatewayReturnAuthorization)
     [GA_KEY_ACCEPTANCE_EXPIRY, ga.acceptanceExpiry],
     [GA_KEY_ACCEPTANCE_SIGNATURE, ga.acceptanceSignature],
     [GA_KEY_HOP_NODE_IDS, ga.hopNodeIds],
+    [GA_KEY_MERKLE_PROOF, ga.merkleProof.map(e => new Map([[1, e.sibling], [2, e.isLeft]]))],
   ]);
   return canonicalEncode(m);
 }
@@ -1388,6 +1408,27 @@ export function decodeGatewayReturnAuthorization(bytes: Uint8Array): { ok: true;
     return { ok: false, reason: "hopNodeIds must be a non-empty array of text strings" };
   }
 
+  // Decode the Merkle proof (key 20).
+  const rawMerkleProof = m.get(GA_KEY_MERKLE_PROOF);
+  if (!Array.isArray(rawMerkleProof) || rawMerkleProof.length === 0) {
+    return { ok: false, reason: "merkleProof must be a non-empty array" };
+  }
+  const merkleProof: { sibling: Uint8Array; isLeft: boolean }[] = [];
+  for (const elem of rawMerkleProof) {
+    if (!(elem instanceof Map)) {
+      return { ok: false, reason: "merkleProof element must be a CBOR map" };
+    }
+    const sibling = elem.get(1);
+    const isLeft = elem.get(2);
+    if (!(sibling instanceof Uint8Array) || sibling.length !== 32) {
+      return { ok: false, reason: "merkleProof sibling must be a 32-byte bstr" };
+    }
+    if (typeof isLeft !== "boolean") {
+      return { ok: false, reason: "merkleProof isLeft must be a boolean" };
+    }
+    merkleProof.push({ sibling, isLeft });
+  }
+
   return {
     ok: true,
     authorization: {
@@ -1410,6 +1451,7 @@ export function decodeGatewayReturnAuthorization(bytes: Uint8Array): { ok: true;
       acceptanceExpiry,
       acceptanceSignature,
       hopNodeIds,
+      merkleProof,
     },
   };
 }
@@ -1536,15 +1578,52 @@ export function verifyGatewayReturnAuthorization(
   }
 
   // 2d. Verify the gatewayNodeId in the template matches the terminalNodeId.
-  //     The gateway template is bound to a specific gatewayNodeId (signed by
-  //     the initiator). The terminal acceptance names its acceptorNodeId (the
-  //     relay that agreed to be the terminal hop). These MUST match — otherwise
-  //     the initiator's template could be replayed to a different gateway than
-  //     the one the terminal acceptance authorized.
   if (gt.gatewayNodeId !== authorization.terminalNodeId) {
     return {
       ok: false,
       reason: `gatewayNodeId does not match the terminal acceptance's acceptorNodeId: template has "${gt.gatewayNodeId}", acceptance has "${authorization.terminalNodeId}"`,
+    };
+  }
+
+  // 2e. MERKLE INCLUSION PROOF.
+  //     Per the re-audit of e105f34: the authorization carries acceptance
+  //     signature + hopNodeIds, but does NOT prove the acceptance is one of the
+  //     acceptances that produced the advertised commitmentRoot. An attacker
+  //     can construct a valid acceptance + hopNodeIds that are NOT part of
+  //     the committed route.
+  //
+  //     The Merkle inclusion proof closes this gap: the gateway recomputes
+  //     the acceptance leaf from the authorization's fields, then verifies
+  //     the Merkle proof against the commitmentRoot from the GatewayReturnTemplate.
+  //     If the acceptance is NOT part of the committed route, the recomputed
+  //     root will not match.
+  const acceptanceForProof: RouteAcceptance = {
+    proposalDigestHex: authorization.acceptanceProposalDigestHex,
+    hopIndex: authorization.hopIndex,
+    hopDigestHex: authorization.acceptanceHopDigestHex,
+    serviceDigestHex: authorization.acceptanceServiceDigestHex,
+    acceptorNodeId: authorization.terminalNodeId,
+    acceptanceNonce: authorization.acceptanceNonce,
+    expiry: authorization.acceptanceExpiry,
+    signature: authorization.acceptanceSignature,
+  };
+  const acceptanceLeaf = computeAcceptanceLeafForVerification(acceptanceForProof, authorization.hopIndex);
+  if (!verifyMerkleInclusionProof(acceptanceLeaf, authorization.merkleProof, gt.commitmentRoot)) {
+    return {
+      ok: false,
+      reason: "Merkle inclusion proof failed: terminal acceptance is NOT part of the committed route (acceptance not in commitmentRoot)",
+    };
+  }
+
+  // 2f. Verify routeId is derived from commitmentRoot.
+  //     routeId = "route:" + hex(commitmentRoot). This proves the routeId
+  //     in the authorization is derived from the same commitmentRoot as the
+  //     GatewayReturnTemplate.
+  const expectedRouteId = "route:" + toHex(gt.commitmentRoot);
+  if (authorization.routeId !== expectedRouteId) {
+    return {
+      ok: false,
+      reason: `routeId does not match commitmentRoot: expected "${expectedRouteId}", got "${authorization.routeId}"`,
     };
   }
 
@@ -1556,12 +1635,7 @@ export function verifyGatewayReturnAuthorization(
     return { ok: false, reason: `ack expired: ackExpiry ${authorization.ackExpiry} ≤ now ${now}` };
   }
 
-  // 4. The ack's relayX25519PublicKey (signed in the ack payload) matches the
-  //    template's gatewayX25519PublicKey (also signed in the template's
-  //    initiator signature). If both signatures verify, the binding is proven
-  //    — the terminal relay's X25519 key is the same one K_ret was encrypted to.
-
-  // 5. Delegate to the standard verifier (NodeId, X25519 key, initiator signature, ECDH decrypt).
+  // 4. Delegate to the standard verifier (NodeId, X25519 key, initiator signature, ECDH decrypt).
   return verifyGatewayReturnTemplate(
     gt,
     expectedGatewayNodeId,

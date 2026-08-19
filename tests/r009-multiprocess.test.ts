@@ -137,6 +137,7 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
     const authorization = constructGatewayReturnAuthorization(
       gatewayTemplate, ackResult.ack, relayEd25519PublicKey,
       terminalAcceptance, hopNodeIds,
+      route.proposal, route.commitment.acceptances,
     );
     const authWireBytes = encodeGatewayReturnAuthorization(authorization);
     const authWireHex = toHex(authWireBytes);
