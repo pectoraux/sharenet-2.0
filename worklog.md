@@ -2576,3 +2576,60 @@ Verification (all five required suites):
 Stage Summary:
 - R-009 Stage 3 Phase 3 is now closed for real: the destroy artifact crosses a REAL TCP transport boundary between independent participant processes. Each process uses its OWN DurableSqliteCircuitDestroyStore (own SQLite DB namespace, initialized via prisma db push). No InMemoryCircuitDestroyStore in the propagation path. The wire bytes are byte-for-byte identical at every hop. Transport failure + restart + concurrency all fail safely.
 - The closure criterion is satisfied: "An INITIATOR- or GATEWAY-originated CircuitDestroy traverses the actual authenticated transport path across independent participant processes, unchanged byte-for-byte, each participant durably revokes and zeroizes locally, and restart/replay/persistence/transport failure remain safe."
+
+---
+Task ID: R009-S3-P3-prod-transport
+Agent: orchestrator
+Task: R-009 Stage 3 Phase 3 — PRODUCTION destroy-propagation transport abstraction.
+
+Work Log:
+- Read previous worklog + git log: confirmed at commit 90f31a7 (R-009 Stage 3 Phase 3 real TCP: destroy propagation over actual transport).
+- Read the audit's verdict: the 90f31a7 test proved real TCP + independent processes + durable per-process SQLite, BUT the actual TCP propagation implementation lived entirely inside the test file. processCircuitDestroy() remained a pure protocol operation that returned wireBytes + left transport entirely to the caller. There was NO production destroy-propagation transport abstraction.
+- Requirement: add a protocol/application-neutral transport interface for destroy propagation, wire the runtime to it, replace the test's embedded forwarding with the production implementation.
+
+Production transport abstraction (reference/circuit/propagation.ts — new file, protocol core):
+- CircuitDestroyTransport interface: send(ctx, wireBytes) → TransportSendResult; receive(localNodeId) → Uint8Array. The transport is AUTHENTICATED: each send is bound to a DestroyPropagationContext that ties localNodeId ↔ nextHopNodeId ↔ circuitId ↔ commitmentRoot ↔ direction ↔ AuthenticatedLink. The transport verifies the binding (link.localNodeId === ctx.localNodeId, link.remoteNodeId === ctx.nextHopNodeId) before sending. Sends the EXACT wire bytes (no decode + re-encode).
+- NextHopResolver interface + TopologyNextHopResolver production helper: derives the next hop from PROTOCOL STATE (signed direction + circuit topology + localNodeId). FORWARD: initiator → hop 0 → ... → gateway (terminal). BACKWARD: gateway → hop N-1 → ... → hop 0 → initiator (terminal). The resolver handles all 3 participant types (initiator, relay, gateway) + returns the AuthenticatedLink to the next hop. A missing link or peer mismatch is a configuration error.
+- DestroyPropagationContext: binds localNodeId + nextHopNodeId + circuitId + commitmentRoot + direction + authenticatedLink.
+- propagateCircuitDestroy() production function: OWNS the full propagation pipeline. Calls processCircuitDestroy (decode → verify → durable revoke → zeroize) → derives direction from signed destroyerRole → resolves next hop via NextHopResolver → if terminal: return → if propagate: send ORIGINAL wireBytes via CircuitDestroyTransport → if transport fails: local remains REVOKED (propagated=false, transportError set). NO caller-supplied propagate/direction/origin/isRelay parameter — the direction is derived from the signed destroyerRole.
+- InProcessCircuitDestroyTransport: test/development transport (in-memory queue, verifies the authenticated binding). For real multi-process tests, the TCP adapter is used.
+- PropagateCircuitDestroyResult: includes action (REVOKED/ALREADY_REVOKED), propagated (bool), terminal (bool), transportError, wireBytes, direction. The direction is in EVERY success variant — verifiable at every hop.
+
+TCP transport adapter (src/lib/sharenet/circuit-destroy-transport.ts — new file, platform layer):
+- TcpCircuitDestroyTransport: implements CircuitDestroyTransport using real TCP sockets (node:net createServer + connect). Length-prefixed wire framing ([4 bytes BE length][wire bytes]). Each participant runs its own TCP server. The transport verifies the authenticated binding before sending. Receives buffer in a queue (so a destroy arriving before receive() is called is not lost). start()/stop() lifecycle.
+
+Architecture (ADR-0013 layer separation — enforced by arch tests #21 + #23):
+- reference/circuit/propagation.ts: protocol core. Does NOT import Prisma, @/lib/db, or anything from src/. Defines the interfaces + the TopologyNextHopResolver + InProcessCircuitDestroyTransport + propagateCircuitDestroy().
+- src/lib/sharenet/circuit-destroy-transport.ts: platform layer. Implements CircuitDestroyTransport using node:net. May import sockets, Prisma, etc. This is the production-equivalent transport adapter.
+- The protocol engine calls the interface; it never knows about sockets.
+
+Production transport tests (tests/r009-destroy-propagation-production.test.ts — new file, +7 tests):
+Each participant is an INDEPENDENT PROCESS that uses the PRODUCTION propagateCircuitDestroy() + TopologyNextHopResolver + TcpCircuitDestroyTransport + DurableSqliteCircuitDestroyStore. The test does NOT contain protocol-specific forwarding logic — it wires the production components.
+1. INITIATOR destroy FORWARD (3-hop topology: relay0, relay1, gateway): INITIATOR → relay0 → relay1 → GATEWAY. All 4 durably revoke + zeroize. direction=FORWARD at every hop. propagated=true at relays, terminal=true at gateway.
+2. GATEWAY destroy BACKWARD (3-hop): GATEWAY → relay1 → relay0 → INITIATOR. direction=BACKWARD. Gateway proof required + verified at every hop.
+3. Transport failure: local revoke succeeds + next-hop transport fails (nobody listening) → local remains REVOKED (propagated=false, transportError set). Tombstone verified in DB.
+4. Restart: revoke → kill → restart with SAME DB → old destroy idempotent (ALREADY_REVOKED, propagated=false). Tombstone persists.
+5-7. Authenticated binding adversarial (in-process): peer mismatch (link.remoteNodeId !== nextHopNodeId) → REJECT; link not owned by local participant → REJECT; exact bytes preserved (no decode + re-encode).
+
+Root causes found + fixed during implementation:
+- PrismaClient + Bun dynamic datasource: new PrismaClient({ datasources: { db: { url } } }) fails in child processes spawned via bun -e with ".prisma/client/default not found". Fix: pass DATABASE_URL as a process env var to spawn(); the child uses the default DurableSqliteCircuitDestroyStore() which picks up the env. Each participant has its own SQLite DB file (per-process namespace).
+- TopologyNextHopResolver initial design only handled relays (localNodeId in hopNodeIds). The initiator (FORWARD originator) is NOT in hopNodeIds. Fix: the resolver now takes initiatorNodeId as a constructor parameter + handles all 3 participant types (initiator sends to hop 0; relay i forwards to i+1/i-1; gateway is terminal for FORWARD). For BACKWARD: gateway (last hop) sends to N-1; hop 0 sends to initiator; initiator is terminal.
+- Map(object) TypeError: new Map(config.peerPortRegistry) fails because the Map constructor expects an iterable, not a plain object. Fix: new Map(Object.entries(config.peerPortRegistry)).
+- TcpCircuitDestroyTransport receive() race: if a destroy arrives before receive() is called, it was dropped. Fix: added a receivedQueue buffer — incoming destroys are queued + delivered when receive() is next called.
+
+Verification (all five required suites):
+- Unit tests: 540 pass / 0 fail (was 533; +7 production transport tests). 2010 expect() calls across 33 files in 38.60s.
+- Architecture tests: 24/24 pass (incl. #21 + #23 layer-separation — reference/circuit/propagation.ts imports nothing from @/; src/lib/sharenet/circuit-destroy-transport.ts imports node:net + reference/circuit/propagation).
+- TS conformance vectors: 41/41 pass.
+- Python conformance vectors: 41/41 pass.
+- Lint: clean (exit 0).
+
+Stage Summary:
+- R-009 Stage 3 Phase 3 is now closed for real: the production runtime — not merely the test harness — owns destroy propagation. The propagateCircuitDestroy() function in reference/circuit/propagation.ts owns the full pipeline (process → derive direction → resolve next hop → send over authenticated transport). The test exercises the production abstraction; it does NOT contain a second transport protocol.
+- The transport is AUTHENTICATED: each send is bound to a DestroyPropagationContext (localNodeId + nextHopNodeId + circuitId + commitmentRoot + direction + AuthenticatedLink). The transport verifies the binding (peer mismatch → REJECT).
+- The direction is derived from the SIGNED destroyerRole (propagationDirection()). NOT caller-supplied. No propagate/direction/origin/isRelay parameter.
+- The exact-byte invariant holds: outputWireBytes === inputWireBytes at every hop. No relay decodes + re-encodes.
+- Ordering: decode → verify → durable revoke → zeroize → transport propagation. Never propagate after local persistence failure.
+- Both directions: INITIATOR → FORWARD → GATEWAY; GATEWAY → BACKWARD → INITIATOR.
+- Each participant uses its OWN DurableSqliteCircuitDestroyStore (own SQLite DB via DATABASE_URL env var). No InMemoryCircuitDestroyStore in the propagation path.
+- Restart/replay/failure semantics: transport failure after local revoke → local remains REVOKED (retry possible); restart → tombstone persists → old destroy idempotent; persistence failure → no claim of propagation.
