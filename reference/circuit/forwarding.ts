@@ -251,35 +251,45 @@ export async function processCircuitWireFrame(
   hopIndex: number,
   wireBytes: Uint8Array,
   /**
-   * OPTIONAL: durable revocation store. If provided, the production path
-   * checks whether the circuit is revoked BEFORE processing the frame.
-   * Per ADR-0022 (R-009 Stage 3): a revoked circuit MUST NOT process
-   * traffic. If omitted (test-only path), the revocation check is skipped.
+   * REQUIRED: durable revocation store. The production path checks whether
+   * the circuit is revoked BEFORE processing the frame. Per ADR-0022
+   * (R-009 Stage 3): a revoked circuit MUST NOT process traffic. A revoked
+   * circuit MUST NOT be resurrected after restart.
    */
-  revocationStore?: CircuitRevocationStore,
+  revocationStore: CircuitRevocationStore,
   /**
-   * OPTIONAL: current time (unix seconds). If provided, the production path
-   * checks circuit expiry. Per ADR-0022: an expired circuit MUST NOT process
-   * traffic. If omitted, uses Math.floor(Date.now() / 1000).
+   * REQUIRED: current time (unix seconds). The production path checks
+   * circuit expiry. Per ADR-0022: an expired circuit MUST NOT process
+   * traffic. Expiry performs a durable terminal-state transition
+   * (revocation + zeroize), not merely a local rejection.
    */
-  now?: number,
+  now: number,
 ): Promise<ProcessCircuitWireFrameResult> {
-  const currentTime = now ?? Math.floor(Date.now() / 1000);
-
   // Step 0a (R-009 Stage 3): check circuit expiry.
   // Per ADR-0022: an expired circuit MUST NOT process traffic.
-  // This check happens BEFORE AEAD — a rejected frame never reaches the replay floor.
-  if (circuit.expiry <= currentTime) {
-    return { ok: false, reason: `circuit expired: expiry ${circuit.expiry} ≤ now ${currentTime}` };
+  // Expiry performs a DURABLE terminal-state transition: write a revocation
+  // record (reason CIRCUIT_EXPIRED) + zeroize keys. This ensures the
+  // circuit is still known to be dead after a process restart.
+  if (circuit.expiry <= now) {
+    // Durable revoke-if-active (idempotent: if already revoked, this is a no-op).
+    await revocationStore.revoke(
+      circuit.circuitId,
+      circuit.commitmentRoot,
+      "system", // expiry is system-initiated
+      0x01, // DESTROYER_ROLE_INITIATOR (the circuit owner's context)
+      0x02, // DESTROY_REASON_CIRCUIT_EXPIRED
+      new Uint8Array(16), // zero nonce for expiry (no wire destroy message)
+    );
+    // Best-effort zeroize.
+    zeroizeCircuit(circuit);
+    return { ok: false, reason: `circuit expired: expiry ${circuit.expiry} ≤ now ${now}` };
   }
 
   // Step 0b (R-009 Stage 3): check durable revocation.
   // Per ADR-0022: a revoked circuit MUST NOT process traffic.
-  if (revocationStore) {
-    const revoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
-    if (revoked) {
-      return { ok: false, reason: "circuit revoked: durable revocation record exists" };
-    }
+  const revoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
+  if (revoked) {
+    return { ok: false, reason: "circuit revoked: durable revocation record exists" };
   }
 
   // Step 1: decode (strict canonical CBOR).
@@ -375,6 +385,38 @@ export function processWireFrame(
   }
 
   return { ok: true, decoded: decoded.frame, forward };
+}
+
+// -----------------------------------------------------------------------
+// Key zeroization (R-009 Stage 3 — best-effort)
+// -----------------------------------------------------------------------
+
+/**
+ * Best-effort zeroization of circuit key material.
+ *
+ * Per spec/08 §6.4 + ADR-0022: when a circuit is revoked, all derived keys
+ * MUST be zeroized. This function fills each key array with zeros IN-PLACE.
+ *
+ * NOT guaranteed: the GC may have copied keys; the OS may have paged them.
+ * This is defense-in-depth, not a hard memory-erasure guarantee.
+ *
+ * After zeroize, the circuit object's keys are all zeros. Any attempt to
+ * use them for AEAD will fail (wrong key → AEAD tag failure).
+ */
+export function zeroizeCircuit(circuit: ActiveCircuit): void {
+  for (const hop of circuit.hops) {
+    hop.forwardingKey.fill(0);
+    hop.returnKey.fill(0);
+    if (hop.relayX25519PublicKey) {
+      hop.relayX25519PublicKey.fill(0);
+    }
+  }
+  circuit.initiatorX25519SecretKey.fill(0);
+  circuit.noncePrefix.fill(0);
+  // circuit.commitmentRoot is NOT zeroized — it's the route identity,
+  // needed for replay floor lookups + revocation checks.
+  // circuit.circuitId is NOT zeroized — it's the circuit identity,
+  // needed for revocation checks.
 }
 
 export { encodeCircuitFrame };

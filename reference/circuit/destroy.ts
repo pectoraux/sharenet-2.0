@@ -28,6 +28,8 @@
 import { randomBytes } from "@noble/hashes/utils.js";
 import { canonicalEncode, canonicalDecode, toHex, fromHex } from "../encoding/cbor";
 import { signMessage, verifySignature } from "../identity/keys";
+import type { CircuitRevocationStore, CircuitDestroyReplayStore } from "./replay-stores";
+import type { ActiveCircuit } from "./circuit";
 
 // -----------------------------------------------------------------------
 // Constants (R-009 Stage 3 — CircuitDestroy)
@@ -350,6 +352,143 @@ export function decodeCircuitDestroy(bytes: Uint8Array): { ok: true; circuitDest
       signature,
     },
   };
+}
+
+// -----------------------------------------------------------------------
+// processCircuitDestroy — the canonical teardown protocol path (R-009 Stage 3)
+// -----------------------------------------------------------------------
+
+/** Result of processing a CircuitDestroy. */
+export type ProcessCircuitDestroyResult =
+  | { ok: true; idempotent: boolean; circuitDestroy: CircuitDestroy }
+  | { ok: false; reason: string };
+
+/**
+ * Process a CircuitDestroy at a participant (initiator, relay, or gateway).
+ *
+ * This is the CANONICAL TEARDOWN PROTOCOL PATH. Per ADR-0022:
+ *
+ *   1. Decode the wire bytes.
+ *   2. Verify the CircuitDestroy (signature + routeId + role).
+ *   3. Verify the circuit binding (circuitId + commitmentRoot match the
+ *      local circuit context).
+ *   4. Verify destroyer authorization:
+ *      - INITIATOR: destroyerNodeId must match the circuit's initiatorNodeId.
+ *      - GATEWAY: destroyerNodeId must match the terminal hop's nodeId.
+ *   5. Check durable revocation (if already revoked → idempotent success).
+ *   6. Consume the destroy nonce (durable, fail-closed).
+ *   7. Write the durable revocation record.
+ *   8. Zeroize circuit key material (best-effort).
+ *   9. Return the CircuitDestroy for propagation (unchanged — no re-signing).
+ *
+ * @param wireBytes - the raw canonical-CBOR-encoded CircuitDestroy bytes
+ * @param circuit - the local ActiveCircuit (for binding + authorization)
+ * @param expectedInitiatorNodeId - the circuit's initiator NodeId (for INITIATOR auth)
+ * @param expectedGatewayNodeId - the terminal hop's NodeId (for GATEWAY auth)
+ * @param revocationStore - REQUIRED durable revocation store
+ * @param destroyReplayStore - REQUIRED durable destroy replay store
+ * @param now - current time (unix seconds)
+ */
+export async function processCircuitDestroy(
+  wireBytes: Uint8Array,
+  circuit: ActiveCircuit,
+  expectedInitiatorNodeId: string,
+  expectedGatewayNodeId: string,
+  revocationStore: CircuitRevocationStore,
+  destroyReplayStore: CircuitDestroyReplayStore,
+  now: number,
+): Promise<ProcessCircuitDestroyResult> {
+  // 1. Decode.
+  const decoded = decodeCircuitDestroy(wireBytes);
+  if (!decoded.ok) {
+    return { ok: false, reason: decoded.reason };
+  }
+  const destroy = decoded.circuitDestroy;
+
+  // 2. Verify the CircuitDestroy (signature + routeId + role).
+  const verifyResult = verifyCircuitDestroy(destroy);
+  if (!verifyResult.ok) {
+    return { ok: false, reason: verifyResult.reason };
+  }
+
+  // 3. Verify circuit binding.
+  if (!bytesEqual(destroy.circuitId, circuit.circuitId)) {
+    return { ok: false, reason: "circuitId mismatch: destroy does not match this circuit" };
+  }
+  if (!bytesEqual(destroy.commitmentRoot, circuit.commitmentRoot)) {
+    return { ok: false, reason: "commitmentRoot mismatch: destroy does not match this circuit" };
+  }
+
+  // 4. Verify destroyer authorization.
+  if (destroy.destroyerRole === DESTROYER_ROLE_INITIATOR) {
+    if (destroy.destroyerNodeId !== expectedInitiatorNodeId) {
+      return {
+        ok: false,
+        reason: `unauthorized: destroyerNodeId "${destroy.destroyerNodeId}" is not the circuit initiator "${expectedInitiatorNodeId}"`,
+      };
+    }
+  } else if (destroy.destroyerRole === DESTROYER_ROLE_GATEWAY) {
+    if (destroy.destroyerNodeId !== expectedGatewayNodeId) {
+      return {
+        ok: false,
+        reason: `unauthorized: destroyerNodeId "${destroy.destroyerNodeId}" is not the terminal gateway "${expectedGatewayNodeId}"`,
+      };
+    }
+  } else {
+    return { ok: false, reason: `unauthorized: invalid destroyerRole ${destroy.destroyerRole}` };
+  }
+
+  // 5. Check durable revocation (idempotent).
+  const alreadyRevoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
+  if (alreadyRevoked) {
+    // Idempotent: the circuit is already revoked. Return success without
+    // re-consuming the nonce or re-writing the revocation.
+    return { ok: true, idempotent: true, circuitDestroy: destroy };
+  }
+
+  // 6. Consume the destroy nonce (durable, fail-closed).
+  const consumed = await destroyReplayStore.consume(
+    circuit.commitmentRoot,
+    circuit.circuitId,
+    destroy.destroyNonce,
+  );
+  if (!consumed) {
+    return {
+      ok: false,
+      reason: "destroy replay: (commitmentRoot, circuitId, destroyNonce) already consumed or persistence failed (fail-closed)",
+    };
+  }
+
+  // 7. Write the durable revocation record.
+  const revoked = await revocationStore.revoke(
+    circuit.circuitId,
+    circuit.commitmentRoot,
+    destroy.destroyerNodeId,
+    destroy.destroyerRole,
+    destroy.destroyReason,
+    destroy.destroyNonce,
+  );
+  if (!revoked) {
+    return {
+      ok: false,
+      reason: "failed to write durable revocation record (persistence failure, fail-closed)",
+    };
+  }
+
+  // 8. Zeroize circuit key material (best-effort).
+  // The caller is responsible for calling zeroizeCircuit(circuit) from forwarding.ts.
+  // We don't import it here to avoid a circular dependency — the caller does it.
+
+  // 9. Return the CircuitDestroy for propagation (unchanged).
+  return { ok: true, idempotent: false, circuitDestroy: destroy };
+}
+
+/** Constant-time byte equality. */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i]! ^ b[i]!;
+  return diff === 0;
 }
 
 export { toHex, fromHex };

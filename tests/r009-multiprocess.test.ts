@@ -236,6 +236,7 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
     // 5. RELAY 1 PROCESS (independent): processCircuitWireFrame.
     const relayScript = (hopIndex: number, frameHex: string) => `
       const { processCircuitWireFrame } = require("${join(process.cwd(), "reference/circuit/forwarding.ts").replace(/\\/g, "\\\\")}");
+      const { InMemoryCircuitRevocationStore } = require("${join(process.cwd(), "reference/circuit/replay-stores.ts").replace(/\\/g, "\\\\")}");
 
       let input = "";
       process.stdin.on("data", (chunk) => { input += chunk; });
@@ -267,8 +268,9 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
         const wireBytes = new Uint8Array(Buffer.from(data.frameHex, "hex"));
         // R-009 Stage 3: pass 'now' from the parent so the relay's expiry check
         // uses the test timestamp (NOW = 2026), not the real Date.now() (2025).
-        // 'revocationStore' is undefined — no durable revocation check in this test.
-        processCircuitWireFrame(activeCircuit, data.hopIndex, wireBytes, undefined, data.now).then((result) => {
+        // 'revocationStore' is a fresh InMemoryCircuitRevocationStore so the
+        // relay's revocation check is exercised (no durable record — frame OK).
+        processCircuitWireFrame(activeCircuit, data.hopIndex, wireBytes, new InMemoryCircuitRevocationStore(), data.now).then((result) => {
           if (!result.ok) {
             process.stdout.write(JSON.stringify({ ok: false, reason: result.reason }));
           } else if (result.terminal) {

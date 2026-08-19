@@ -51,7 +51,7 @@ import {
   constructReturnOnionTemplate,
   sealReturnFrameFromTemplate,
 } from "@reference/circuit/return-template";
-import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
+import { InMemoryCircuitSequenceFloorStore, InMemoryCircuitRevocationStore } from "@reference/circuit/replay-stores";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
@@ -174,7 +174,7 @@ describe("R-009: sealForwardFrame + forwardFrame — 2-hop forwarding", () => {
 
     // Relay 0: decode + AEAD + durable commit + forward (canonical production path).
     // Entry hop commits the floor (commitFloor=true, the default).
-    const relay0Result = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const relay0Result = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(relay0Result.ok).toBe(true);
     if (!relay0Result.ok) return;
     expect(relay0Result.terminal).toBe(false); // hop 0 is not terminal for 2-hop
@@ -184,7 +184,7 @@ describe("R-009: sealForwardFrame + forwardFrame — 2-hop forwarding", () => {
     // Intermediate hop (hopIndex=1): no commit — the protocol derives that
     // only hop 0 is the ingress replay checkpoint (ADR-0019).
     const nextWireBytes = relay0Result.nextWireBytes;
-    const relay1Result = await processCircuitWireFrame(circuit, 1, nextWireBytes, undefined, NOW);
+    const relay1Result = await processCircuitWireFrame(circuit, 1, nextWireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(relay1Result.ok).toBe(true);
     if (!relay1Result.ok) return;
     expect(relay1Result.terminal).toBe(true); // hop 1 IS terminal
@@ -418,7 +418,7 @@ describe("R-009: multi-frame sequential sequence (ORDERED_STREAM)", () => {
 
       // Relay 0 forwards (canonical production path: decode + AEAD + commit + forward).
       // Entry hop commits the floor (commitFloor=true, the default).
-      const r0 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+      const r0 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
       expect(r0.ok).toBe(true);
       if (!r0.ok) return;
       expect(r0.committedSequence).toBe(BigInt(seq));
@@ -427,7 +427,7 @@ describe("R-009: multi-frame sequential sequence (ORDERED_STREAM)", () => {
       // Intermediate hop (hopIndex=1): no commit — the protocol derives
       // that only hop 0 is the ingress replay checkpoint (ADR-0019).
       const nextWire = r0.nextWireBytes;
-      const r1 = await processCircuitWireFrame(circuit, 1, nextWire, undefined, NOW);
+      const r1 = await processCircuitWireFrame(circuit, 1, nextWire, new InMemoryCircuitRevocationStore(), NOW);
       expect(r1.ok).toBe(true);
       if (!r1.ok) return;
       expect(new TextDecoder().decode(r1.plaintext)).toBe(`packet ${seq}`);
@@ -597,7 +597,7 @@ describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invaria
     const wireBytes = encodeCircuitFrame(sealed);
 
     // The production path owns the ENTIRE invariant.
-    const result = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const result = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.terminal).toBe(true); // 1-hop: hop 0 is terminal
@@ -623,7 +623,7 @@ describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invaria
     // frame_sequence (2 bytes) + direction (2 bytes) = ~14 bytes in. Flip byte 15.
     tamperedWire[15] ^= 0x01;
 
-    const result = await processCircuitWireFrame(circuit, 0, tamperedWire, undefined, NOW);
+    const result = await processCircuitWireFrame(circuit, 0, tamperedWire, new InMemoryCircuitRevocationStore(), NOW);
     expect(result.ok).toBe(false);
     // The floor is UNCHANGED — the production path did NOT commit (AEAD failed first).
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(0n);
@@ -640,13 +640,13 @@ describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invaria
     const wireBytes = encodeCircuitFrame(sealed);
 
     // First presentation: accepted + committed.
-    const r1 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r1 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r1.ok).toBe(true);
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
 
     // Replay: AEAD succeeds (valid ciphertext) but the durable commit rejects
     // (1 ≤ floor 1). The production path catches the replay.
-    const r2 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r2 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.reason).toContain("≤ floor");
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n); // unchanged
@@ -665,7 +665,7 @@ describe("R-009 Stage 1 hardening: processCircuitWireFrame owns the full invaria
     withTrailing.set(valid, 0);
     withTrailing[valid.length] = 0xff; // trailing byte
 
-    const result = await processCircuitWireFrame(circuit, 0, withTrailing, undefined, NOW);
+    const result = await processCircuitWireFrame(circuit, 0, withTrailing, new InMemoryCircuitRevocationStore(), NOW);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toMatch(/non-canonical|CBOR decode failed|too many terminals|trailing/);
     // Floor unchanged — decode rejected before AEAD/commit.
@@ -700,7 +700,7 @@ describe("R-009 Stage 1 final hardening: commit ownership is protocol-enforced (
     const wireBytes = encodeCircuitFrame(sealed);
 
     // hop 0 processes — the floor MUST advance (no way to disable it).
-    const r0 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r0 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r0.ok).toBe(true);
     if (!r0.ok) return;
     expect(r0.committedSequence).toBe(1n);
@@ -728,13 +728,13 @@ describe("R-009 Stage 1 final hardening: commit ownership is protocol-enforced (
     const plaintext = new TextEncoder().encode("seq 6");
     const sealed = sealForwardFrame(circuit, 6, plaintext);
     const wireBytes = encodeCircuitFrame(sealed);
-    const r0 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r0 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r0.ok).toBe(true);
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(6n); // hop 0 committed
 
     // hop 1 processes the forwarded nextFrame — commits at (root, 1, FORWARD) → 6
     // (its OWN floor, independent from hop 0's).
-    const r1 = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes, undefined, NOW);
+    const r1 = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r1.ok).toBe(true);
     if (!r1.ok) return;
     expect(r1.terminal).toBe(true); // hop 1 is terminal → delivers plaintext
@@ -760,19 +760,19 @@ describe("R-009 Stage 1 final hardening: commit ownership is protocol-enforced (
     const wireBytes = encodeCircuitFrame(sealed);
 
     // hop 0 processes — commits at (root, 0, FORWARD) → 10.
-    const r0 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r0 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r0.ok).toBe(true);
     if (!r0.ok) return;
 
     // hop 1 processes the forwarded nextFrame — commits at (root, 1, FORWARD) → 10.
-    const r1 = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes, undefined, NOW);
+    const r1 = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r1.ok).toBe(true);
     expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_FORWARD)).toBe(10n);
 
     // MALICIOUS RELAY ATTACK: relay 0 replays the SAME nextFrame toward hop 1.
     // The AEAD succeeds (valid ciphertext, same key+nonce → same plaintext),
     // but hop 1's OWN floor catches the replay (10 ≤ floor 10).
-    const replayResult = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes, undefined, NOW);
+    const replayResult = await processCircuitWireFrame(circuit, 1, r0.nextWireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(replayResult.ok).toBe(false);
     if (!replayResult.ok) expect(replayResult.reason).toContain("≤ floor");
     // hop 1's floor is UNCHANGED (still 10 — the replay did not advance it).
@@ -792,13 +792,13 @@ describe("R-009 Stage 1 final hardening: commit ownership is protocol-enforced (
     const wireBytes = encodeCircuitFrame(sealed);
 
     // First presentation at hop 0 → accepted + committed.
-    const r1 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r1 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r1.ok).toBe(true);
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
 
     // Replay at hop 0 → AEAD succeeds (valid ciphertext) but the ingress
     // checkpoint's durable commit rejects (1 ≤ floor 1).
-    const r2 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r2 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.reason).toContain("≤ floor");
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n); // unchanged
@@ -850,7 +850,7 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     const wireBytes = encodeCircuitFrame(backwardFrame);
 
     // hop 0 (the source) processes — terminal for BACKWARD, delivers plaintext.
-    const result = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const result = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(result.ok).toBe(true);
     if (!result.ok) return;
     expect(result.terminal).toBe(true); // hop 0 is terminal for BACKWARD
@@ -879,14 +879,14 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     const wireBytes = encodeCircuitFrame(backwardFrame);
 
     // hop 1 (gateway's neighbor) processes first — NOT terminal (terminal is hop 0).
-    const r1 = await processCircuitWireFrame(circuit, 1, wireBytes, undefined, NOW);
+    const r1 = await processCircuitWireFrame(circuit, 1, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r1.ok).toBe(true);
     if (!r1.ok) return;
     expect(r1.terminal).toBe(false); // hop 1 is NOT terminal for BACKWARD
     expect(await floorStore.getFloor(route.commitmentRoot, 1, DIRECTION_BACKWARD)).toBe(1n);
 
     // Forward the nextFrame to hop 0 (the source) — terminal, delivers plaintext.
-    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes, undefined, NOW);
+    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r0.ok).toBe(true);
     if (!r0.ok) return;
     expect(r0.terminal).toBe(true); // hop 0 IS terminal for BACKWARD
@@ -908,7 +908,7 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     // Forward frame at seq=1.
     const fwdPayload = new TextEncoder().encode("forward");
     const fwdSealed = sealForwardFrame(circuit, 1, fwdPayload);
-    const fwdResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(fwdSealed), undefined, NOW);
+    const fwdResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(fwdSealed), new InMemoryCircuitRevocationStore(), NOW);
     expect(fwdResult.ok).toBe(true);
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_FORWARD)).toBe(1n);
 
@@ -921,7 +921,7 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
       direction: DIRECTION_BACKWARD,
       ciphertext: retCiphertext,
     };
-    const retResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(retFrame), undefined, NOW);
+    const retResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(retFrame), new InMemoryCircuitRevocationStore(), NOW);
     expect(retResult.ok).toBe(true);
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(1n);
     // Forward floor UNCHANGED by the backward frame.
@@ -945,11 +945,11 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     const wireBytes = encodeCircuitFrame(frame);
 
     // First presentation — accepted.
-    const r1 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r1 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r1.ok).toBe(true);
 
     // Replay — rejected by the backward floor (1 ≤ 1).
-    const r2 = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const r2 = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.reason).toContain("≤ floor");
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(1n);
@@ -972,7 +972,7 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     const wireBytes = new Uint8Array(encodeCircuitFrame(frame));
     wireBytes[wireBytes.length - 1] ^= 0x01; // tamper the ciphertext
 
-    const result = await processCircuitWireFrame(circuit, 0, wireBytes, undefined, NOW);
+    const result = await processCircuitWireFrame(circuit, 0, wireBytes, new InMemoryCircuitRevocationStore(), NOW);
     expect(result.ok).toBe(false);
     // Backward floor UNCHANGED — AEAD failed before commit.
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(0n);
