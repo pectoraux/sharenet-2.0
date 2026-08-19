@@ -54,6 +54,7 @@ import {
   DESTROYER_ROLE_GATEWAY,
   DESTROY_REASON_OPERATOR_INITIATED,
 } from "@reference/circuit/destroy";
+import { signPropagationChannelProof, encodePropagationChannelProof } from "@reference/circuit/propagation";
 
 const NOW = 1786876545;
 
@@ -244,12 +245,16 @@ process.stdin.on("end", async () => {
     // Build a transport that can SEND (no listen needed for the originator).
     const transport = new TcpCircuitDestroyTransport(config.localNodeId, 0, new Map(Object.entries(config.peerPortRegistry)));
     const wireBytes = Buffer.from(config.originatorDestroyHex, "hex");
+    const senderSk = Buffer.from(config.senderEd25519SecretKeyHex, "hex");
+    const senderPk = Buffer.from(config.senderEd25519PublicKeyHex, "hex");
     const result = await propagateCircuitDestroy(
       wireBytes, activeCircuit,
       config.localNodeId,
       config.expectedInitiatorNodeId, config.expectedGatewayNodeId,
       destroyStore, config.now,
-      resolver, transport, gatewayProofBytes,
+      resolver, transport,
+      senderSk, senderPk,
+      gatewayProofBytes,
     );
     // Verify keys were zeroized + tombstone persisted.
     const keysZeroized = activeCircuit.hops.every(
@@ -265,16 +270,35 @@ process.stdin.on("end", async () => {
   const transport = new TcpCircuitDestroyTransport(config.localNodeId, config.listenPort, new Map(Object.entries(config.peerPortRegistry)));
   await transport.start();
 
-  // Receive the destroy wire bytes over TCP (the real transport).
-  const wireBytes = await transport.receive(config.localNodeId);
+  // Receive the destroy wire bytes over TCP (the real authenticated transport).
+  // The receive context binds: localNodeId, expectedRemoteNodeId, circuitId,
+  // commitmentRoot. The transport verifies the incoming PropagationChannelProof
+  // against this context before delivering the bytes.
+  const receiveResult = await transport.receive({
+    localNodeId: config.localNodeId,
+    expectedRemoteNodeId: config.expectedRemoteNodeId,
+    circuitId: activeCircuit.circuitId,
+    commitmentRoot: activeCircuit.commitmentRoot,
+  });
+  if (!receiveResult.ok) {
+    process.stdout.write(JSON.stringify({ ok: false, reason: "receive authentication failed: " + receiveResult.reason }));
+    await transport.stop();
+    process.exit(0);
+    return;
+  }
+  const wireBytes = receiveResult.wireBytes;
 
   // Call the PRODUCTION propagateCircuitDestroy (owns process + resolve + send).
+  const senderSk = Buffer.from(config.senderEd25519SecretKeyHex, "hex");
+  const senderPk = Buffer.from(config.senderEd25519PublicKeyHex, "hex");
   const result = await propagateCircuitDestroy(
     wireBytes, activeCircuit,
     config.localNodeId,
     config.expectedInitiatorNodeId, config.expectedGatewayNodeId,
     destroyStore, config.now,
-    resolver, transport, gatewayProofBytes,
+    resolver, transport,
+    senderSk, senderPk,
+    gatewayProofBytes,
   );
 
   // Wait briefly for any outgoing send to flush.
@@ -396,9 +420,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): initiator destroy FORWAR
       gatewayProofHex: null,
       isOriginator: false,
       localNodeId: topo.gatewayNodeId,
+      expectedRemoteNodeId: topo.hopNodeIds[1]!,
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.gatewayNodeId, [topo.hopNodeIds[1]!]),
       peerPortRegistry: Object.fromEntries(gatewayPeerPorts),
+      senderEd25519SecretKeyHex: toHex(topo.gatewayKp.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.gatewayKp.publicKey),
       destroyForDirection,
     });
     await new Promise((r) => setTimeout(r, 400));
@@ -415,9 +442,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): initiator destroy FORWAR
       gatewayProofHex: null,
       isOriginator: false,
       localNodeId: topo.hopNodeIds[1]!,
+      expectedRemoteNodeId: topo.hopNodeIds[0]!,
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.hopNodeIds[1]!, [topo.hopNodeIds[0]!, topo.hopNodeIds[2]!]),
       peerPortRegistry: Object.fromEntries(relay1PeerPorts),
+      senderEd25519SecretKeyHex: toHex(topo.route.kps[1]!.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.route.kps[1]!.publicKey),
       destroyForDirection,
     });
     await new Promise((r) => setTimeout(r, 400));
@@ -434,9 +464,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): initiator destroy FORWAR
       gatewayProofHex: null,
       isOriginator: false,
       localNodeId: topo.hopNodeIds[0]!,
+      expectedRemoteNodeId: topo.route.initiator.nodeId,
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.hopNodeIds[0]!, [topo.hopNodeIds[1]!]),
       peerPortRegistry: Object.fromEntries(relay0PeerPorts),
+      senderEd25519SecretKeyHex: toHex(topo.route.kps[0]!.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.route.kps[0]!.publicKey),
       destroyForDirection,
     });
     await new Promise((r) => setTimeout(r, 400));
@@ -456,9 +489,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): initiator destroy FORWAR
       isOriginator: true,
       originatorDestroyHex: destroyWireHex,
       localNodeId: topo.route.initiator.nodeId,
+      expectedRemoteNodeId: topo.route.initiator.nodeId, // placeholder — originator does not receive
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.route.initiator.nodeId, [topo.hopNodeIds[0]!]),
       peerPortRegistry: Object.fromEntries(initiatorPeerPorts),
+      senderEd25519SecretKeyHex: toHex(topo.initiatorKp.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.initiatorKp.publicKey),
       destroyForDirection,
     });
 
@@ -551,9 +587,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): gateway destroy BACKWARD
       gatewayProofHex,
       isOriginator: false,
       localNodeId: topo.route.initiator.nodeId,
+      expectedRemoteNodeId: topo.hopNodeIds[0]!,
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.route.initiator.nodeId, [topo.hopNodeIds[0]!]),
       peerPortRegistry: {},
+      senderEd25519SecretKeyHex: toHex(topo.initiatorKp.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.initiatorKp.publicKey),
       destroyForDirection,
     });
     await new Promise((r) => setTimeout(r, 400));
@@ -571,9 +610,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): gateway destroy BACKWARD
       gatewayProofHex,
       isOriginator: false,
       localNodeId: topo.hopNodeIds[0]!,
+      expectedRemoteNodeId: topo.hopNodeIds[1]!,
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.hopNodeIds[0]!, [topo.hopNodeIds[1]!, topo.route.initiator.nodeId]),
       peerPortRegistry: Object.fromEntries(relay0PeerPorts),
+      senderEd25519SecretKeyHex: toHex(topo.route.kps[0]!.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.route.kps[0]!.publicKey),
       destroyForDirection,
     });
     await new Promise((r) => setTimeout(r, 400));
@@ -591,9 +633,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): gateway destroy BACKWARD
       gatewayProofHex,
       isOriginator: false,
       localNodeId: topo.hopNodeIds[1]!,
+      expectedRemoteNodeId: topo.gatewayNodeId,
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.hopNodeIds[1]!, [topo.hopNodeIds[0]!, topo.hopNodeIds[2]!]),
       peerPortRegistry: Object.fromEntries(relay1PeerPorts),
+      senderEd25519SecretKeyHex: toHex(topo.route.kps[1]!.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.route.kps[1]!.publicKey),
       destroyForDirection,
     });
     await new Promise((r) => setTimeout(r, 400));
@@ -611,9 +656,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): gateway destroy BACKWARD
       isOriginator: true,
       originatorDestroyHex: destroyWireHex,
       localNodeId: topo.gatewayNodeId,
+      expectedRemoteNodeId: topo.gatewayNodeId, // placeholder — originator does not receive
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.gatewayNodeId, [topo.hopNodeIds[1]!]),
       peerPortRegistry: Object.fromEntries(gatewayPeerPorts),
+      senderEd25519SecretKeyHex: toHex(topo.gatewayKp.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.gatewayKp.publicKey),
       destroyForDirection,
     });
 
@@ -695,9 +743,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): transport failure", () =
       isOriginator: true,
       originatorDestroyHex: destroyWireHex,
       localNodeId: topo.route.initiator.nodeId,
+      expectedRemoteNodeId: topo.route.initiator.nodeId, // placeholder — originator does not receive
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.route.initiator.nodeId, [topo.hopNodeIds[0]!]),
       peerPortRegistry: Object.fromEntries(initiatorPeerPorts),
+      senderEd25519SecretKeyHex: toHex(topo.initiatorKp.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.initiatorKp.publicKey),
       destroyForDirection,
     });
 
@@ -752,22 +803,44 @@ describe("R-009 Stage 3 Phase 3 (production transport): restart", () => {
       gatewayProofHex: null,
       isOriginator: false,
       localNodeId: topo.hopNodeIds[0]!,
+      expectedRemoteNodeId: topo.route.initiator.nodeId, // initiator sends to relay0
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.hopNodeIds[0]!, [topo.hopNodeIds[1]!]),
       peerPortRegistry: {},
+      senderEd25519SecretKeyHex: toHex(topo.route.kps[0]!.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.route.kps[0]!.publicKey),
       destroyForDirection,
     });
     await new Promise((r) => setTimeout(r, 400));
 
-    // Send the destroy over TCP (manually, simulating the previous hop).
+    // Build the PropagationChannelProof (signed by the initiator — the
+    // previous hop in the FORWARD direction) + the destroy wire bytes in
+    // the production wire format: [4 bytes proof len][proof]
+    // [4 bytes destroy len][destroy]. The receiver (relay0) verifies the
+    // proof against its expectedRemoteNodeId + circuit context before
+    // delivering the destroy to propagateCircuitDestroy().
     const { connect } = await import("node:net");
+    const buildProofAndWireBytes = (): Buffer => {
+      const proof = signPropagationChannelProof(
+        topo.route.initiator.nodeId, // senderNodeId (the previous hop)
+        topo.hopNodeIds[0]!, // receiverNodeId (relay0)
+        topo.circuit.circuitId, topo.circuit.commitmentRoot, "FORWARD",
+        topo.initiatorKp.secretKey, topo.initiatorKp.publicKey,
+      );
+      const proofBytes = Buffer.from(encodePropagationChannelProof(proof));
+      const wireBytes = Buffer.from(encodeCircuitDestroy(destroy));
+      const proofLenBuf = Buffer.alloc(4);
+      proofLenBuf.writeUInt32BE(proofBytes.length, 0);
+      const destroyLenBuf = Buffer.alloc(4);
+      destroyLenBuf.writeUInt32BE(wireBytes.length, 0);
+      return Buffer.concat([proofLenBuf, proofBytes, destroyLenBuf, wireBytes]);
+    };
+    const proofAndWireBytes = buildProofAndWireBytes();
+
+    // Send the destroy over TCP (manually, simulating the previous hop).
     await new Promise<void>((resolve, reject) => {
       const sock = connect(port1, "127.0.0.1", () => {
-        const wire = encodeCircuitDestroy(destroy);
-        const lenBuf = Buffer.alloc(4);
-        lenBuf.writeUInt32BE(wire.length, 0);
-        sock.write(lenBuf);
-        sock.write(wire);
+        sock.write(proofAndWireBytes);
         setTimeout(() => { sock.end(); resolve(); }, 100);
       });
       sock.on("error", reject);
@@ -790,21 +863,22 @@ describe("R-009 Stage 3 Phase 3 (production transport): restart", () => {
       gatewayProofHex: null,
       isOriginator: false,
       localNodeId: topo.hopNodeIds[0]!,
+      expectedRemoteNodeId: topo.route.initiator.nodeId, // initiator sends to relay0
       hopNodeIds: topo.hopNodeIds,
       links: buildLinks(topo.hopNodeIds[0]!, [topo.hopNodeIds[1]!]),
       peerPortRegistry: {},
+      senderEd25519SecretKeyHex: toHex(topo.route.kps[0]!.secretKey),
+      senderEd25519PublicKeyHex: toHex(topo.route.kps[0]!.publicKey),
       destroyForDirection,
     });
     await new Promise((r) => setTimeout(r, 400));
 
-    // Send the SAME destroy again → idempotent.
+    // Send the SAME destroy again → idempotent. Reuse the same proof bytes
+    // (the proof is signed by the initiator and is valid for the same
+    // circuit + direction context).
     await new Promise<void>((resolve, reject) => {
       const sock = connect(port2, "127.0.0.1", () => {
-        const wire = encodeCircuitDestroy(destroy);
-        const lenBuf = Buffer.alloc(4);
-        lenBuf.writeUInt32BE(wire.length, 0);
-        sock.write(lenBuf);
-        sock.write(wire);
+        sock.write(proofAndWireBytes);
         setTimeout(() => { sock.end(); resolve(); }, 100);
       });
       sock.on("error", reject);
@@ -828,30 +902,42 @@ describe("R-009 Stage 3 Phase 3 (production transport): restart", () => {
 // =====================================================================
 
 describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", () => {
+  // Helper: generate a real Ed25519 keypair for the test sender.
+  async function makeSenderKey() {
+    const { generateNodeKeypair } = await import("@reference/identity/keys");
+    return generateNodeKeypair();
+  }
+
+  // Helper: build a fake AuthenticatedLink (plain object — NOT a genuine
+  // WeakSet-registered link). The transport verifies the link binding by
+  // field value (localNodeId, remoteNodeId), NOT by WeakSet membership.
+  // The cryptographic authentication comes from the PropagationChannelProof
+  // (signed by the sender's Ed25519 key), not from the link object itself.
+  function fakeLink(localNodeId: string, remoteNodeId: string) {
+    return {
+      localNodeId, remoteNodeId,
+      linkIdHex: "mock", linkIdBytes: new Uint8Array(32),
+      transcriptDigestHex: "mock", localRole: "INITIATOR" as const,
+      establishedAt: NOW, expiresAt: NOW + 3600, transcriptVerifiedAt: NOW,
+      remoteNode: { nodeId: remoteNodeId },
+    };
+  }
+
   test("InProcessCircuitDestroyTransport rejects peer mismatch (link.remoteNodeId !== nextHopNodeId)", async () => {
     const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
     const transport = new InProcessCircuitDestroyTransport();
+    const senderKp = await makeSenderKey();
 
     // A link to NodeId "real-next-hop", but the ctx claims nextHopNodeId = "wrong-hop".
-    const fakeLink = {
-      localNodeId: "local",
-      remoteNodeId: "real-next-hop",
-      linkIdHex: "mock",
-      linkIdBytes: new Uint8Array(32),
-      transcriptDigestHex: "mock",
-      localRole: "INITIATOR" as const,
-      establishedAt: NOW,
-      expiresAt: NOW + 3600,
-      transcriptVerifiedAt: NOW,
-      remoteNode: { nodeId: "real-next-hop" },
-    };
     const ctx = {
       localNodeId: "local",
       nextHopNodeId: "wrong-hop", // MISMATCH
       circuitId: new Uint8Array(32),
       commitmentRoot: new Uint8Array(32),
       direction: "FORWARD" as const,
-      authenticatedLink: fakeLink,
+      authenticatedLink: fakeLink("local", "real-next-hop"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
     };
     const result = await transport.send(ctx, new Uint8Array(32));
     expect(result.ok).toBe(false);
@@ -861,62 +947,190 @@ describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", 
   test("InProcessCircuitDestroyTransport rejects link not owned by local participant", async () => {
     const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
     const transport = new InProcessCircuitDestroyTransport();
+    const senderKp = await makeSenderKey();
 
-    const fakeLink = {
-      localNodeId: "someone-else", // NOT the local participant
-      remoteNodeId: "next-hop",
-      linkIdHex: "mock",
-      linkIdBytes: new Uint8Array(32),
-      transcriptDigestHex: "mock",
-      localRole: "INITIATOR" as const,
-      establishedAt: NOW,
-      expiresAt: NOW + 3600,
-      transcriptVerifiedAt: NOW,
-      remoteNode: { nodeId: "next-hop" },
-    };
     const ctx = {
-      localNodeId: "local", // MISMATCH — the link is not owned by this participant
+      localNodeId: "local", // MISMATCH — the link is owned by "someone-else"
       nextHopNodeId: "next-hop",
       circuitId: new Uint8Array(32),
       commitmentRoot: new Uint8Array(32),
       direction: "FORWARD" as const,
-      authenticatedLink: fakeLink,
+      authenticatedLink: fakeLink("someone-else", "next-hop"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
     };
     const result = await transport.send(ctx, new Uint8Array(32));
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("link.localNodeId");
   });
 
-  test("InProcessCircuitDestroyTransport sends exact bytes (no decode + re-encode)", async () => {
+  test("InProcessCircuitDestroyTransport sends exact bytes + receiver authenticates (correct peer + correct circuit)", async () => {
     const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
     const transport = new InProcessCircuitDestroyTransport();
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
 
-    const fakeLink = {
-      localNodeId: "local",
-      remoteNodeId: "next-hop",
-      linkIdHex: "mock",
-      linkIdBytes: new Uint8Array(32),
-      transcriptDigestHex: "mock",
-      localRole: "INITIATOR" as const,
-      establishedAt: NOW,
-      expiresAt: NOW + 3600,
-      transcriptVerifiedAt: NOW,
-      remoteNode: { nodeId: "next-hop" },
-    };
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
     const ctx = {
-      localNodeId: "local",
-      nextHopNodeId: "next-hop",
-      circuitId: new Uint8Array(32),
-      commitmentRoot: new Uint8Array(32),
+      localNodeId: senderNodeId,
+      nextHopNodeId: "receiver",
+      circuitId, commitmentRoot,
       direction: "FORWARD" as const,
-      authenticatedLink: fakeLink,
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
     };
     const wireBytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
     const sendResult = await transport.send(ctx, wireBytes);
     expect(sendResult.ok).toBe(true);
 
-    // Receive — the exact bytes should arrive.
-    const received = await transport.receive("next-hop");
-    expect(toHex(received)).toBe(toHex(wireBytes)); // byte-for-byte identical
+    // Receive — the receiver authenticates the sender via the
+    // PropagationChannelProof. Correct peer + correct circuit → ACCEPT.
+    const received = await transport.receive({
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId, commitmentRoot,
+    });
+    expect(received.ok).toBe(true);
+    if (!received.ok) return;
+    expect(toHex(received.wireBytes)).toBe(toHex(wireBytes)); // byte-for-byte identical
+  });
+
+  test("receiver REJECTS wrong peer (senderNodeId !== expectedRemoteNodeId)", async () => {
+    const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const transport = new InProcessCircuitDestroyTransport();
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+    const ctx = {
+      localNodeId: senderNodeId,
+      nextHopNodeId: "receiver",
+      circuitId, commitmentRoot,
+      direction: "FORWARD" as const,
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
+    };
+    await transport.send(ctx, new Uint8Array(32));
+
+    // Receiver expects a DIFFERENT peer → REJECT.
+    const received = await transport.receive({
+      localNodeId: "receiver",
+      expectedRemoteNodeId: "wrong-peer", // MISMATCH
+      circuitId, commitmentRoot,
+    });
+    expect(received.ok).toBe(false);
+    if (!received.ok) expect(received.reason).toContain("wrong peer");
+  });
+
+  test("receiver REJECTS wrong circuit context (circuitId mismatch)", async () => {
+    const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const transport = new InProcessCircuitDestroyTransport();
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+    const ctx = {
+      localNodeId: senderNodeId,
+      nextHopNodeId: "receiver",
+      circuitId, commitmentRoot,
+      direction: "FORWARD" as const,
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
+    };
+    await transport.send(ctx, new Uint8Array(32));
+
+    // Receiver expects a DIFFERENT circuitId → REJECT.
+    const received = await transport.receive({
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId: new Uint8Array(32).fill(0xff), // MISMATCH
+      commitmentRoot,
+    });
+    expect(received.ok).toBe(false);
+    if (!received.ok) expect(received.reason).toContain("wrong circuit context");
+  });
+
+  test("receiver REJECTS wrong commitmentRoot (route mismatch)", async () => {
+    const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const transport = new InProcessCircuitDestroyTransport();
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+    const ctx = {
+      localNodeId: senderNodeId,
+      nextHopNodeId: "receiver",
+      circuitId, commitmentRoot,
+      direction: "FORWARD" as const,
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
+    };
+    await transport.send(ctx, new Uint8Array(32));
+
+    // Receiver expects a DIFFERENT commitmentRoot → REJECT.
+    const received = await transport.receive({
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId,
+      commitmentRoot: new Uint8Array(32).fill(0xff), // MISMATCH
+    });
+    expect(received.ok).toBe(false);
+    if (!received.ok) expect(received.reason).toContain("wrong route context");
+  });
+
+  test("receiver REJECTS forged PropagationChannelProof (wrong signature)", async () => {
+    const { InProcessCircuitDestroyTransport, signPropagationChannelProof, verifyPropagationChannelProof } = await import("@reference/circuit/propagation");
+    const senderKp = await makeSenderKey();
+    const attackerKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    // FORGE: sign the proof with the ATTACKER's key, but claim the sender's NodeId.
+    // The verifyNodeIdBinding check catches this (attacker's key doesn't derive
+    // the sender's NodeId).
+    const forgedProof = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitId, commitmentRoot, "FORWARD",
+      attackerKp.secretKey, attackerKp.publicKey, // attacker's key
+    );
+    const result = verifyPropagationChannelProof(forgedProof);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("identity binding failed");
+  });
+
+  test("receiver REJECTS copied PropagationChannelProof from a different circuit", async () => {
+    const { signPropagationChannelProof, verifyIncomingPropagationChannelProof } = await import("@reference/circuit/propagation");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+
+    // A proof for circuit A.
+    const circuitAId = new Uint8Array(32).fill(0xab);
+    const commitmentRootA = new Uint8Array(32).fill(0xcd);
+    const proofA = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitAId, commitmentRootA, "FORWARD",
+      senderKp.secretKey, senderKp.publicKey,
+    );
+
+    // The receiver expects circuit B → the proof from circuit A is a "copied"
+    // proof. The circuitId binding check catches this.
+    const circuitBId = new Uint8Array(32).fill(0xff);
+    const commitmentRootB = new Uint8Array(32).fill(0xee);
+    const result = verifyIncomingPropagationChannelProof(proofA, {
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId: circuitBId, // MISMATCH — expects circuit B
+      commitmentRoot: commitmentRootB,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("wrong circuit context");
   });
 });

@@ -32,10 +32,15 @@
  */
 
 import { createServer, connect as netConnect, type Server, type Socket } from "node:net";
-import type {
-  CircuitDestroyTransport,
-  DestroyPropagationContext,
-  TransportSendResult,
+import {
+  signPropagationChannelProof,
+  encodePropagationChannelProof,
+  decodePropagationChannelProof,
+  verifyIncomingPropagationChannelProof,
+  type CircuitDestroyTransport,
+  type DestroyPropagationContext,
+  type AuthenticatedReceiveContext,
+  type TransportSendResult,
 } from "@reference/circuit/propagation";
 
 /**
@@ -49,10 +54,14 @@ import type {
  */
 export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
   private server: Server | null = null;
-  private pendingReceiver: ((wireBytes: Uint8Array) => void) | null = null;
-  // Queue of received wire bytes (in case a destroy arrives before receive()
-  // is called — the destroy is buffered until a receiver waits).
-  private readonly receivedQueue: Uint8Array[] = [];
+  // The pending receiver: its resolve callback + the context to verify
+  // the incoming proof against. When a connection arrives, handleIncoming
+  // verifies the proof against this context + resolves the promise.
+  private pendingReceiver: { resolve: (r: { ok: true; wireBytes: Uint8Array } | { ok: false; reason: string }) => void; ctx: AuthenticatedReceiveContext } | null = null;
+  // Queue of received (proof, wireBytes) pairs (in case a destroy arrives
+  // before receive() is called — the destroy is buffered until a receiver
+  // waits). The receiver verifies the proof against its context on delivery.
+  private readonly receivedQueue: Array<{ proofBytes: Uint8Array; wireBytes: Uint8Array }> = [];
 
   /**
    * @param localNodeId - the local participant's NodeId
@@ -94,11 +103,12 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
   }
 
   /**
-   * Send the destroy wire bytes to the next hop over TCP. Verifies the
-   * authenticated binding before sending.
+   * Send the destroy wire bytes to the next hop over TCP. Signs a
+   * PropagationChannelProof + sends it alongside the destroy wire bytes.
+   * The receiver verifies the proof before accepting the destroy.
    */
   async send(ctx: DestroyPropagationContext, wireBytes: Uint8Array): Promise<TransportSendResult> {
-    // 1. Verify the authenticated binding.
+    // 1. Verify the authenticated link binding.
     if (ctx.authenticatedLink.localNodeId !== ctx.localNodeId) {
       return {
         ok: false,
@@ -112,7 +122,15 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
       };
     }
 
-    // 2. Look up the next hop's port.
+    // 2. Sign the PropagationChannelProof (binds the channel context).
+    const proof = signPropagationChannelProof(
+      ctx.localNodeId, ctx.nextHopNodeId,
+      ctx.circuitId, ctx.commitmentRoot, ctx.direction,
+      ctx.senderEd25519SecretKey, ctx.senderEd25519PublicKey,
+    );
+    const proofBytes = encodePropagationChannelProof(proof);
+
+    // 3. Look up the next hop's port.
     const port = this.peerPortRegistry.get(ctx.nextHopNodeId);
     if (port === undefined) {
       return {
@@ -121,12 +139,17 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
       };
     }
 
-    // 3. Connect + send the EXACT wire bytes (length-prefixed framing).
+    // 4. Connect + send the proof + the EXACT wire bytes.
+    //    Wire protocol: [4 bytes proof len][proof bytes][4 bytes destroy len][destroy bytes]
     return new Promise<TransportSendResult>((resolve) => {
       const sock = netConnect(port, "127.0.0.1", () => {
-        const lenBuf = Buffer.alloc(4);
-        lenBuf.writeUInt32BE(wireBytes.length, 0);
-        sock.write(lenBuf);
+        const proofLenBuf = Buffer.alloc(4);
+        proofLenBuf.writeUInt32BE(proofBytes.length, 0);
+        sock.write(proofLenBuf);
+        sock.write(Buffer.from(proofBytes));
+        const destroyLenBuf = Buffer.alloc(4);
+        destroyLenBuf.writeUInt32BE(wireBytes.length, 0);
+        sock.write(destroyLenBuf);
         sock.write(Buffer.from(wireBytes));
         // Wait for the write to flush, then close.
         setTimeout(() => {
@@ -141,40 +164,59 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
   }
 
   /**
-   * Receive the destroy wire bytes addressed to `localNodeId`. Blocks until
-   * a destroy arrives over the TCP server. The caller MUST have called
-   * `start()` first.
-   *
-   * If a destroy arrives BEFORE `receive()` is called, it is buffered in
-   * `receivedQueue` + delivered when `receive()` is next called.
+   * Receive the destroy wire bytes, AUTHENTICATED. Verifies the incoming
+   * PropagationChannelProof against the receiver's context before delivering.
+   * Blocks until a destroy arrives. The caller MUST have called `start()`.
    */
-  async receive(localNodeId: string): Promise<Uint8Array> {
-    if (localNodeId !== this.localNodeId) {
-      throw new Error(`receive() called with localNodeId "${localNodeId}" but transport is for "${this.localNodeId}"`);
+  async receive(ctx: AuthenticatedReceiveContext): Promise<{ ok: true; wireBytes: Uint8Array } | { ok: false; reason: string }> {
+    if (ctx.localNodeId !== this.localNodeId) {
+      throw new Error(`receive() called with localNodeId "${ctx.localNodeId}" but transport is for "${this.localNodeId}"`);
     }
-    // If a destroy is already queued, deliver it immediately.
+    // If a destroy is already queued, verify its proof + deliver.
     if (this.receivedQueue.length > 0) {
-      return this.receivedQueue.shift()!;
+      const item = this.receivedQueue.shift()!;
+      const proofDecoded = decodePropagationChannelProof(item.proofBytes);
+      if (!proofDecoded.ok) {
+        return { ok: false, reason: `received proof decode failed: ${proofDecoded.reason}` };
+      }
+      const verifyResult = verifyIncomingPropagationChannelProof(proofDecoded.proof, ctx);
+      if (!verifyResult.ok) {
+        return { ok: false, reason: verifyResult.reason };
+      }
+      return { ok: true, wireBytes: item.wireBytes };
     }
-    return new Promise<Uint8Array>((resolve) => {
-      this.pendingReceiver = resolve;
+    // No queued destroy — wait for one. Store the ctx so handleIncoming
+    // can verify the incoming proof when it arrives.
+    return new Promise((resolve) => {
+      this.pendingReceiver = { resolve, ctx };
     });
   }
 
   /**
-   * Handle an incoming TCP connection. Reads the length-prefixed wire bytes
-   * + delivers them to the pending receiver (if any), or buffers them in
-   * `receivedQueue` (if no receiver is waiting yet).
+   * Handle an incoming TCP connection. Reads the proof + the wire bytes,
+   * verifies the proof against the pending receiver's context (if any), or
+   * buffers them for later.
    */
   private handleIncoming(socket: Socket): void {
-    readWire(socket).then((wireBytes) => {
+    readProofAndWire(socket).then(({ proofBytes, wireBytes }) => {
       if (this.pendingReceiver) {
-        const receiver = this.pendingReceiver;
+        const { resolve, ctx } = this.pendingReceiver;
         this.pendingReceiver = null;
-        receiver(wireBytes);
+        // Decode + verify the proof against the receiver's context.
+        const proofDecoded = decodePropagationChannelProof(proofBytes);
+        if (!proofDecoded.ok) {
+          resolve({ ok: false, reason: `received proof decode failed: ${proofDecoded.reason}` });
+        } else {
+          const verifyResult = verifyIncomingPropagationChannelProof(proofDecoded.proof, ctx);
+          if (!verifyResult.ok) {
+            resolve({ ok: false, reason: verifyResult.reason });
+          } else {
+            resolve({ ok: true, wireBytes });
+          }
+        }
       } else {
-        // No receiver waiting — buffer the destroy.
-        this.receivedQueue.push(wireBytes);
+        // No receiver waiting — buffer the proof + wire bytes.
+        this.receivedQueue.push({ proofBytes, wireBytes });
       }
       socket.end();
     }).catch(() => {
@@ -184,29 +226,53 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
 }
 
 /**
- * Read length-prefixed wire bytes from a TCP socket.
+ * Read the PropagationChannelProof + the destroy wire bytes from a TCP socket.
  *
- * Wire protocol: [4 bytes big-endian length][length bytes destroy wire]
+ * Wire protocol:
+ *   [4 bytes big-endian proof length][proof bytes]
+ *   [4 bytes big-endian destroy length][destroy bytes]
  */
-function readWire(socket: Socket): Promise<Uint8Array> {
-  return new Promise<Uint8Array>((resolve, reject) => {
-    let lenBuf: Buffer | null = null;
+function readProofAndWire(socket: Socket): Promise<{ proofBytes: Uint8Array; wireBytes: Uint8Array }> {
+  return new Promise((resolve, reject) => {
+    let phase: "proof-len" | "proof" | "destroy-len" | "destroy" = "proof-len";
+    let lenBuf = Buffer.alloc(0);
     let payload = Buffer.alloc(0);
     let expected = 0;
+    let proofBytes: Uint8Array | null = null;
     socket.on("data", (chunk: Buffer) => {
       let buf = chunk;
       while (buf.length > 0) {
-        if (!lenBuf) {
-          lenBuf = buf.subarray(0, 4);
-          buf = buf.subarray(4);
-          expected = lenBuf.readUInt32BE(0);
+        if (phase === "proof-len" || phase === "destroy-len") {
+          const needed = 4 - lenBuf.length;
+          const take = Math.min(needed, buf.length);
+          lenBuf = Buffer.concat([lenBuf, buf.subarray(0, take)]);
+          buf = buf.subarray(take);
+          if (lenBuf.length === 4) {
+            expected = lenBuf.readUInt32BE(0);
+            payload = Buffer.alloc(0);
+            phase = phase === "proof-len" ? "proof" : "destroy";
+            if (expected === 0 && phase === "proof") {
+              // Empty proof — shouldn't happen, but handle.
+              proofBytes = new Uint8Array(0);
+              phase = "destroy-len";
+              lenBuf = Buffer.alloc(0);
+            }
+          }
         } else {
           const remaining = expected - payload.length;
           payload = Buffer.concat([payload, buf.subarray(0, Math.min(remaining, buf.length))]);
           buf = buf.subarray(Math.min(remaining, buf.length));
           if (payload.length === expected) {
-            resolve(new Uint8Array(payload));
-            return;
+            if (phase === "proof") {
+              proofBytes = new Uint8Array(payload);
+              phase = "destroy-len";
+              lenBuf = Buffer.alloc(0);
+              payload = Buffer.alloc(0);
+            } else {
+              // destroy complete
+              resolve({ proofBytes: proofBytes!, wireBytes: new Uint8Array(payload) });
+              return;
+            }
           }
         }
       }

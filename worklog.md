@@ -2633,3 +2633,166 @@ Stage Summary:
 - Both directions: INITIATOR → FORWARD → GATEWAY; GATEWAY → BACKWARD → INITIATOR.
 - Each participant uses its OWN DurableSqliteCircuitDestroyStore (own SQLite DB via DATABASE_URL env var). No InMemoryCircuitDestroyStore in the propagation path.
 - Restart/replay/failure semantics: transport failure after local revoke → local remains REVOKED (retry possible); restart → tombstone persists → old destroy idempotent; persistence failure → no claim of propagation.
+
+---
+
+## Task ID: config-update
+**Agent**: general-purpose
+**Date**: 2026-08-16 (corrective sub-task)
+**File**: `tests/r009-destroy-propagation-production.test.ts`
+
+### Context
+
+The R-009 Stage 3 Phase 3 production-transport destroy-propagation test
+spawns each participant as a separate `bun -e` child process that reads its
+config from stdin and runs the production `propagateCircuitDestroy()` (from
+`reference/circuit/propagation.ts`). A prior commit had wired up the
+`TcpCircuitDestroyTransport` to verify an incoming `PropagationChannelProof`
+against a per-receiver `AuthenticatedReceiveContext` (localNodeId,
+expectedRemoteNodeId, circuitId, commitmentRoot) — and the PARTICIPANT_SCRIPT
+accordingly reads `config.senderEd25519SecretKeyHex`,
+`config.senderEd25519PublicKeyHex`, and `config.expectedRemoteNodeId` from
+stdin. The FORWARD-test listening participants (gateway, relay0, relay1) had
+been updated to supply these three fields, but the remaining configs had not,
+so the script threw `TypeError: ... Received undefined` whenever it tried to
+`Buffer.from(config.senderEd25519SecretKeyHex, "hex")`.
+
+### Work performed
+
+1. **Added import** at the top of the test file (after the existing
+   `@reference/circuit/destroy` import):
+   ```ts
+   import { signPropagationChannelProof, encodePropagationChannelProof } from "@reference/circuit/propagation";
+   ```
+
+2. **Updated the BACKWARD-test configs** (`gateway destroy BACKWARD`,
+   4 participants) — added `expectedRemoteNodeId` +
+   `senderEd25519SecretKeyHex` + `senderEd25519PublicKeyHex` to each:
+   - initiator (terminal, listens): `expectedRemoteNodeId = topo.hopNodeIds[0]!` (relay0 → initiator), sender = `topo.initiatorKp`
+   - relay0 (forwards to initiator): `expectedRemoteNodeId = topo.hopNodeIds[1]!` (relay1 → relay0), sender = `topo.route.kps[0]`
+   - relay1 (forwards to relay0): `expectedRemoteNodeId = topo.gatewayNodeId` (gateway → relay1), sender = `topo.route.kps[1]`
+   - gateway (originator): `expectedRemoteNodeId = topo.gatewayNodeId` (placeholder — originator does not receive), sender = `topo.gatewayKp`
+
+3. **Updated the transport-failure test config** (initiator, originator):
+   `expectedRemoteNodeId = topo.route.initiator.nodeId` (placeholder),
+   sender = `topo.initiatorKp`.
+
+4. **Updated the restart-test configs** (2 participants, both relay0):
+   `expectedRemoteNodeId = topo.route.initiator.nodeId` (initiator → relay0),
+   sender = `topo.route.kps[0]`.
+
+5. **Replaced the two raw manual TCP sends** in the restart test. The
+   previous code sent `[4 bytes destroy len][destroy]` directly, which the
+   production `TcpCircuitDestroyTransport.receive()` rejects (it expects
+   `[4 bytes proof len][proof][4 bytes destroy len][destroy]` and verifies
+   the proof before delivering the destroy). Replaced each with a helper
+   that:
+   - signs a `PropagationChannelProof` with the initiator's Ed25519 key
+     (the manual send simulates the initiator — the previous hop in the
+     FORWARD direction — sending to relay0),
+   - encodes it via `encodePropagationChannelProof`,
+   - writes the full `[proofLen][proof][destroyLen][destroy]` frame in a
+     single `sock.write(Buffer.concat([...]))` so the framing state machine
+     in `readProofAndWire()` completes correctly.
+   The proof is computed once and reused for the second send (the proof
+   binds only senderNodeId/receiverNodeId/circuitId/commitmentRoot/direction,
+   not a per-send nonce — so it is valid for both sends on the same circuit).
+
+6. **Added the same three fields to the FORWARD-test initiator config**
+   (the originator). The task said "do NOT change the forward test (already
+   updated)", but the forward-test initiator config was missing the three
+   fields — without them, the originator branch of the script throws
+   `TypeError: ... Received undefined` when reading
+   `config.senderEd25519SecretKeyHex`, and the FORWARD test timed out
+   after 90s with no initiator output. Since the task also says "if any
+   test times out or fails, debug + fix it", I added the minimal missing
+   fields (`expectedRemoteNodeId = topo.route.initiator.nodeId` placeholder
+   + `senderEd25519{Secret,Public}KeyHex` from `topo.initiatorKp`) needed
+   to make the originator branch of the script run. No assertions or
+   behavior changed.
+
+### Test results
+
+`cd /home/z/my-project && timeout 200 bun test tests/r009-destroy-propagation-production.test.ts`
+
+```
+(pass) R-009 Stage 3 Phase 3 (production transport): initiator destroy FORWARD ... [5723ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): gateway destroy BACKWARD ... [5701ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): transport failure ... [1327ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): restart ... [2535ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): authenticated binding > rejects peer mismatch [1.39ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): authenticated binding > rejects link not owned by local participant [0.54ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): authenticated binding > sends exact bytes + receiver authenticates [2.83ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): authenticated binding > receiver REJECTS wrong peer [2.55ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): authenticated binding > receiver REJECTS wrong circuit context [2.88ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): authenticated binding > receiver REJECTS wrong commitmentRoot (route mismatch) [3.59ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): authenticated binding > receiver REJECTS forged PropagationChannelProof (wrong signature) [2.50ms]
+(pass) R-009 Stage 3 Phase 3 (production transport): authenticated binding > receiver REJECTS copied PropagationChannelProof from a different circuit [4.19ms]
+
+12 pass
+0 fail
+69 expect() calls
+Ran 12 tests across 1 file. [15.40s]
+```
+
+All 12 tests pass (4 multi-process + 8 in-process binding). No assertions
+were modified.
+
+### Next actions
+
+- Consider factoring the per-participant `expectedRemoteNodeId` +
+  `senderEd25519SecretKeyHex` + `senderEd25519PublicKeyHex` triple into a
+  small helper (`participantSenderFields(topo, role)`) to reduce
+  duplication across the four multi-process tests.
+- The forward-test initiator config note above ("do NOT change the forward
+  test") appears to conflict with the actual state of the file at the
+  start of this task — the initiator config was missing the three fields.
+  The fix is minimal and behavior-preserving, but a Principal should
+  confirm this matches intent.
+
+---
+Task ID: R009-S3-P3-auth-transport
+Agent: orchestrator
+Task: R-009 Stage 3 Phase 3 final transport hardening — authenticated incoming peer.
+
+Work Log:
+- Read previous worklog + git log: confirmed at commit 9bbbef7 (R-009 Stage 3 Phase 3 production transport abstraction).
+- Read the audit's verdict: the TCP adapter is not actually authenticated. receive(localNodeId) accepted arbitrary TCP peers. The AuthenticatedLink is in-process only (WeakSet) — a plain object is forgeable. Need a REAL cryptographic proof that crosses process boundaries.
+
+Fixes applied:
+- PropagationChannelProof (reference/circuit/propagation.ts — new protocol-core artifact): a SIGNED, portable (canonical CBOR) proof that binds the channel context (senderNodeId + receiverNodeId + circuitId + commitmentRoot + direction) + is signed by the sender's Ed25519 node identity key. Domain: SHARENET/CIRCUIT/PROPAGATION/CHANNEL/1. The receiver verifies: (1) the signature, (2) verifyNodeIdBinding(senderNodeId, senderEd25519PublicKey), (3) receiverNodeId === localNodeId, (4) senderNodeId === expectedRemoteNodeId, (5) circuitId + commitmentRoot match my context. This is a REAL cryptographic proof — an attacker cannot construct a valid proof without the sender's Ed25519 secret key. A copied proof from a different circuit fails the circuitId/commitmentRoot binding checks.
+- signPropagationChannelProof() + verifyPropagationChannelProof() + encodePropagationChannelProof() + decodePropagationChannelProof(): the sign/verify/encode/decode functions (portable — no WeakSet dependency).
+- verifyIncomingPropagationChannelProof(proof, ctx): the RECEIVER-SIDE authentication check — verifies the proof + the binding to the receiver's context (localNodeId, expectedRemoteNodeId, circuitId, commitmentRoot). A wrong peer, wrong circuit, wrong commitmentRoot, or forged proof is REJECTED.
+- AuthenticatedReceiveContext (new interface): replaces receive(localNodeId). Binds localNodeId + expectedRemoteNodeId + circuitId + commitmentRoot. The transport verifies the incoming proof against this context.
+- DestroyPropagationContext: extended with senderEd25519SecretKey + senderEd25519PublicKey (the sender signs a proof for each hop).
+- CircuitDestroyTransport.receive(ctx): now takes AuthenticatedReceiveContext, returns { ok: true, wireBytes } | { ok: false, reason }. The transport verifies the incoming proof before delivering the bytes.
+- InProcessCircuitDestroyTransport: updated to sign the proof on send + verify on receive (via verifyIncomingPropagationChannelProof).
+- TcpCircuitDestroyTransport (src/lib/sharenet/circuit-destroy-transport.ts): updated to sign the proof on send + send it alongside the destroy bytes (wire protocol: [4 bytes proof len][proof][4 bytes destroy len][destroy]). The receiver reads the proof + destroy, verifies the proof against the AuthenticatedReceiveContext, and delivers the bytes only if the proof is valid. A wrong peer / wrong circuit / wrong commitmentRoot / forged proof → REJECT.
+- propagateCircuitDestroy(): extended signature with senderEd25519SecretKey + senderEd25519PublicKey. The function passes these to the DestroyPropagationContext; the transport signs the proof using them.
+
+Adversarial tests (tests/r009-destroy-propagation-production.test.ts — 8 in-process binding tests):
+1. peer mismatch (link.remoteNodeId !== nextHopNodeId) → REJECT
+2. link not owned by local participant → REJECT
+3. correct peer + correct circuit → ACCEPT (exact bytes preserved)
+4. receiver REJECTS wrong peer (senderNodeId !== expectedRemoteNodeId)
+5. receiver REJECTS wrong circuit context (circuitId mismatch)
+6. receiver REJECTS wrong commitmentRoot (route mismatch)
+7. receiver REJECTS forged PropagationChannelProof (wrong signature — identity binding fails)
+8. receiver REJECTS copied PropagationChannelProof from a different circuit (circuitId mismatch)
+
+Multi-process tests (4 tests, updated):
+- The PARTICIPANT_SCRIPT now passes the sender keypair + expectedRemoteNodeId to each participant config. Each relay uses the authenticated receive(ctx) — the transport verifies the incoming proof before delivering the bytes. The forward + backward + transport-failure + restart tests all pass with the authenticated transport.
+- The restart test's manual TCP send was updated to use the production [proof len][proof][destroy len][destroy] wire format (signs a PropagationChannelProof with the initiator's key — the simulated previous hop).
+
+Subagent (config-update): updated the backward + transport-failure + restart test configs to include senderEd25519SecretKeyHex + senderEd25519PublicKeyHex + expectedRemoteNodeId. Also fixed the forward-test initiator config that was missing the three fields. All 12 tests pass (4 multi-process + 8 binding).
+
+Verification (all five required suites):
+- Unit tests: 545 pass / 0 fail (was 540; +5 adversarial binding tests). 2021 expect() calls across 33 files in 39.59s.
+- Architecture tests: 24/24 pass (incl. #21 + #23 layer-separation — reference/circuit/propagation.ts imports only from ../identity/keys + ../encoding/cbor; no @/ or Prisma).
+- TS conformance vectors: 41/41 pass.
+- Python conformance vectors: 41/41 pass.
+- Lint: clean (exit 0).
+
+Stage Summary:
+- R-009 Stage 3 Phase 3 final transport hardening is complete: the transport is AUTHENTICATED END-TO-END. Every destroy hop traverses an authenticated peer/channel bound to the intended participant, circuit, route, and direction. The PropagationChannelProof is a REAL cryptographic proof (signed by the sender's Ed25519 node identity key, verified by the receiver) — not a forgeable plain object. The original signed destroy bytes remain unchanged. Each receiver validates the forwarding peer before teardown. Durable revoke/zeroize semantics remain intact.
+- Closure criterion satisfied: "Every CircuitDestroy hop traverses an authenticated peer/channel bound to the intended participant, circuit, route, and direction; the original signed destroy bytes remain unchanged; each receiver validates the forwarding peer before teardown; and durable revoke/zeroize semantics remain intact."
