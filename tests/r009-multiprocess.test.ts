@@ -82,6 +82,16 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
   // Each spawn is a SEPARATE process with its own V8 isolate — no shared memory.
 
   test("gateway receives wire bytes in independent process → verifies route → decrypts → seals → source decrypts", async () => {
+    // The makeGenuineBrandedRouteHelper returns the full BrandedRouteContext
+    // (with `.branded`, `.kps`, `.commitment`, `.hops`). We use ONE route
+    // throughout — per the re-audit of 8fa4ef3 (R-009 Stage 2 terminal-hop
+    // proof): the GatewayReturnAuthorization now embeds the terminal
+    // RouteAcceptance + the list of hopNodeIds so the gateway can verify
+    // (from wire bytes alone) that the relayEd25519PublicKey matches BOTH
+    // the ack signature AND the acceptance signature, AND that the
+    // gatewayNodeId in the template is the genuine terminal hop. The
+    // terminalAcceptance + hopNodeIds must come from the SAME route as the
+    // gatewayTemplate + terminalAck.
     const route = makeGenuineBrandedRouteHelper(2, NOW);
     const relayKeys = [
       { hopIndex: 0, nodeId: route.branded.hops[0]!.nodeId, x25519PublicKey: x25519.getPublicKey(randomBytes(32)) },
@@ -99,16 +109,12 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
       initiatorX25519PublicKey: circuit.initiatorX25519PublicKey,
       setupNonce: randomBytes(16),
     };
-    const relayKp = { secretKey: randomBytes(32), publicKey: new Uint8Array(32) };
-    // We need the relay's Ed25519 keypair from the route helper.
-    // The makeGenuineBrandedRouteHelper generates kps — use ctx.kps.
-    const ctx = makeGenuineBrandedRouteHelper(2, NOW);
     const ackResult = handleCircuitSetup(
-      req, ctx.kps[terminalHopIndex]!.secretKey, route.branded.commitmentRoot, NOW,
+      req, route.kps[terminalHopIndex]!.secretKey, route.branded.commitmentRoot, NOW,
     );
     if (!ackResult.ok) throw new Error("terminal ack setup failed");
     const terminalAck = ackResult.ack;
-    const relayEd25519PublicKey = ctx.kps[terminalHopIndex]!.publicKey;
+    const relayEd25519PublicKey = route.kps[terminalHopIndex]!.publicKey;
     const gatewayX25519SecretKey = ackResult.state.relayX25519SecretKey;
     const gatewayX25519PublicKey = ackResult.state.relayX25519PublicKey;
 
@@ -118,15 +124,19 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
       template, route.branded.expiry, gatewayNodeId,
       gatewayX25519PublicKey,
       circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
-      ctx.kps[0]!.secretKey, ctx.kps[0]!.publicKey, // initiator Ed25519 key
+      route.kps[0]!.secretKey, route.kps[0]!.publicKey, // initiator Ed25519 key
     );
 
     // 2. INITIATOR: construct the GatewayReturnAuthorization (portable proof).
     //    This bundles the GatewayReturnTemplate + the terminal ack's proof fields
-    //    (relayEd25519PublicKey, relaySignature, routeId, etc.) into a single
-    //    canonical wire artifact that the gateway can verify from wire bytes alone.
+    //    (relayEd25519PublicKey, relaySignature, routeId, etc.) + the terminal
+    //    RouteAcceptance + the list of hopNodeIds into a single canonical wire
+    //    artifact that the gateway can verify from wire bytes alone.
+    const terminalAcceptance = route.commitment.acceptances[terminalHopIndex]!;
+    const hopNodeIds = route.branded.hops.map((h) => h.nodeId);
     const authorization = constructGatewayReturnAuthorization(
-      gatewayTemplate, ackResult.ack, ctx.kps[terminalHopIndex]!.publicKey,
+      gatewayTemplate, ackResult.ack, relayEd25519PublicKey,
+      terminalAcceptance, hopNodeIds,
     );
     const authWireBytes = encodeGatewayReturnAuthorization(authorization);
     const authWireHex = toHex(authWireBytes);
@@ -134,8 +144,12 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
     // 3. GATEWAY PROCESS (independent): verify from wire bytes alone.
     //    The child process receives the GatewayReturnAuthorization as canonical
     //    CBOR wire bytes. It decodes + verifies the terminal ack's Ed25519
-    //    signature (proving the ack is genuine, not forged) + the initiator's
-    //    signature + the ECDH decrypt — ALL from wire bytes, no WeakSet dependency.
+    //    signature (proving the ack is genuine, not forged), the terminal
+    //    RouteAcceptance's Ed25519 signature (proving the relay is the
+    //    authorized terminal hop of the committed route), the gatewayNodeId
+    //    match (proving the template was bound to the SAME gateway the
+    //    acceptance authorized), and the initiator's signature + ECDH
+    //    decrypt — ALL from wire bytes, no WeakSet dependency.
     const gatewayScript = `
       const { decodeGatewayReturnAuthorization, verifyGatewayReturnAuthorization } = require("${join(process.cwd(), "reference/circuit/return-template.ts").replace(/\\/g, "\\\\")}");
 

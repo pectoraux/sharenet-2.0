@@ -55,6 +55,13 @@ function makeRoute(numHops = 2) {
     kps: ctx.kps,
     hpk: ctx.hopPublicKeys,
     commitmentRoot: ctx.branded.commitmentRoot,
+    // Per R-009 Stage 2 (re-audit of 8fa4ef3 — terminal-hop proof): the
+    // GatewayReturnAuthorization now embeds the terminal RouteAcceptance +
+    // the list of hopNodeIds so the gateway can verify it is the genuine
+    // terminal hop (not an intermediate relay impersonating the gateway).
+    commitment: ctx.commitment,
+    hopNodeIds: ctx.branded.hops.map((h) => h.nodeId),
+    terminalAcceptance: ctx.commitment.acceptances[ctx.commitment.acceptances.length - 1]!,
   };
 }
 
@@ -1109,19 +1116,28 @@ describe("R-009 Stage 2: real distributed transport (wire bytes → decode → v
 
 describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire bytes)", () => {
   test("construct + encode + decode round-trip", () => {
-    const { circuit, template, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
-    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const { circuit, template, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds);
     const wireBytes = encodeGatewayReturnAuthorization(auth);
     const decoded = decodeGatewayReturnAuthorization(wireBytes);
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
     expect(decoded.authorization.routeId).toBe(auth.routeId);
     expect(decoded.authorization.hopIndex).toBe(auth.hopIndex);
+    // The 8 new terminal-hop proof fields round-trip byte-identical.
+    expect(decoded.authorization.terminalNodeId).toBe(auth.terminalNodeId);
+    expect(decoded.authorization.acceptanceProposalDigestHex).toBe(auth.acceptanceProposalDigestHex);
+    expect(decoded.authorization.acceptanceHopDigestHex).toBe(auth.acceptanceHopDigestHex);
+    expect(decoded.authorization.acceptanceServiceDigestHex).toBe(auth.acceptanceServiceDigestHex);
+    expect(decoded.authorization.acceptanceNonce).toEqual(auth.acceptanceNonce);
+    expect(decoded.authorization.acceptanceExpiry).toBe(auth.acceptanceExpiry);
+    expect(decoded.authorization.acceptanceSignature).toEqual(auth.acceptanceSignature);
+    expect(decoded.authorization.hopNodeIds).toEqual(auth.hopNodeIds);
   });
 
   test("verify from wire bytes alone → accepts (no WeakSet dependency)", () => {
-    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
-    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds);
     const wireBytes = encodeGatewayReturnAuthorization(auth);
     const decoded = decodeGatewayReturnAuthorization(wireBytes);
     if (!decoded.ok) return;
@@ -1137,9 +1153,9 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
   });
 
   test("forged terminal ack (wrong relayEd25519PublicKey) → REJECT", () => {
-    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck } = setupGatewayEnv();
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
     const wrongEd25519Key = randomBytes(32); // not the relay's Ed25519 key
-    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, wrongEd25519Key);
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, wrongEd25519Key, terminalAcceptance, hopNodeIds);
     const wireBytes = encodeGatewayReturnAuthorization(auth);
     const decoded = decodeGatewayReturnAuthorization(wireBytes);
     if (!decoded.ok) return;
@@ -1156,8 +1172,8 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
   });
 
   test("tampered relaySignature → REJECT", () => {
-    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
-    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds);
     const tamperedSig = new Uint8Array(auth.relaySignature);
     tamperedSig[0] ^= 0x01;
     const tamperedAuth = { ...auth, relaySignature: tamperedSig };
@@ -1174,8 +1190,8 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
   });
 
   test("wrong gateway NodeId → REJECT", () => {
-    const { gatewayX25519Sk, gatewayX25519Pk, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
-    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds);
 
     const result = verifyGatewayReturnAuthorization(
       auth,
@@ -1189,8 +1205,8 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
   });
 
   test("expired template → REJECT", () => {
-    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
-    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds);
 
     const result = verifyGatewayReturnAuthorization(
       auth,
@@ -1204,8 +1220,8 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
   });
 
   test("wrong gateway X25519 key → REJECT", () => {
-    const { gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
-    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const { gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds);
     const wrongSk = randomBytes(32);
     const wrongPk = x25519.getPublicKey(wrongSk);
 
@@ -1218,6 +1234,78 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("X25519 public key mismatch");
+  });
+
+  // -----------------------------------------------------------------
+  // R-009 Stage 2 — terminal-hop proof tests (re-audit of 8fa4ef3):
+  // The 3 new tests below exercise the new check 2b (acceptance signature),
+  // check 2c (terminalNodeId is the actual terminal hop), and check 2c
+  // (second sub-check: hopNodeIds[hopIndex] === terminalNodeId).
+  // -----------------------------------------------------------------
+
+  test("non-terminal relay proof (hopIndex != terminal) → REJECT", () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds);
+    // Attacker tampers hopNodeIds to drop the terminal hop. The acceptance
+    // signature is still genuine (verifies at check 2b), but check 2c
+    // fires because auth.hopIndex (1) is no longer the last index of
+    // the (tampered, truncated) hopNodeIds (length 1 → last index 0).
+    const tamperedAuth = { ...auth, hopNodeIds: [hopNodeIds[0]!] };
+
+    const result = verifyGatewayReturnAuthorization(
+      tamperedAuth,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("terminalNodeId is not the terminal hop");
+  });
+
+  test("mismatched relay Ed25519 key (acceptance signed by different key) → REJECT", () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, hopNodeIds } = setupGatewayEnv();
+    // Attacker uses a DIFFERENT route's terminal acceptance — it was signed
+    // by a different relay's Ed25519 secret key. The genuine
+    // relayEd25519PublicKey (route1's terminal relay) cannot verify the
+    // signature → check 2b rejects.
+    const otherRoute = makeRoute(2);
+    const otherAcceptance = otherRoute.terminalAcceptance;
+    const auth = constructGatewayReturnAuthorization(
+      gatewayTemplate, terminalAck, relayEd25519PublicKey, otherAcceptance, hopNodeIds,
+    );
+
+    const result = verifyGatewayReturnAuthorization(
+      auth,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("RouteAcceptance signature invalid");
+  });
+
+  test("hopNodeIds doesn't match (wrong route) → REJECT", () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds);
+    // Attacker replaces hopNodeIds with a DIFFERENT route's hopNodeIds.
+    // The acceptance signature is genuine (check 2b passes); hopIndex
+    // equals hopNodeIds.length - 1 (check 2c first sub-check passes);
+    // BUT hopNodeIds[hopIndex] (route2's terminal) !== terminalNodeId
+    // (route1's terminal) → check 2c second sub-check fires.
+    const otherRoute = makeRoute(2);
+    const tamperedAuth = { ...auth, hopNodeIds: otherRoute.hopNodeIds };
+
+    const result = verifyGatewayReturnAuthorization(
+      tamperedAuth,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("terminalNodeId is not the terminal hop");
   });
 });
 
@@ -1257,5 +1345,12 @@ function setupGatewayEnv() {
     route, circuit, template, gatewayTemplate, terminalAck, relayEd25519PublicKey,
     gatewayX25519Sk: gatewayX25519SecretKey, gatewayX25519Pk: gatewayX25519PublicKey,
     gatewayNodeId,
+    // Per R-009 Stage 2 (re-audit of 8fa4ef3 — terminal-hop proof): the
+    // GatewayReturnAuthorization now embeds the terminal RouteAcceptance +
+    // the list of hopNodeIds so the gateway can verify (from wire bytes
+    // alone) that it is the genuine terminal hop + that the terminal
+    // acceptance was signed by the same Ed25519 key as the ack.
+    terminalAcceptance: route.terminalAcceptance,
+    hopNodeIds: route.hopNodeIds,
   };
 }

@@ -85,6 +85,12 @@ import {
   routeCommitmentDigest,
   type CircuitSetupAck,
 } from "./distributed-setup";
+import {
+  routeAcceptanceSigningPayload,
+  verifyRouteAcceptance,
+  type RouteAcceptance,
+} from "../routing/route";
+import { fromHex } from "../encoding/cbor";
 
 // -----------------------------------------------------------------------
 // Constants (R-009 Stage 2 — return-onion template)
@@ -1091,6 +1097,15 @@ export function decodeGatewayReturnTemplate(bytes: Uint8Array): { ok: true; gate
 //   1. The terminal ack's Ed25519 signature (using the embedded relayEd25519PublicKey).
 //   2. The ack's routeId/routeCommitmentDigest/hopIndex binding (against the template's
 //      commitmentRoot — which is also signed by the initiator).
+//   2b. The terminal RouteAcceptance's Ed25519 signature (using the SAME
+//      relayEd25519PublicKey — the relay that acked also accepted the route).
+//      Proves the relay is the authorized terminal hop of the committed route.
+//   2c. The terminalNodeId is the actual terminal hop (hopIndex == hopNodeIds.length - 1
+//      AND hopNodeIds[hopIndex] == terminalNodeId). Blocks intermediate-relay
+//      impersonation of the gateway.
+//   2d. The gatewayNodeId in the template matches the terminalNodeId (the
+//      acceptance's acceptorNodeId). Blocks replaying a template bound to one
+//      gateway against the acceptance of a different gateway.
 //   3. The initiator's Ed25519 signature over the complete template binding.
 //   4. The standard GatewayReturnTemplate checks (NodeId, X25519 key, expiry, ECDH decrypt).
 //
@@ -1122,22 +1137,35 @@ export const GATEWAY_RETURN_AUTHORIZATION_DOMAIN = "SHARENET/CIRCUIT/RETURN/AUTH
  *     3: routeId (text),
  *     4: routeCommitmentDigestHex (text),
  *     5: hopIndex (uint),
- *     6: ackNonce (bstr .size 16),
- *     7: ackTimestamp (uint),
- *     8: ackExpiry (uint),
- *     9: relaySignature (bstr .size 64) }
+ *     6: possessionProofCiphertext (bstr .size 48),
+ *     7: possessionChallenge (bstr .size 32),
+ *     8: ackNonce (bstr .size 16),
+ *     9: ackTimestamp (uint),
+ *     10: ackExpiry (uint),
+ *     11: relaySignature (bstr .size 64),
+ *     12: terminalNodeId (text),
+ *     13: acceptanceProposalDigestHex (text),
+ *     14: acceptanceHopDigestHex (text),
+ *     15: acceptanceServiceDigestHex (text),
+ *     16: acceptanceNonce (bstr .size 16),
+ *     17: acceptanceExpiry (uint),
+ *     18: acceptanceSignature (bstr .size 64),
+ *     19: hopNodeIds (array of text) }
  *
  * Note: the relayX25519PublicKey + initiatorX25519PublicKey +
  * possessionProofCiphertext + possessionChallenge are already in the
  * GatewayReturnTemplate (fields 9-10 there). The ack's signature covers
  * them (the signing payload includes all 10 ack fields). The gateway
  * reconstructs the ack signing payload from the GatewayReturnTemplate's
- * fields + this object's fields.
+ * fields + this object's fields. The terminal RouteAcceptance's signature
+ * covers (proposal_digest, hop_index, hop_digest, service_digest,
+ * acceptor_node_id, acceptance_nonce, expiry) — reconstructed from
+ * fields 13-18 + the hopIndex (5) + the terminalNodeId (12).
  */
 export interface GatewayReturnAuthorization {
   /** The encoded GatewayReturnTemplate (the inner wire object). */
   gatewayTemplateBytes: Uint8Array;
-  /** The terminal relay's Ed25519 public key (verifies the ack signature). */
+  /** The terminal relay's Ed25519 public key (verifies the ack + acceptance signatures). */
   relayEd25519PublicKey: Uint8Array;
   /** The route ID (from the committed route). */
   routeId: string;
@@ -1157,6 +1185,22 @@ export interface GatewayReturnAuthorization {
   ackExpiry: number;
   /** The terminal relay's Ed25519 signature over the ack binding payload. */
   relaySignature: Uint8Array;
+  /** The terminal relay's NodeId (the acceptorNodeId from the RouteAcceptance). */
+  terminalNodeId: string;
+  /** The terminal RouteAcceptance's proposalDigestHex. */
+  acceptanceProposalDigestHex: string;
+  /** The terminal RouteAcceptance's hopDigestHex. */
+  acceptanceHopDigestHex: string;
+  /** The terminal RouteAcceptance's serviceDigestHex. */
+  acceptanceServiceDigestHex: string;
+  /** The terminal RouteAcceptance's nonce (16 bytes). */
+  acceptanceNonce: Uint8Array;
+  /** The terminal RouteAcceptance's expiry (unix seconds). */
+  acceptanceExpiry: number;
+  /** The terminal RouteAcceptance's Ed25519 signature. */
+  acceptanceSignature: Uint8Array;
+  /** The list of hop NodeIds in the route (so the gateway can verify hopIndex is terminal). */
+  hopNodeIds: string[];
 }
 
 /** CBOR map keys for GatewayReturnAuthorization (per ADR-0004). */
@@ -1171,6 +1215,14 @@ const GA_KEY_ACK_NONCE = 8;
 const GA_KEY_ACK_TIMESTAMP = 9;
 const GA_KEY_ACK_EXPIRY = 10;
 const GA_KEY_RELAY_SIGNATURE = 11;
+const GA_KEY_TERMINAL_NODE_ID = 12;
+const GA_KEY_ACCEPTANCE_PROPOSAL_DIGEST = 13;
+const GA_KEY_ACCEPTANCE_HOP_DIGEST = 14;
+const GA_KEY_ACCEPTANCE_SERVICE_DIGEST = 15;
+const GA_KEY_ACCEPTANCE_NONCE = 16;
+const GA_KEY_ACCEPTANCE_EXPIRY = 17;
+const GA_KEY_ACCEPTANCE_SIGNATURE = 18;
+const GA_KEY_HOP_NODE_IDS = 19;
 
 /**
  * Construct a GatewayReturnAuthorization from a GatewayReturnTemplate + the
@@ -1188,6 +1240,8 @@ export function constructGatewayReturnAuthorization(
   gatewayTemplate: GatewayReturnTemplate,
   terminalAck: CircuitSetupAck,
   relayEd25519PublicKey: Uint8Array,
+  terminalAcceptance: RouteAcceptance,
+  hopNodeIds: string[],
 ): GatewayReturnAuthorization {
   return {
     gatewayTemplateBytes: encodeGatewayReturnTemplate(gatewayTemplate),
@@ -1201,6 +1255,14 @@ export function constructGatewayReturnAuthorization(
     ackTimestamp: terminalAck.ackTimestamp,
     ackExpiry: terminalAck.ackExpiry,
     relaySignature: terminalAck.relaySignature,
+    terminalNodeId: terminalAcceptance.acceptorNodeId,
+    acceptanceProposalDigestHex: terminalAcceptance.proposalDigestHex,
+    acceptanceHopDigestHex: terminalAcceptance.hopDigestHex,
+    acceptanceServiceDigestHex: terminalAcceptance.serviceDigestHex,
+    acceptanceNonce: terminalAcceptance.acceptanceNonce,
+    acceptanceExpiry: terminalAcceptance.expiry,
+    acceptanceSignature: terminalAcceptance.signature,
+    hopNodeIds,
   };
 }
 
@@ -1220,6 +1282,14 @@ export function encodeGatewayReturnAuthorization(ga: GatewayReturnAuthorization)
     [GA_KEY_ACK_TIMESTAMP, ga.ackTimestamp],
     [GA_KEY_ACK_EXPIRY, ga.ackExpiry],
     [GA_KEY_RELAY_SIGNATURE, ga.relaySignature],
+    [GA_KEY_TERMINAL_NODE_ID, ga.terminalNodeId],
+    [GA_KEY_ACCEPTANCE_PROPOSAL_DIGEST, ga.acceptanceProposalDigestHex],
+    [GA_KEY_ACCEPTANCE_HOP_DIGEST, ga.acceptanceHopDigestHex],
+    [GA_KEY_ACCEPTANCE_SERVICE_DIGEST, ga.acceptanceServiceDigestHex],
+    [GA_KEY_ACCEPTANCE_NONCE, ga.acceptanceNonce],
+    [GA_KEY_ACCEPTANCE_EXPIRY, ga.acceptanceExpiry],
+    [GA_KEY_ACCEPTANCE_SIGNATURE, ga.acceptanceSignature],
+    [GA_KEY_HOP_NODE_IDS, ga.hopNodeIds],
   ]);
   return canonicalEncode(m);
 }
@@ -1250,6 +1320,14 @@ export function decodeGatewayReturnAuthorization(bytes: Uint8Array): { ok: true;
   const ackTimestamp = m.get(GA_KEY_ACK_TIMESTAMP);
   const ackExpiry = m.get(GA_KEY_ACK_EXPIRY);
   const relaySignature = m.get(GA_KEY_RELAY_SIGNATURE);
+  const terminalNodeId = m.get(GA_KEY_TERMINAL_NODE_ID);
+  const acceptanceProposalDigestHex = m.get(GA_KEY_ACCEPTANCE_PROPOSAL_DIGEST);
+  const acceptanceHopDigestHex = m.get(GA_KEY_ACCEPTANCE_HOP_DIGEST);
+  const acceptanceServiceDigestHex = m.get(GA_KEY_ACCEPTANCE_SERVICE_DIGEST);
+  const acceptanceNonce = m.get(GA_KEY_ACCEPTANCE_NONCE);
+  const acceptanceExpiry = m.get(GA_KEY_ACCEPTANCE_EXPIRY);
+  const acceptanceSignature = m.get(GA_KEY_ACCEPTANCE_SIGNATURE);
+  const hopNodeIds = m.get(GA_KEY_HOP_NODE_IDS);
 
   if (!(templateBytes instanceof Uint8Array) || templateBytes.length < 10) {
     return { ok: false, reason: "gatewayTemplateBytes must be a bstr" };
@@ -1284,6 +1362,31 @@ export function decodeGatewayReturnAuthorization(bytes: Uint8Array): { ok: true;
   if (!(relaySignature instanceof Uint8Array) || relaySignature.length !== 64) {
     return { ok: false, reason: "relaySignature must be a 64-byte bstr" };
   }
+  if (typeof terminalNodeId !== "string") {
+    return { ok: false, reason: "terminalNodeId must be a text string" };
+  }
+  if (typeof acceptanceProposalDigestHex !== "string") {
+    return { ok: false, reason: "acceptanceProposalDigestHex must be a text string" };
+  }
+  if (typeof acceptanceHopDigestHex !== "string") {
+    return { ok: false, reason: "acceptanceHopDigestHex must be a text string" };
+  }
+  if (typeof acceptanceServiceDigestHex !== "string") {
+    return { ok: false, reason: "acceptanceServiceDigestHex must be a text string" };
+  }
+  if (!(acceptanceNonce instanceof Uint8Array) || acceptanceNonce.length !== 16) {
+    return { ok: false, reason: "acceptanceNonce must be a 16-byte bstr" };
+  }
+  if (typeof acceptanceExpiry !== "number" || !Number.isInteger(acceptanceExpiry)) {
+    return { ok: false, reason: "acceptanceExpiry must be an integer" };
+  }
+  if (!(acceptanceSignature instanceof Uint8Array) || acceptanceSignature.length !== 64) {
+    return { ok: false, reason: "acceptanceSignature must be a 64-byte bstr" };
+  }
+  if (!Array.isArray(hopNodeIds) || hopNodeIds.length === 0 ||
+      !hopNodeIds.every((id) => typeof id === "string")) {
+    return { ok: false, reason: "hopNodeIds must be a non-empty array of text strings" };
+  }
 
   return {
     ok: true,
@@ -1299,6 +1402,14 @@ export function decodeGatewayReturnAuthorization(bytes: Uint8Array): { ok: true;
       ackTimestamp,
       ackExpiry,
       relaySignature,
+      terminalNodeId,
+      acceptanceProposalDigestHex,
+      acceptanceHopDigestHex,
+      acceptanceServiceDigestHex,
+      acceptanceNonce,
+      acceptanceExpiry,
+      acceptanceSignature,
+      hopNodeIds,
     },
   };
 }
@@ -1322,16 +1433,20 @@ export type VerifyGatewayReturnAuthorizationResult =
  *      relayEd25519PublicKey. This proves the ack was signed by the terminal
  *      relay (not forged). The ack signing payload is reconstructed from
  *      the template's fields + the authorization's fields.
- *   3. Verify the ack's routeId matches the template's routeId (via the
- *      commitmentRoot — the routeId is derived from commitmentRoot).
- *   4. Verify the ack's hopIndex is consistent (the gateway doesn't know the
- *      full route, but the initiator signed the template binding including
- *      gatewayNodeId, which the ack also binds to the terminal hop).
- *   5. Verify the ack's relayX25519PublicKey matches the template's
- *      gatewayX25519PublicKey (the ack's X25519 key is the one K_ret was
- *      encrypted to).
- *   6. Check expiry (the ack's ackExpiry + the template's expiry).
- *   7. Delegate to verifyGatewayReturnTemplate for the standard checks
+ *   2b. Verify the terminal RouteAcceptance's Ed25519 signature using the
+ *      SAME relayEd25519PublicKey. The acceptance is the relay's signed
+ *      agreement to occupy the terminal hop — proving the relay is the
+ *      authorized terminal hop of the committed route. Reconstructed from
+ *      the authorization's acceptance fields + the terminalNodeId (claimed).
+ *   2c. Verify the terminalNodeId IS the actual terminal hop:
+ *      authorization.hopIndex must equal hopNodeIds.length - 1, AND
+ *      hopNodeIds[hopIndex] must equal terminalNodeId. This proves the
+ *      gateway is the genuine terminal hop, not an intermediate relay.
+ *   2d. Verify the gatewayNodeId in the template matches the terminalNodeId
+ *      (the acceptance's acceptorNodeId). This proves the initiator's
+ *      template was bound to the SAME gateway that the acceptance authorized.
+ *   3. Check expiry (the ack's ackExpiry + the template's expiry).
+ *   4. Delegate to verifyGatewayReturnTemplate for the standard checks
  *      (NodeId, X25519 key binding, initiator signature, ECDH decrypt).
  *
  * @param authorization - the GatewayReturnAuthorization wire object
@@ -1374,6 +1489,63 @@ export function verifyGatewayReturnAuthorization(
   );
   if (!verifySignature(authorization.relayEd25519PublicKey, ackPayload, authorization.relaySignature)) {
     return { ok: false, reason: "terminal ack signature invalid (forged or tampered authorization)" };
+  }
+
+  // 2b. Verify the terminal RouteAcceptance's Ed25519 signature.
+  //     Per the re-audit of 8fa4ef3 (R-009 Stage 2 terminal-hop proof): the
+  //     terminal-hop proof must verify the RouteAcceptance signature using the
+  //     same relayEd25519PublicKey (the relay that produced the ack also
+  //     produced the acceptance — they MUST be the same identity key). The
+  //     signing payload is reconstructed from the authorization's fields, with
+  //     the terminalNodeId (claimed by the authorization) bound as the
+  //     acceptorNodeId. If the acceptance was signed by a different Ed25519 key
+  //     (e.g. an attacker forged a fake acceptance), this verification fails.
+  const acceptancePayload = routeAcceptanceSigningPayload(
+    fromHex(authorization.acceptanceProposalDigestHex),
+    authorization.hopIndex,
+    fromHex(authorization.acceptanceHopDigestHex),
+    fromHex(authorization.acceptanceServiceDigestHex),
+    authorization.terminalNodeId,
+    authorization.acceptanceNonce,
+    authorization.acceptanceExpiry,
+  );
+  if (!verifySignature(
+    authorization.relayEd25519PublicKey,
+    acceptancePayload,
+    authorization.acceptanceSignature,
+  )) {
+    return { ok: false, reason: "terminal RouteAcceptance signature invalid" };
+  }
+
+  // 2c. Verify the terminalNodeId is the actual terminal hop.
+  //     The authorization's hopIndex must be the LAST hop (the gateway), AND
+  //     the hopNodeIds at that index must equal the terminalNodeId. This proves
+  //     the gateway is the genuine terminal hop of the committed route — not
+  //     an intermediate relay trying to impersonate the gateway.
+  if (authorization.hopIndex !== authorization.hopNodeIds.length - 1) {
+    return {
+      ok: false,
+      reason: `terminalNodeId is not the terminal hop: hopIndex ${authorization.hopIndex} is not the last index ${authorization.hopNodeIds.length - 1}`,
+    };
+  }
+  if (authorization.hopNodeIds[authorization.hopIndex] !== authorization.terminalNodeId) {
+    return {
+      ok: false,
+      reason: `terminalNodeId is not the terminal hop: hopNodeIds[${authorization.hopIndex}] is "${authorization.hopNodeIds[authorization.hopIndex]}", terminalNodeId is "${authorization.terminalNodeId}"`,
+    };
+  }
+
+  // 2d. Verify the gatewayNodeId in the template matches the terminalNodeId.
+  //     The gateway template is bound to a specific gatewayNodeId (signed by
+  //     the initiator). The terminal acceptance names its acceptorNodeId (the
+  //     relay that agreed to be the terminal hop). These MUST match — otherwise
+  //     the initiator's template could be replayed to a different gateway than
+  //     the one the terminal acceptance authorized.
+  if (gt.gatewayNodeId !== authorization.terminalNodeId) {
+    return {
+      ok: false,
+      reason: `gatewayNodeId does not match the terminal acceptance's acceptorNodeId: template has "${gt.gatewayNodeId}", acceptance has "${authorization.terminalNodeId}"`,
+    };
   }
 
   // 3. Check expiry (both the template + the ack).
