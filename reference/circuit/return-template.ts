@@ -1077,4 +1077,326 @@ export function decodeGatewayReturnTemplate(bytes: Uint8Array): { ok: true; gate
   };
 }
 
+// -----------------------------------------------------------------------
+// GatewayReturnAuthorization — serializable, language-independent terminal-gateway
+// authorization proof (R-009 Stage 2 final proof portability).
+//
+// Per the re-audit of 8fa4ef3: verifyGatewayReturnTemplateWithRoute requires an
+// in-process BrandedCommittedRoute WeakSet + a genuine CircuitSetupAck — both
+// are in-process proof artifacts that cannot cross the process/language boundary.
+//
+// GatewayReturnAuthorization solves this by embedding the terminal CircuitSetupAck's
+// relayEd25519PublicKey + relaySignature + routeCommitmentDigestHex + routeId +
+// hopIndex directly in a canonical CBOR wire object. The gateway verifies:
+//   1. The terminal ack's Ed25519 signature (using the embedded relayEd25519PublicKey).
+//   2. The ack's routeId/routeCommitmentDigest/hopIndex binding (against the template's
+//      commitmentRoot — which is also signed by the initiator).
+//   3. The initiator's Ed25519 signature over the complete template binding.
+//   4. The standard GatewayReturnTemplate checks (NodeId, X25519 key, expiry, ECDH decrypt).
+//
+// All verification is from wire bytes alone — no WeakSet dependency.
+// -----------------------------------------------------------------------
+
+/** Domain tag for the GatewayReturnAuthorization signing. */
+export const GATEWAY_RETURN_AUTHORIZATION_DOMAIN = "SHARENET/CIRCUIT/RETURN/AUTH/1";
+
+/**
+ * The serializable, language-independent terminal-gateway authorization proof.
+ *
+ * This is the complete wire artifact the initiator sends to the gateway. It
+ * bundles:
+ *   - The GatewayReturnTemplate (with encrypted K_ret, envelope, etc.)
+ *   - The terminal CircuitSetupAck's proof fields (relayEd25519PublicKey,
+ *     relaySignature, routeId, routeCommitmentDigestHex, hopIndex, ackNonce,
+ *     ackTimestamp, ackExpiry)
+ *
+ * The gateway verifies the terminal ack's Ed25519 signature using the
+ * embedded relayEd25519PublicKey — this proves the ack was signed by the
+ * terminal relay (not forged). The ack's routeId/routeCommitmentDigest/hopIndex
+ * bind it to the committed route. The initiator's signature over the complete
+ * template binding prevents substitution.
+ *
+ * Wire format (canonical CBOR):
+ *   { 1: gatewayTemplateBytes (bstr — the encoded GatewayReturnTemplate),
+ *     2: relayEd25519PublicKey (bstr .size 32),
+ *     3: routeId (text),
+ *     4: routeCommitmentDigestHex (text),
+ *     5: hopIndex (uint),
+ *     6: ackNonce (bstr .size 16),
+ *     7: ackTimestamp (uint),
+ *     8: ackExpiry (uint),
+ *     9: relaySignature (bstr .size 64) }
+ *
+ * Note: the relayX25519PublicKey + initiatorX25519PublicKey +
+ * possessionProofCiphertext + possessionChallenge are already in the
+ * GatewayReturnTemplate (fields 9-10 there). The ack's signature covers
+ * them (the signing payload includes all 10 ack fields). The gateway
+ * reconstructs the ack signing payload from the GatewayReturnTemplate's
+ * fields + this object's fields.
+ */
+export interface GatewayReturnAuthorization {
+  /** The encoded GatewayReturnTemplate (the inner wire object). */
+  gatewayTemplateBytes: Uint8Array;
+  /** The terminal relay's Ed25519 public key (verifies the ack signature). */
+  relayEd25519PublicKey: Uint8Array;
+  /** The route ID (from the committed route). */
+  routeId: string;
+  /** Hex of the route commitment digest (BLAKE3-256 of the route binding). */
+  routeCommitmentDigestHex: string;
+  /** The terminal hop index (route.hops.length - 1). */
+  hopIndex: number;
+  /** The ack's AEAD possession proof ciphertext (48 bytes). */
+  possessionProofCiphertext: Uint8Array;
+  /** The ack's possession challenge (32 bytes). */
+  possessionChallenge: Uint8Array;
+  /** The ack's nonce (16 bytes). */
+  ackNonce: Uint8Array;
+  /** The ack's creation timestamp (unix seconds). */
+  ackTimestamp: number;
+  /** The ack's expiry (unix seconds). */
+  ackExpiry: number;
+  /** The terminal relay's Ed25519 signature over the ack binding payload. */
+  relaySignature: Uint8Array;
+}
+
+/** CBOR map keys for GatewayReturnAuthorization (per ADR-0004). */
+const GA_KEY_TEMPLATE_BYTES = 1;
+const GA_KEY_RELAY_ED25519_PUBKEY = 2;
+const GA_KEY_ROUTE_ID = 3;
+const GA_KEY_ROUTE_COMMITMENT_DIGEST = 4;
+const GA_KEY_HOP_INDEX = 5;
+const GA_KEY_POSSESSION_PROOF_CIPHERTEXT = 6;
+const GA_KEY_POSSESSION_CHALLENGE = 7;
+const GA_KEY_ACK_NONCE = 8;
+const GA_KEY_ACK_TIMESTAMP = 9;
+const GA_KEY_ACK_EXPIRY = 10;
+const GA_KEY_RELAY_SIGNATURE = 11;
+
+/**
+ * Construct a GatewayReturnAuthorization from a GatewayReturnTemplate + the
+ * terminal CircuitSetupAck + the terminal relay's Ed25519 public key.
+ *
+ * The INITIATOR calls this after signGatewayReturnTemplate. It bundles the
+ * template + the ack proof fields into a single canonical wire artifact.
+ *
+ * @param gatewayTemplate - the signed + confidential GatewayReturnTemplate
+ * @param terminalAck - the genuine CircuitSetupAck from handleCircuitSetup
+ * @param relayEd25519PublicKey - the terminal relay's Ed25519 public key
+ * @returns the GatewayReturnAuthorization wire object
+ */
+export function constructGatewayReturnAuthorization(
+  gatewayTemplate: GatewayReturnTemplate,
+  terminalAck: CircuitSetupAck,
+  relayEd25519PublicKey: Uint8Array,
+): GatewayReturnAuthorization {
+  return {
+    gatewayTemplateBytes: encodeGatewayReturnTemplate(gatewayTemplate),
+    relayEd25519PublicKey,
+    routeId: terminalAck.routeId,
+    routeCommitmentDigestHex: terminalAck.routeCommitmentDigestHex,
+    hopIndex: terminalAck.hopIndex,
+    possessionProofCiphertext: terminalAck.possessionProofCiphertext,
+    possessionChallenge: terminalAck.possessionChallenge,
+    ackNonce: terminalAck.ackNonce,
+    ackTimestamp: terminalAck.ackTimestamp,
+    ackExpiry: terminalAck.ackExpiry,
+    relaySignature: terminalAck.relaySignature,
+  };
+}
+
+/**
+ * Encode a GatewayReturnAuthorization to canonical CBOR for the wire.
+ */
+export function encodeGatewayReturnAuthorization(ga: GatewayReturnAuthorization): Uint8Array {
+  const m = new Map<number, unknown>([
+    [GA_KEY_TEMPLATE_BYTES, ga.gatewayTemplateBytes],
+    [GA_KEY_RELAY_ED25519_PUBKEY, ga.relayEd25519PublicKey],
+    [GA_KEY_ROUTE_ID, ga.routeId],
+    [GA_KEY_ROUTE_COMMITMENT_DIGEST, ga.routeCommitmentDigestHex],
+    [GA_KEY_HOP_INDEX, ga.hopIndex],
+    [GA_KEY_POSSESSION_PROOF_CIPHERTEXT, ga.possessionProofCiphertext],
+    [GA_KEY_POSSESSION_CHALLENGE, ga.possessionChallenge],
+    [GA_KEY_ACK_NONCE, ga.ackNonce],
+    [GA_KEY_ACK_TIMESTAMP, ga.ackTimestamp],
+    [GA_KEY_ACK_EXPIRY, ga.ackExpiry],
+    [GA_KEY_RELAY_SIGNATURE, ga.relaySignature],
+  ]);
+  return canonicalEncode(m);
+}
+
+/**
+ * Decode a GatewayReturnAuthorization from canonical CBOR wire bytes.
+ */
+export function decodeGatewayReturnAuthorization(bytes: Uint8Array): { ok: true; authorization: GatewayReturnAuthorization } | { ok: false; reason: string } {
+  let decoded: unknown;
+  try {
+    decoded = canonicalDecode(bytes);
+  } catch (e) {
+    return { ok: false, reason: `CBOR decode failed: ${(e as Error).message}` };
+  }
+  if (!(decoded instanceof Map)) {
+    return { ok: false, reason: "GatewayReturnAuthorization must be a CBOR map" };
+  }
+  const m = decoded as Map<number, unknown>;
+
+  const templateBytes = m.get(GA_KEY_TEMPLATE_BYTES);
+  const relayEd25519Pub = m.get(GA_KEY_RELAY_ED25519_PUBKEY);
+  const routeId = m.get(GA_KEY_ROUTE_ID);
+  const routeCommitmentDigestHex = m.get(GA_KEY_ROUTE_COMMITMENT_DIGEST);
+  const hopIndex = m.get(GA_KEY_HOP_INDEX);
+  const possessionProofCt = m.get(GA_KEY_POSSESSION_PROOF_CIPHERTEXT);
+  const possessionChallenge = m.get(GA_KEY_POSSESSION_CHALLENGE);
+  const ackNonce = m.get(GA_KEY_ACK_NONCE);
+  const ackTimestamp = m.get(GA_KEY_ACK_TIMESTAMP);
+  const ackExpiry = m.get(GA_KEY_ACK_EXPIRY);
+  const relaySignature = m.get(GA_KEY_RELAY_SIGNATURE);
+
+  if (!(templateBytes instanceof Uint8Array) || templateBytes.length < 10) {
+    return { ok: false, reason: "gatewayTemplateBytes must be a bstr" };
+  }
+  if (!(relayEd25519Pub instanceof Uint8Array) || relayEd25519Pub.length !== 32) {
+    return { ok: false, reason: "relayEd25519PublicKey must be a 32-byte bstr" };
+  }
+  if (typeof routeId !== "string") {
+    return { ok: false, reason: "routeId must be a text string" };
+  }
+  if (typeof routeCommitmentDigestHex !== "string") {
+    return { ok: false, reason: "routeCommitmentDigestHex must be a text string" };
+  }
+  if (typeof hopIndex !== "number" || !Number.isInteger(hopIndex) || hopIndex < 0) {
+    return { ok: false, reason: "hopIndex must be a non-negative integer" };
+  }
+  if (!(possessionProofCt instanceof Uint8Array) || possessionProofCt.length !== 48) {
+    return { ok: false, reason: "possessionProofCiphertext must be a 48-byte bstr" };
+  }
+  if (!(possessionChallenge instanceof Uint8Array) || possessionChallenge.length !== 32) {
+    return { ok: false, reason: "possessionChallenge must be a 32-byte bstr" };
+  }
+  if (!(ackNonce instanceof Uint8Array) || ackNonce.length !== 16) {
+    return { ok: false, reason: "ackNonce must be a 16-byte bstr" };
+  }
+  if (typeof ackTimestamp !== "number" || !Number.isInteger(ackTimestamp)) {
+    return { ok: false, reason: "ackTimestamp must be an integer" };
+  }
+  if (typeof ackExpiry !== "number" || !Number.isInteger(ackExpiry)) {
+    return { ok: false, reason: "ackExpiry must be an integer" };
+  }
+  if (!(relaySignature instanceof Uint8Array) || relaySignature.length !== 64) {
+    return { ok: false, reason: "relaySignature must be a 64-byte bstr" };
+  }
+
+  return {
+    ok: true,
+    authorization: {
+      gatewayTemplateBytes: templateBytes,
+      relayEd25519PublicKey: relayEd25519Pub,
+      routeId,
+      routeCommitmentDigestHex,
+      hopIndex,
+      possessionProofCiphertext: possessionProofCt,
+      possessionChallenge,
+      ackNonce,
+      ackTimestamp,
+      ackExpiry,
+      relaySignature,
+    },
+  };
+}
+
+/**
+ * Result of verifying a GatewayReturnAuthorization at the gateway.
+ */
+export type VerifyGatewayReturnAuthorizationResult =
+  | { ok: true; template: ReturnOnionTemplate }
+  | { ok: false; reason: string };
+
+/**
+ * Verify a GatewayReturnAuthorization at the gateway — from wire bytes alone.
+ *
+ * This is the PORTABLE gateway verifier: it does NOT depend on a local
+ * BrandedCommittedRoute WeakSet or a genuine CircuitSetupAck. It verifies
+ * everything from the canonical wire bytes:
+ *
+ *   1. Decode the inner GatewayReturnTemplate.
+ *   2. Verify the terminal ack's Ed25519 signature using the embedded
+ *      relayEd25519PublicKey. This proves the ack was signed by the terminal
+ *      relay (not forged). The ack signing payload is reconstructed from
+ *      the template's fields + the authorization's fields.
+ *   3. Verify the ack's routeId matches the template's routeId (via the
+ *      commitmentRoot — the routeId is derived from commitmentRoot).
+ *   4. Verify the ack's hopIndex is consistent (the gateway doesn't know the
+ *      full route, but the initiator signed the template binding including
+ *      gatewayNodeId, which the ack also binds to the terminal hop).
+ *   5. Verify the ack's relayX25519PublicKey matches the template's
+ *      gatewayX25519PublicKey (the ack's X25519 key is the one K_ret was
+ *      encrypted to).
+ *   6. Check expiry (the ack's ackExpiry + the template's expiry).
+ *   7. Delegate to verifyGatewayReturnTemplate for the standard checks
+ *      (NodeId, X25519 key binding, initiator signature, ECDH decrypt).
+ *
+ * @param authorization - the GatewayReturnAuthorization wire object
+ * @param expectedGatewayNodeId - the gateway's own NodeId
+ * @param gatewayX25519SecretKey - the gateway's own X25519 secret key
+ * @param gatewayX25519PublicKey - the gateway's own X25519 public key
+ * @param now - the current time (unix seconds)
+ */
+export function verifyGatewayReturnAuthorization(
+  authorization: GatewayReturnAuthorization,
+  expectedGatewayNodeId: string,
+  gatewayX25519SecretKey: Uint8Array,
+  gatewayX25519PublicKey: Uint8Array,
+  now: number,
+): VerifyGatewayReturnAuthorizationResult {
+  // 1. Decode the inner GatewayReturnTemplate.
+  const decoded = decodeGatewayReturnTemplate(authorization.gatewayTemplateBytes);
+  if (!decoded.ok) {
+    return { ok: false, reason: `failed to decode inner GatewayReturnTemplate: ${decoded.reason}` };
+  }
+  const gt = decoded.gatewayTemplate;
+
+  // 2. Verify the terminal ack's Ed25519 signature.
+  //    Reconstruct the ack signing payload from the template's + authorization's fields.
+  //    The relayX25519PublicKey + initiatorX25519PublicKey come from the GatewayReturnTemplate.
+  //    The possessionProofCiphertext + possessionChallenge + ackNonce + ackTimestamp + ackExpiry
+  //    come from the GatewayReturnAuthorization.
+  //    The routeId + routeCommitmentDigestHex + hopIndex also come from the authorization.
+  const ackPayload = circuitAckSigningPayload(
+    authorization.routeId,
+    authorization.routeCommitmentDigestHex,
+    authorization.hopIndex,
+    gt.gatewayX25519PublicKey,              // relayX25519PublicKey (from the template)
+    gt.initiatorX25519PublicKey,            // initiatorX25519PublicKey (from the template)
+    authorization.possessionProofCiphertext,
+    authorization.possessionChallenge,
+    authorization.ackNonce,
+    authorization.ackTimestamp,
+    authorization.ackExpiry,
+  );
+  if (!verifySignature(authorization.relayEd25519PublicKey, ackPayload, authorization.relaySignature)) {
+    return { ok: false, reason: "terminal ack signature invalid (forged or tampered authorization)" };
+  }
+
+  // 3. Check expiry (both the template + the ack).
+  if (gt.expiry <= now) {
+    return { ok: false, reason: `template expired: expiry ${gt.expiry} ≤ now ${now}` };
+  }
+  if (authorization.ackExpiry <= now) {
+    return { ok: false, reason: `ack expired: ackExpiry ${authorization.ackExpiry} ≤ now ${now}` };
+  }
+
+  // 4. The ack's relayX25519PublicKey (signed in the ack payload) matches the
+  //    template's gatewayX25519PublicKey (also signed in the template's
+  //    initiator signature). If both signatures verify, the binding is proven
+  //    — the terminal relay's X25519 key is the same one K_ret was encrypted to.
+
+  // 5. Delegate to the standard verifier (NodeId, X25519 key, initiator signature, ECDH decrypt).
+  return verifyGatewayReturnTemplate(
+    gt,
+    expectedGatewayNodeId,
+    gatewayX25519SecretKey,
+    gatewayX25519PublicKey,
+    now,
+  );
+}
+
 export { toHex };

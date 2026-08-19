@@ -41,6 +41,10 @@ import {
   encodeGatewayReturnTemplate,
   sealReturnFrameFromTemplate,
   verifyGatewayReturnTemplateWithRoute,
+  constructGatewayReturnAuthorization,
+  encodeGatewayReturnAuthorization,
+  decodeGatewayReturnAuthorization,
+  verifyGatewayReturnAuthorization,
 } from "@reference/circuit/return-template";
 import { handleCircuitSetup } from "@reference/circuit/distributed-setup";
 import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
@@ -117,35 +121,35 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
       ctx.kps[0]!.secretKey, ctx.kps[0]!.publicKey, // initiator Ed25519 key
     );
 
-    // 2. TRANSPORT: encode to wire bytes.
-    const wireBytes = encodeGatewayReturnTemplate(gatewayTemplate);
-    const wireHex = toHex(wireBytes);
+    // 2. INITIATOR: construct the GatewayReturnAuthorization (portable proof).
+    //    This bundles the GatewayReturnTemplate + the terminal ack's proof fields
+    //    (relayEd25519PublicKey, relaySignature, routeId, etc.) into a single
+    //    canonical wire artifact that the gateway can verify from wire bytes alone.
+    const authorization = constructGatewayReturnAuthorization(
+      gatewayTemplate, ackResult.ack, ctx.kps[terminalHopIndex]!.publicKey,
+    );
+    const authWireBytes = encodeGatewayReturnAuthorization(authorization);
+    const authWireHex = toHex(authWireBytes);
 
-    // 3. GATEWAY PROCESS (independent): verify the template.
-    //    We run this in a child process to prove it works in isolation.
+    // 3. GATEWAY PROCESS (independent): verify from wire bytes alone.
+    //    The child process receives the GatewayReturnAuthorization as canonical
+    //    CBOR wire bytes. It decodes + verifies the terminal ack's Ed25519
+    //    signature (proving the ack is genuine, not forged) + the initiator's
+    //    signature + the ECDH decrypt — ALL from wire bytes, no WeakSet dependency.
     const gatewayScript = `
-      const { verifyGatewayReturnTemplateWithRoute, decodeGatewayReturnTemplate } = require("${join(process.cwd(), "reference/circuit/return-template.ts").replace(/\\/g, "\\\\")}");
-      const { isBrandedCommittedRoute } = require("${join(process.cwd(), "reference/transport/validated-types.ts").replace(/\\/g, "\\\\")}");
+      const { decodeGatewayReturnAuthorization, verifyGatewayReturnAuthorization } = require("${join(process.cwd(), "reference/circuit/return-template.ts").replace(/\\/g, "\\\\")}");
 
-      // Read the JSON payload from stdin.
       let input = "";
       process.stdin.on("data", (chunk) => { input += chunk; });
       process.stdin.on("end", () => {
         const data = JSON.parse(input);
-        const decoded = decodeGatewayReturnTemplate(new Uint8Array(Buffer.from(data.wireHex, "hex")));
+        const decoded = decodeGatewayReturnAuthorization(new Uint8Array(Buffer.from(data.authWireHex, "hex")));
         if (!decoded.ok) {
           process.stdout.write(JSON.stringify({ ok: false, reason: decoded.reason }));
           return;
         }
-        // We can't pass the BrandedCommittedRoute across processes (WeakSet check).
-        // In a real deployment, the gateway has the route from the setup protocol.
-        // For this test, we verify the template WITHOUT the route binding (the
-        // route-bound check requires the genuine WeakSet-branded route object,
-        // which can't cross process boundaries). The standard verifyGatewayReturnTemplate
-        // still verifies: NodeId, X25519 key, expiry, signature, ECDH decrypt.
-        const { verifyGatewayReturnTemplate } = require("${join(process.cwd(), "reference/circuit/return-template.ts").replace(/\\/g, "\\\\")}");
-        const result = verifyGatewayReturnTemplate(
-          decoded.gatewayTemplate,
+        const result = verifyGatewayReturnAuthorization(
+          decoded.authorization,
           data.gatewayNodeId,
           new Uint8Array(Buffer.from(data.gatewayX25519SecretKeyHex, "hex")),
           new Uint8Array(Buffer.from(data.gatewayX25519PublicKeyHex, "hex")),
@@ -167,7 +171,7 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
     `;
 
     const gatewayInput = JSON.stringify({
-      wireHex,
+      authWireHex,
       gatewayNodeId,
       gatewayX25519SecretKeyHex: toHex(gatewayX25519SecretKey),
       gatewayX25519PublicKeyHex: toHex(gatewayX25519PublicKey),

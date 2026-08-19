@@ -37,6 +37,10 @@ import {
   verifyGatewayReturnTemplateWithRoute,
   encodeGatewayReturnTemplate,
   decodeGatewayReturnTemplate,
+  constructGatewayReturnAuthorization,
+  encodeGatewayReturnAuthorization,
+  decodeGatewayReturnAuthorization,
+  verifyGatewayReturnAuthorization,
 } from "@reference/circuit/return-template";
 import { handleCircuitSetup, type CircuitSetupAck } from "@reference/circuit/distributed-setup";
 import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
@@ -1096,3 +1100,162 @@ describe("R-009 Stage 2: real distributed transport (wire bytes → decode → v
     }
   });
 });
+
+// =====================================================================
+// R-009 Stage 2: GatewayReturnAuthorization — serializable proof portability
+// (per the re-audit of 8fa4ef3: the gateway verifier must work from wire
+//  bytes alone, without an in-process BrandedCommittedRoute WeakSet.)
+// =====================================================================
+
+describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire bytes)", () => {
+  test("construct + encode + decode round-trip", () => {
+    const { circuit, template, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const wireBytes = encodeGatewayReturnAuthorization(auth);
+    const decoded = decodeGatewayReturnAuthorization(wireBytes);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.authorization.routeId).toBe(auth.routeId);
+    expect(decoded.authorization.hopIndex).toBe(auth.hopIndex);
+  });
+
+  test("verify from wire bytes alone → accepts (no WeakSet dependency)", () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const wireBytes = encodeGatewayReturnAuthorization(auth);
+    const decoded = decodeGatewayReturnAuthorization(wireBytes);
+    if (!decoded.ok) return;
+
+    const result = verifyGatewayReturnAuthorization(
+      decoded.authorization,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  test("forged terminal ack (wrong relayEd25519PublicKey) → REJECT", () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck } = setupGatewayEnv();
+    const wrongEd25519Key = randomBytes(32); // not the relay's Ed25519 key
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, wrongEd25519Key);
+    const wireBytes = encodeGatewayReturnAuthorization(auth);
+    const decoded = decodeGatewayReturnAuthorization(wireBytes);
+    if (!decoded.ok) return;
+
+    const result = verifyGatewayReturnAuthorization(
+      decoded.authorization,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("signature invalid");
+  });
+
+  test("tampered relaySignature → REJECT", () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const tamperedSig = new Uint8Array(auth.relaySignature);
+    tamperedSig[0] ^= 0x01;
+    const tamperedAuth = { ...auth, relaySignature: tamperedSig };
+
+    const result = verifyGatewayReturnAuthorization(
+      tamperedAuth,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("signature invalid");
+  });
+
+  test("wrong gateway NodeId → REJECT", () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+
+    const result = verifyGatewayReturnAuthorization(
+      auth,
+      "wrong-gateway-node-id",
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("NodeId mismatch");
+  });
+
+  test("expired template → REJECT", () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+
+    const result = verifyGatewayReturnAuthorization(
+      auth,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      gatewayTemplate.expiry + 1,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("expired");
+  });
+
+  test("wrong gateway X25519 key → REJECT", () => {
+    const { gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey);
+    const wrongSk = randomBytes(32);
+    const wrongPk = x25519.getPublicKey(wrongSk);
+
+    const result = verifyGatewayReturnAuthorization(
+      auth,
+      gatewayNodeId,
+      wrongSk,
+      wrongPk,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("X25519 public key mismatch");
+  });
+});
+
+// Helper for the GatewayReturnAuthorization tests.
+function setupGatewayEnv() {
+  const route = makeRoute(2);
+  const relayKeys = makeRelayX25519Keys(route.branded);
+  const floorStore = new InMemoryCircuitSequenceFloorStore();
+  const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+  const gatewayNodeId = route.branded.hops[1]!.nodeId;
+  const terminalHopIndex = route.branded.hops.length - 1;
+  const initiatorKp = generateNodeKeypair();
+
+  // Generate a genuine terminal ack.
+  const req = {
+    route: route.branded,
+    hopIndex: terminalHopIndex,
+    initiatorX25519PublicKey: circuit.initiatorX25519PublicKey,
+    setupNonce: randomBytes(16),
+  };
+  const ackResult = handleCircuitSetup(req, route.kps[terminalHopIndex]!.secretKey, route.commitmentRoot, NOW);
+  if (!ackResult.ok) throw new Error("terminal ack setup failed");
+  const terminalAck = ackResult.ack;
+  const relayEd25519PublicKey = route.kps[terminalHopIndex]!.publicKey;
+  const gatewayX25519SecretKey = ackResult.state.relayX25519SecretKey;
+  const gatewayX25519PublicKey = ackResult.state.relayX25519PublicKey;
+
+  const template = constructReturnOnionTemplate(circuit);
+  const gatewayTemplate = signGatewayReturnTemplate(
+    template, route.branded.expiry, gatewayNodeId,
+    gatewayX25519PublicKey,
+    circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+    initiatorKp.secretKey, initiatorKp.publicKey,
+  );
+
+  return {
+    route, circuit, template, gatewayTemplate, terminalAck, relayEd25519PublicKey,
+    gatewayX25519Sk: gatewayX25519SecretKey, gatewayX25519Pk: gatewayX25519PublicKey,
+    gatewayNodeId,
+  };
+}
