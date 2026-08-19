@@ -1,0 +1,98 @@
+{
+  "id": "V-CIRCUIT-DESTROY-001",
+  "status": "frozen",
+  "spec": "spec/08-circuits.md §6.5a, ADR-0022",
+  "description": "CircuitDestroy: authenticated circuit teardown wire object. The initiator or gateway signs a destroy message binding (circuitId, commitmentRoot, routeId, destroyerNodeId, destroyerRole, destroyReason, destroyNonce, issuedAt, expiry). Domain: SHARENET/CIRCUIT/DESTROY/1.",
+  "sharedInputs": {
+    "circuitIdHex": "e41914691e4a3886c301568795f37f7e9bb2c7b96a271c0804e55626d07a5c83",
+    "commitmentRootHex": "971320035fea4752f89a8ebd8475fdb2e313b182c9831876d642f707f29051eb",
+    "routeId": "route:971320035fea4752f89a8ebd8475fdb2e313b182c9831876d642f707f29051eb",
+    "expiry": 1786880145,
+    "referenceNow": 1786876545,
+    "initiatorEd25519SecretKeyHex": "1010101010101010101010101010101010101010101010101010101010101010",
+    "initiatorEd25519PubHex": "5c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84",
+    "gatewayEd25519SecretKeyHex": "2020202020202020202020202020202020202020202020202020202020202020",
+    "gatewayEd25519PubHex": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8"
+  },
+  "vectors": [
+    {
+      "name": "sign-destroy",
+      "description": "signCircuitDestroy: initiator signs a destroy message.",
+      "input": {},
+      "expected": {
+        "destroyerNodeId": "initiator-node-id",
+        "destroyerRole": 1,
+        "destroyReason": 1,
+        "routeId": "route:971320035fea4752f89a8ebd8475fdb2e313b182c9831876d642f707f29051eb",
+        "encodedLen": 299
+      }
+    },
+    {
+      "name": "decode-destroy",
+      "description": "decodeCircuitDestroy: decode the canonical CBOR wire bytes.",
+      "input": {
+        "encodedHex": "ab015820e41914691e4a3886c301568795f37f7e9bb2c7b96a271c0804e55626d07a5c83025820971320035fea4752f89a8ebd8475fdb2e313b182c9831876d642f707f29051eb037846726f7574653a393731333230303335666561343735326638396138656264383437356664623265333133623138326339383331383736643634326637303766323930353165620471696e69746961746f722d6e6f64652d69640501060107503d798670dd4ef31ce0159e66b471d90f081a6a819281091a6a81a0910a58205c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de840b58403d1964913b7af9caf8805d993c8bb7921f424d5a837e370a74859aa08db32732314ca12a95c7344b698d1aa954f4a7f1fd99ade5d6826ea382383a35a854c00c"
+      },
+      "expected": {
+        "ok": true
+      }
+    },
+    {
+      "name": "verify-destroy",
+      "description": "verifyCircuitDestroy: verify the signature + routeId + role.",
+      "input": {},
+      "expected": {
+        "ok": true
+      }
+    },
+    {
+      "name": "wrong-signer-rejected",
+      "description": "verifyCircuitDestroy with wrong destroyerNodeId → signature invalid (the signing payload includes destroyerNodeId).",
+      "input": {},
+      "expected": {
+        "ok": false,
+        "reasonContains": "signature invalid"
+      }
+    },
+    {
+      "name": "tampered-reason-rejected",
+      "description": "verifyCircuitDestroy with tampered destroyReason → signature invalid.",
+      "input": {},
+      "expected": {
+        "ok": false,
+        "reasonContains": "signature invalid"
+      }
+    },
+    {
+      "name": "tampered-nonce-rejected",
+      "description": "verifyCircuitDestroy with tampered destroyNonce → signature invalid.",
+      "input": {},
+      "expected": {
+        "ok": false,
+        "reasonContains": "signature invalid"
+      }
+    },
+    {
+      "name": "invalid-role-rejected",
+      "description": "verifyCircuitDestroy with invalid destroyerRole (0x03) → REJECT.",
+      "input": {},
+      "expected": {
+        "ok": false,
+        "reasonContains": "invalid destroyerRole"
+      }
+    },
+    {
+      "name": "wrong-routeId-rejected",
+      "description": "verifyCircuitDestroy with wrong routeId → REJECT.",
+      "input": {},
+      "expected": {
+        "ok": false,
+        "reasonContains": "routeId mismatch"
+      }
+    }
+  ],
+  "verification": {
+    "runner": "ts-vector-runner.ts:verifyCircuitDestroyVector + py_vector_verifier.py:verify_circuit_destroy_vector",
+    "notes": "Fixed seeds for reproducibility. The CircuitDestroy wire object carries circuitId, commitmentRoot, destroyerNodeId, destroyerRole, destroyReason, destroyNonce, issuedAt, expiry, destroyerEd25519PublicKey, signature. Domain: SHARENET/CIRCUIT/DESTROY/1."
+  }
+}

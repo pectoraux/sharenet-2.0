@@ -418,6 +418,9 @@ def verify_vector(data: dict) -> dict:
     elif vid.startswith("V-CIRCUIT-GATEWAY-TEMPLATE-"):
         return verify_circuit_gateway_template_vector(data)
 
+    elif vid.startswith("V-CIRCUIT-DESTROY-"):
+        return verify_circuit_destroy_vector(data)
+
     elif vid.startswith("V-CIRCUIT-"):
         return verify_circuit_vector(data)
 
@@ -3599,6 +3602,544 @@ def verify_circuit_gateway_template_vector(data: dict) -> dict:
         "passed": passed,
         "expected": f"{len(vectors)} gateway-template cases match",
         "actual": f"{len(vectors)} gateway-template cases match" if passed
+                  else f"FAILED: {'; '.join(failures)}",
+    }
+
+
+# -----------------------------------------------------------------------
+# CircuitDestroy (added for R-009 Stage 3 —
+# V-CIRCUIT-DESTROY-001)
+#
+# INDEPENDENT implementation of the authenticated circuit teardown wire
+# object. The CircuitDestroy is the authenticated teardown message: an
+# authorized originator (the initiator OR the gateway) signs a destroy
+# message binding (circuitId, commitmentRoot, routeId, destroyerNodeId,
+# destroyerRole, destroyReason, destroyNonce, issuedAt, expiry) with its
+# Ed25519 key. Anyone with the destroyerEd25519PublicKey can verify the
+# signature — no WeakSet or in-process proof required.
+#
+# Per spec/08 §6.5a + ADR-0022 + reference/circuit/destroy.ts:
+#   - Domain: SHARENET/CIRCUIT/DESTROY/1
+#   - Signing payload = domain || canonicalCBOR(map{1..9})
+#   - Wire object = canonicalCBOR(map{1..11})  -- 10 = pubkey, 11 = signature
+#
+# CBOR integer keys (ADR-0004) — see CD_KEY_* below.
+# -----------------------------------------------------------------------
+
+CIRCUIT_DESTROY_DOMAIN = b"SHARENET/CIRCUIT/DESTROY/1"
+
+# Destroy originator roles (only INITIATOR or GATEWAY may originate a
+# destroy; relays may propagate but not originate).
+DESTROYER_ROLE_INITIATOR = 0x01
+DESTROYER_ROLE_GATEWAY = 0x02
+
+# Destroy reason codes (enumerated, see spec/08 §6.5a).
+DESTROY_REASON_OPERATOR_INITIATED = 0x01
+DESTROY_REASON_CIRCUIT_EXPIRED = 0x02
+DESTROY_REASON_LINK_FAILURE = 0x03
+DESTROY_REASON_GATEWAY_DISAPPEARANCE = 0x04
+DESTROY_REASON_PROTOCOL_VIOLATION = 0x05
+
+# CBOR integer keys for CircuitDestroy (matches TS reference CD_KEY_ *
+# constants in reference/circuit/destroy.ts:88-98). The wire object is
+# an 11-field canonical CBOR map per ADR-0004.
+CD_KEY_CIRCUIT_ID = 1
+CD_KEY_COMMITMENT_ROOT = 2
+CD_KEY_ROUTE_ID = 3
+CD_KEY_DESTROYER_NODE_ID = 4
+CD_KEY_DESTROYER_ROLE = 5
+CD_KEY_DESTROY_REASON = 6
+CD_KEY_DESTROY_NONCE = 7
+CD_KEY_ISSUED_AT = 8
+CD_KEY_EXPIRY = 9
+CD_KEY_DESTROYER_ED25519_PUBKEY = 10
+CD_KEY_SIGNATURE = 11
+
+
+def circuit_destroy_signing_payload(
+        circuit_id: bytes, commitment_root: bytes, route_id: str,
+        destroyer_node_id: str, destroyer_role: int, destroy_reason: int,
+        destroy_nonce: bytes, issued_at: int, expiry: int) -> bytes:
+    """Compute the signing payload for a CircuitDestroy.
+
+    Mirrors reference/circuit/destroy.ts:circuitDestroySigningPayload.
+
+    Payload = "SHARENET/CIRCUIT/DESTROY/1"
+              || canonicalCBOR(map{
+                  1: circuitId (32-byte bstr),
+                  2: commitmentRoot (32-byte bstr),
+                  3: routeId (tstr),
+                  4: destroyerNodeId (tstr),
+                  5: destroyerRole (uint — 0x01 or 0x02),
+                  6: destroyReason (uint — reason code),
+                  7: destroyNonce (16-byte bstr),
+                  8: issuedAt (uint — unix seconds),
+                  9: expiry (uint — circuit expiry),
+              })
+
+    The payload binds the destroyer identity (destroyerNodeId +
+    destroyerRole), the destroy reason, the replay nonce, and the
+    circuit lifetime — so any tampering with these fields invalidates
+    the signature. The signature is verified by anyone who has the
+    destroyerEd25519PublicKey (the pubkey is carried in the wire object).
+    """
+    if not isinstance(destroyer_role, int) or isinstance(destroyer_role, bool):
+        raise ValueError(f"destroyerRole must be an integer, got {destroyer_role!r}")
+    if not isinstance(destroy_reason, int) or isinstance(destroy_reason, bool):
+        raise ValueError(f"destroyReason must be an integer, got {destroy_reason!r}")
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+        raise ValueError(f"issuedAt must be an integer, got {issued_at!r}")
+    if not isinstance(expiry, int) or isinstance(expiry, bool):
+        raise ValueError(f"expiry must be an integer, got {expiry!r}")
+    if not isinstance(route_id, str):
+        raise ValueError("routeId must be a text string")
+    if not isinstance(destroyer_node_id, str):
+        raise ValueError("destroyerNodeId must be a text string")
+    m = {
+        CD_KEY_CIRCUIT_ID: bytes(circuit_id),
+        CD_KEY_COMMITMENT_ROOT: bytes(commitment_root),
+        CD_KEY_ROUTE_ID: route_id,
+        CD_KEY_DESTROYER_NODE_ID: destroyer_node_id,
+        CD_KEY_DESTROYER_ROLE: destroyer_role,
+        CD_KEY_DESTROY_REASON: destroy_reason,
+        CD_KEY_DESTROY_NONCE: bytes(destroy_nonce),
+        CD_KEY_ISSUED_AT: issued_at,
+        CD_KEY_EXPIRY: expiry,
+    }
+    body = canonical_cbor_encode(m)
+    return CIRCUIT_DESTROY_DOMAIN + body
+
+
+def sign_circuit_destroy(
+        circuit_id: bytes, commitment_root: bytes,
+        destroyer_node_id: str, destroyer_role: int, destroy_reason: int,
+        issued_at: int, expiry: int,
+        destroyer_ed25519_secret_key: bytes,
+        destroyer_ed25519_public_key: bytes) -> dict:
+    """Construct a signed CircuitDestroy wire object (destroyer-side).
+
+    Mirrors reference/circuit/destroy.ts:signCircuitDestroy.
+
+    Steps:
+      1. Derive the routeId from the commitmentRoot:
+         "route:" + hex(commitmentRoot).
+      2. Generate a fresh 16-byte destroyNonce (os.urandom).
+      3. Construct the 9-field signing payload + sign with the destroyer's
+         Ed25519 secret key via nacl.signing.SigningKey.sign(payload).
+      4. Return the 11-field wire dict (the 9 signing fields + the
+         destroyerEd25519PublicKey + the signature).
+
+    The destroyNonce is fresh per signing call (16 random bytes), so the
+    signature + encoded wire bytes differ each run — verifiers assert
+    LENGTHS (not exact bytes) for the encoded wire, matching the TS
+    runner's behavior at ts-vector-runner.ts:1638-1643.
+    """
+    route_id = "route:" + bytes(commitment_root).hex()
+    destroy_nonce = os.urandom(16)
+    payload = circuit_destroy_signing_payload(
+        circuit_id, commitment_root, route_id,
+        destroyer_node_id, destroyer_role, destroy_reason,
+        destroy_nonce, issued_at, expiry)
+    signing_key = SigningKey(bytes(destroyer_ed25519_secret_key))
+    signature = signing_key.sign(payload).signature
+    return {
+        "circuitId": bytes(circuit_id),
+        "commitmentRoot": bytes(commitment_root),
+        "routeId": route_id,
+        "destroyerNodeId": destroyer_node_id,
+        "destroyerRole": destroyer_role,
+        "destroyReason": destroy_reason,
+        "destroyNonce": destroy_nonce,
+        "issuedAt": issued_at,
+        "expiry": expiry,
+        "destroyerEd25519PublicKey": bytes(destroyer_ed25519_public_key),
+        "signature": bytes(signature),
+    }
+
+
+def verify_circuit_destroy(destroy: dict) -> dict:
+    """Verify a CircuitDestroy wire object — from the wire dict alone.
+
+    Mirrors reference/circuit/destroy.ts:verifyCircuitDestroy.
+
+    This is the PORTABLE verifier. It verifies:
+      1. The destroyerRole is valid (0x01 INITIATOR or 0x02 GATEWAY).
+      2. The routeId derivation: routeId == "route:" + hex(commitmentRoot).
+      3. The Ed25519 signature over the 9-field binding payload
+         (authenticates the destroyer + binds every wire field).
+
+    Authorization checks (is the destroyer the actual initiator/gateway
+    of THIS circuit?) are performed separately by the caller using the
+    circuit context (portable proof chain for gateway, initiatorNodeId
+    match for initiator).
+
+    Returns {"ok": True, "circuitDestroy": destroy} on success, or
+    {"ok": False, "reason": str} on failure.
+    """
+    # 1. Verify destroyerRole is valid (0x01 INITIATOR or 0x02 GATEWAY).
+    role = destroy.get("destroyerRole")
+    if role != DESTROYER_ROLE_INITIATOR and role != DESTROYER_ROLE_GATEWAY:
+        return {"ok": False,
+                "reason": f"invalid destroyerRole: {role}"}
+
+    # 2. Verify routeId derivation.
+    commitment_root = destroy.get("commitmentRoot")
+    if not isinstance(commitment_root, (bytes, bytearray)):
+        return {"ok": False,
+                "reason": f"routeId mismatch: expected \"route:\" + "
+                          f"hex(commitmentRoot), got non-bytes commitmentRoot"}
+    expected_route_id = "route:" + bytes(commitment_root).hex()
+    actual_route_id = destroy.get("routeId")
+    if actual_route_id != expected_route_id:
+        return {"ok": False,
+                "reason": f"routeId mismatch: expected \"{expected_route_id}\","
+                          f" got \"{actual_route_id}\""}
+
+    # 3. Verify the Ed25519 signature over the 9-field binding payload.
+    payload = circuit_destroy_signing_payload(
+        destroy["circuitId"],
+        destroy["commitmentRoot"],
+        destroy["routeId"],
+        destroy["destroyerNodeId"],
+        destroy["destroyerRole"],
+        destroy["destroyReason"],
+        destroy["destroyNonce"],
+        destroy["issuedAt"],
+        destroy["expiry"],
+    )
+    pub = destroy["destroyerEd25519PublicKey"]
+    sig = destroy["signature"]
+    try:
+        verify_key = VerifyKey(bytes(pub))
+        verify_key.verify(payload, bytes(sig))
+    except BadSignatureError:
+        return {"ok": False,
+                "reason": "destroyer signature invalid "
+                          "(forged or tampered destroy)"}
+    except Exception as e:
+        return {"ok": False,
+                "reason": f"destroyer signature invalid: {e}"}
+
+    return {"ok": True, "circuitDestroy": destroy}
+
+
+def encode_circuit_destroy(cd: dict) -> bytes:
+    """Encode a CircuitDestroy to canonical CBOR (11-field map).
+
+    Mirrors reference/circuit/destroy.ts:encodeCircuitDestroy.
+    """
+    m = {
+        CD_KEY_CIRCUIT_ID: bytes(cd["circuitId"]),
+        CD_KEY_COMMITMENT_ROOT: bytes(cd["commitmentRoot"]),
+        CD_KEY_ROUTE_ID: cd["routeId"],
+        CD_KEY_DESTROYER_NODE_ID: cd["destroyerNodeId"],
+        CD_KEY_DESTROYER_ROLE: cd["destroyerRole"],
+        CD_KEY_DESTROY_REASON: cd["destroyReason"],
+        CD_KEY_DESTROY_NONCE: bytes(cd["destroyNonce"]),
+        CD_KEY_ISSUED_AT: cd["issuedAt"],
+        CD_KEY_EXPIRY: cd["expiry"],
+        CD_KEY_DESTROYER_ED25519_PUBKEY: bytes(cd["destroyerEd25519PublicKey"]),
+        CD_KEY_SIGNATURE: bytes(cd["signature"]),
+    }
+    return canonical_cbor_encode(m)
+
+
+def decode_circuit_destroy(data: bytes) -> dict:
+    """Decode a CircuitDestroy from canonical CBOR wire bytes.
+
+    Mirrors reference/circuit/destroy.ts:decodeCircuitDestroy.
+
+    Validates all field types + sizes. Returns
+    {"ok": True, "circuitDestroy": {...}} on success, or
+    {"ok": False, "reason": str} on any malformed wire object.
+    """
+    try:
+        decoded = canonical_cbor_decode(data)
+    except Exception as e:
+        return {"ok": False, "reason": f"CBOR decode failed: {e}"}
+
+    if not isinstance(decoded, dict):
+        return {"ok": False,
+                "reason": "CircuitDestroy must be a CBOR map"}
+
+    def get_bstr(key, name, length=None):
+        v = decoded.get(key)
+        if not isinstance(v, (bytes, bytearray)):
+            return None, f"{name} must be a bstr"
+        v = bytes(v)
+        if length is not None and len(v) != length:
+            return None, f"{name} must be a {length}-byte bstr"
+        return v, None
+
+    circuit_id, err = get_bstr(CD_KEY_CIRCUIT_ID, "circuitId", length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+    commitment_root, err = get_bstr(CD_KEY_COMMITMENT_ROOT, "commitmentRoot",
+                                    length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+
+    route_id = decoded.get(CD_KEY_ROUTE_ID)
+    if not isinstance(route_id, str):
+        return {"ok": False, "reason": "routeId must be a text string"}
+
+    destroyer_node_id = decoded.get(CD_KEY_DESTROYER_NODE_ID)
+    if not isinstance(destroyer_node_id, str):
+        return {"ok": False, "reason": "destroyerNodeId must be a text string"}
+
+    destroyer_role = decoded.get(CD_KEY_DESTROYER_ROLE)
+    if not isinstance(destroyer_role, int) or isinstance(destroyer_role, bool):
+        return {"ok": False, "reason": "destroyerRole must be an integer"}
+
+    destroy_reason = decoded.get(CD_KEY_DESTROY_REASON)
+    if not isinstance(destroy_reason, int) or isinstance(destroy_reason, bool):
+        return {"ok": False, "reason": "destroyReason must be an integer"}
+
+    destroy_nonce, err = get_bstr(CD_KEY_DESTROY_NONCE, "destroyNonce",
+                                 length=16)
+    if err is not None:
+        return {"ok": False, "reason": err}
+
+    issued_at = decoded.get(CD_KEY_ISSUED_AT)
+    if not isinstance(issued_at, int) or isinstance(issued_at, bool):
+        return {"ok": False, "reason": "issuedAt must be an integer"}
+
+    expiry = decoded.get(CD_KEY_EXPIRY)
+    if not isinstance(expiry, int) or isinstance(expiry, bool):
+        return {"ok": False, "reason": "expiry must be an integer"}
+
+    destroyer_pub, err = get_bstr(CD_KEY_DESTROYER_ED25519_PUBKEY,
+                                 "destroyerEd25519PublicKey", length=32)
+    if err is not None:
+        return {"ok": False, "reason": err}
+
+    signature, err = get_bstr(CD_KEY_SIGNATURE, "signature", length=64)
+    if err is not None:
+        return {"ok": False, "reason": err}
+
+    return {
+        "ok": True,
+        "circuitDestroy": {
+            "circuitId": circuit_id,
+            "commitmentRoot": commitment_root,
+            "routeId": route_id,
+            "destroyerNodeId": destroyer_node_id,
+            "destroyerRole": destroyer_role,
+            "destroyReason": destroy_reason,
+            "destroyNonce": destroy_nonce,
+            "issuedAt": issued_at,
+            "expiry": expiry,
+            "destroyerEd25519PublicKey": destroyer_pub,
+            "signature": signature,
+        },
+    }
+
+
+def verify_circuit_destroy_vector(data: dict) -> dict:
+    """Verify a V-CIRCUIT-DESTROY-* vector (CircuitDestroy wire object).
+
+    Handles the 8 cases defined in V-CIRCUIT-DESTROY-001
+    (R-009 Stage 3 — authenticated circuit teardown):
+      1. sign-destroy                    — initiator signs a destroy message.
+      2. decode-destroy                  — decode the canonical CBOR wire bytes.
+      3. verify-destroy                 — verify the signature + routeId + role.
+      4. wrong-signer-rejected          — wrong destroyerNodeId → signature
+                                          invalid (payload includes
+                                          destroyerNodeId).
+      5. tampered-reason-rejected       — wrong destroyReason → signature
+                                          invalid.
+      6. tampered-nonce-rejected        — wrong destroyNonce → signature
+                                          invalid.
+      7. invalid-role-rejected          — destroyerRole = 0x03 → REJECT
+                                          (role check fails FIRST).
+      8. wrong-routeId-rejected         — wrong routeId → REJECT (routeId
+                                          check fails FIRST).
+
+    The implementation is INDEPENDENT of the TS runner — it reproduces
+    every byte from spec/08 §6.5a + ADR-0022 using only the FROZEN
+    R-008/R-009 crypto substrate (Ed25519 via nacl.signing, canonical
+    CBOR via cbor2). The verifier mirrors the TS runner's verify order:
+    role check → routeId derivation check → Ed25519 signature check.
+    """
+    vid = data.get("id", "unknown")
+    vectors = data.get("vectors", [])
+    shared = data.get("sharedInputs", {}) or {}
+
+    circuit_id = bytes.fromhex(shared["circuitIdHex"])
+    commitment_root = bytes.fromhex(shared["commitmentRootHex"])
+    expiry = shared["expiry"]
+    now = shared["referenceNow"]
+    init_ed25519_sk = bytes.fromhex(shared["initiatorEd25519SecretKeyHex"])
+    init_ed25519_pk = bytes.fromhex(shared["initiatorEd25519PubHex"])
+
+    # Construct + sign the destroy once (shared across cases). The
+    # destroyNonce is freshly random per sign call (16 bytes), so the
+    # signature + encoded wire bytes differ each run. The `sign-destroy`
+    # case asserts the deterministic identity fields + the encoded LENGTH
+    # (not exact bytes) — matching the TS runner's behavior at
+    # ts-vector-runner.ts:1638-1643.
+    destroy = sign_circuit_destroy(
+        circuit_id, commitment_root,
+        "initiator-node-id",
+        DESTROYER_ROLE_INITIATOR,
+        DESTROY_REASON_OPERATOR_INITIATED,
+        now, expiry,
+        init_ed25519_sk, init_ed25519_pk,
+    )
+    encoded = encode_circuit_destroy(destroy)
+
+    failures = []
+    for v in vectors:
+        try:
+            name = v["name"]
+            inp = v.get("input", {}) or {}
+            expected = v.get("expected", {}) or {}
+            case_ok = True
+
+            if name == "sign-destroy":
+                # Assert the deterministic identity fields + encoded LENGTH
+                # (the destroyNonce is random per sign call, so the
+                # signature + encoded bytes differ each run).
+                if destroy["destroyerNodeId"] != expected["destroyerNodeId"]:
+                    case_ok = False
+                    failures.append(f"{name}: destroyerNodeId mismatch")
+                if destroy["destroyerRole"] != expected["destroyerRole"]:
+                    case_ok = False
+                    failures.append(f"{name}: destroyerRole mismatch")
+                if destroy["destroyReason"] != expected["destroyReason"]:
+                    case_ok = False
+                    failures.append(f"{name}: destroyReason mismatch")
+                if destroy["routeId"] != expected["routeId"]:
+                    case_ok = False
+                    failures.append(f"{name}: routeId mismatch")
+                if len(encoded) != expected["encodedLen"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: encodedLen {len(encoded)} != "
+                        f"{expected['encodedLen']}")
+
+            elif name == "decode-destroy":
+                wire = bytes.fromhex(inp["encodedHex"])
+                r = decode_circuit_destroy(wire)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                        + (f" ({r.get('reason')})" if not r["ok"] else ""))
+
+            elif name == "verify-destroy":
+                r = verify_circuit_destroy(destroy)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}"
+                        + (f" ({r.get('reason')})" if not r["ok"] else ""))
+
+            elif name == "wrong-signer-rejected":
+                # Replace destroyerNodeId with a wrong value. The signature
+                # was over the ORIGINAL destroyerNodeId, so the signature
+                # check at step 3 fails.
+                tampered = dict(destroy)
+                tampered["destroyerNodeId"] = "wrong-node-id"
+                r = verify_circuit_destroy(tampered)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}")
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'")
+
+            elif name == "tampered-reason-rejected":
+                # Replace destroyReason with 0x99 (out of the enumerated
+                # range). The signature was over the ORIGINAL destroyReason,
+                # so the signature check at step 3 fails.
+                tampered = dict(destroy)
+                tampered["destroyReason"] = 0x99
+                r = verify_circuit_destroy(tampered)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}")
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'")
+
+            elif name == "tampered-nonce-rejected":
+                # Replace destroyNonce with 0xFF × 16. The signature was
+                # over the ORIGINAL destroyNonce, so the signature check
+                # at step 3 fails.
+                tampered = dict(destroy)
+                tampered["destroyNonce"] = bytes([0xFF] * 16)
+                r = verify_circuit_destroy(tampered)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}")
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'")
+
+            elif name == "invalid-role-rejected":
+                # Replace destroyerRole with 0x03 (not in {0x01, 0x02}).
+                # The role check at step 1 fails BEFORE the signature check.
+                tampered = dict(destroy)
+                tampered["destroyerRole"] = 0x03
+                r = verify_circuit_destroy(tampered)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}")
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'")
+
+            elif name == "wrong-routeId-rejected":
+                # Replace routeId with "route:wrong". The routeId
+                # derivation check at step 2 fails BEFORE the signature
+                # check (the routeId is NOT in the signing payload —
+                # routeId is derived from commitmentRoot and verified
+                # separately).
+                tampered = dict(destroy)
+                tampered["routeId"] = "route:wrong"
+                r = verify_circuit_destroy(tampered)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}")
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'")
+
+            else:
+                case_ok = False
+                failures.append(
+                    f"{name}: unknown circuit-destroy case name")
+
+        except Exception as e:
+            failures.append(f"{v.get('name', '?')}: threw {e}")
+
+    passed = len(failures) == 0
+    return {
+        "id": vid,
+        "passed": passed,
+        "expected": f"{len(vectors)} circuit-destroy cases match",
+        "actual": f"{len(vectors)} circuit-destroy cases match" if passed
                   else f"FAILED: {'; '.join(failures)}",
     }
 

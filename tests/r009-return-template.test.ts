@@ -348,13 +348,13 @@ describe("R-009 Stage 2: full distributed integration (production path)", () => 
     const fwdWire = encodeCircuitFrame(fwdSealed);
 
     // Relay 0 processes the forward frame.
-    const fwdR0 = await processCircuitWireFrame(circuit, 0, fwdWire);
+    const fwdR0 = await processCircuitWireFrame(circuit, 0, fwdWire, undefined, NOW);
     expect(fwdR0.ok).toBe(true);
     if (!fwdR0.ok) return;
     expect(fwdR0.terminal).toBe(false); // hop 0 is not terminal for FORWARD
 
     // Gateway (hop 1) processes — terminal for FORWARD, delivers the request.
-    const fwdR1 = await processCircuitWireFrame(circuit, 1, fwdR0.nextWireBytes);
+    const fwdR1 = await processCircuitWireFrame(circuit, 1, fwdR0.nextWireBytes, undefined, NOW);
     expect(fwdR1.ok).toBe(true);
     if (!fwdR1.ok) return;
     expect(fwdR1.terminal).toBe(true); // hop 1 IS terminal for FORWARD
@@ -375,13 +375,13 @@ describe("R-009 Stage 2: full distributed integration (production path)", () => 
     const retWire = encodeCircuitFrame(retFrame);
 
     // Relay 1 (gateway's neighbor) processes the backward frame.
-    const retR1 = await processCircuitWireFrame(circuit, 1, retWire);
+    const retR1 = await processCircuitWireFrame(circuit, 1, retWire, undefined, NOW);
     expect(retR1.ok).toBe(true);
     if (!retR1.ok) return;
     expect(retR1.terminal).toBe(false); // hop 1 is NOT terminal for BACKWARD
 
     // Source (hop 0) processes — terminal for BACKWARD, delivers the response.
-    const retR0 = await processCircuitWireFrame(circuit, 0, retR1.nextWireBytes);
+    const retR0 = await processCircuitWireFrame(circuit, 0, retR1.nextWireBytes, undefined, NOW);
     expect(retR0.ok).toBe(true);
     if (!retR0.ok) return;
     expect(retR0.terminal).toBe(true); // hop 0 IS terminal for BACKWARD
@@ -413,11 +413,11 @@ describe("R-009 Stage 2: full distributed integration (production path)", () => 
     const wire = encodeCircuitFrame(frame);
 
     // First presentation — accepted.
-    const r1 = await processCircuitWireFrame(circuit, 0, wire);
+    const r1 = await processCircuitWireFrame(circuit, 0, wire, undefined, NOW);
     expect(r1.ok).toBe(true);
 
     // Replay through the production path — rejected.
-    const r2 = await processCircuitWireFrame(circuit, 0, wire);
+    const r2 = await processCircuitWireFrame(circuit, 0, wire, undefined, NOW);
     expect(r2.ok).toBe(false);
     if (!r2.ok) expect(r2.reason).toContain("≤ floor");
   });
@@ -439,7 +439,7 @@ describe("R-009 Stage 2: full distributed integration (production path)", () => 
     const wire = new Uint8Array(encodeCircuitFrame(frame));
     wire[wire.length - 1] ^= 0x01; // tamper
 
-    const result = await processCircuitWireFrame(circuit, 0, wire);
+    const result = await processCircuitWireFrame(circuit, 0, wire, undefined, NOW);
     expect(result.ok).toBe(false);
     expect(await floorStore.getFloor(route.commitmentRoot, 0, DIRECTION_BACKWARD)).toBe(0n);
   });
@@ -682,12 +682,12 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     const retWire = encodeCircuitFrame(retFrame);
 
     // 5. Relay 1 processes the backward frame (production path).
-    const r1 = await processCircuitWireFrame(circuit, 1, retWire);
+    const r1 = await processCircuitWireFrame(circuit, 1, retWire, undefined, NOW);
     expect(r1.ok).toBe(true);
     if (!r1.ok) return;
 
     // 6. Source (hop 0) processes — terminal, delivers the response.
-    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes);
+    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes, undefined, NOW);
     expect(r0.ok).toBe(true);
     if (!r0.ok) return;
     expect(new TextDecoder().decode(r0.plaintext)).toBe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
@@ -1056,12 +1056,12 @@ describe("R-009 Stage 2: real distributed transport (wire bytes → decode → v
     const retWire = encodeCircuitFrame(retFrame);
 
     // 6. RELAY 1 (independent): processes the backward frame (production path).
-    const r1 = await processCircuitWireFrame(circuit, 1, retWire);
+    const r1 = await processCircuitWireFrame(circuit, 1, retWire, undefined, NOW);
     expect(r1.ok).toBe(true);
     if (!r1.ok) return;
 
     // 7. SOURCE (independent): processes — terminal, delivers the response.
-    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes);
+    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes, undefined, NOW);
     expect(r0.ok).toBe(true);
     if (!r0.ok) return;
     expect(new TextDecoder().decode(r0.plaintext)).toBe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");

@@ -260,6 +260,13 @@
           "spec_ref": "spec/08-circuits.md \u00a74.8a (authenticated gateway-template transfer)",
           "description": "Authenticated gateway-template transfer wire object (R-009 Stage 2): the initiator signs the ReturnOnionTemplate binding it to (circuitId, commitmentRoot, noncePrefix, kRet, envelope, expiry, gatewayNodeId). The gateway verifies the signature + checks its own NodeId + expiry. Only the intended terminal gateway can accept the template \u2014 a relay that intercepts the transfer cannot use it (wrong NodeId). The signature prevents tampering with K_ret or the envelope. The circuitId/commitmentRoot binding prevents template replay onto a different circuit. Family: V-CIRCUIT-GATEWAY-TEMPLATE.",
           "conformance_vector_family": "V-CIRCUIT-GATEWAY-TEMPLATE"
+        },
+        "CircuitDestroy": {
+          "kind": "wire",
+          "maturity": "reference-implemented",
+          "spec_ref": "spec/08-circuits.md \u00a76.5a",
+          "description": "Authenticated circuit teardown wire object (R-009 Stage 3): the initiator or gateway signs a destroy message binding (circuitId, commitmentRoot, routeId, destroyerNodeId, destroyerRole, destroyReason, destroyNonce, issuedAt, expiry). Each participant verifies the signature + checks durable revocation. Relays cannot originate but can propagate. The destroy is single-use via destroyNonce. Domain: SHARENET/CIRCUIT/DESTROY/1.",
+          "conformance_vector_family": "V-CIRCUIT-DESTROY"
         }
       }
     },

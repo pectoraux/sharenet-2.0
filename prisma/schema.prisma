@@ -387,6 +387,60 @@ model ConsumedGatewayAuthorization {
 }
 
 // ---------------------------------------------------------------------
+// Circuit Revocation (durable terminal-state tombstone — R-009 Stage 3)
+// ---------------------------------------------------------------------
+
+/// Per ADR-0022 (R-009 Stage 3): when a circuit is destroyed or expired,
+/// a durable revocation record is written. Keyed by (circuitId, commitmentRoot)
+/// — the circuit instance identity, NOT the destroy nonce. Survives process
+/// restart. A revoked circuit MUST NOT be resurrected.
+model CircuitRevocation {
+  /// Hex of the 32-byte circuit_id (circuit instance identity).
+  circuitIdHex      String
+  /// Hex of the 32-byte commitment_root (route identity).
+  commitmentRootHex String
+  /// When the revocation was recorded.
+  revokedAt         DateTime @default(now())
+  /// NodeId of the destroyer (the participant who signed the CircuitDestroy).
+  destroyerNodeId   String
+  /// Destroyer role: 0x01 = initiator, 0x02 = gateway.
+  destroyerRole     Int
+  /// Destroy reason code (enumerated per spec/08 §6.5a).
+  destroyReason     Int
+  /// Hex of the 16-byte destroyNonce (evidence, not state identity).
+  destroyNonceHex   String
+
+  /// Unique: one revocation per circuit instance. Prevents conflicting
+  /// or duplicate revocation records.
+  @@unique([circuitIdHex, commitmentRootHex])
+  @@index([commitmentRootHex])
+}
+
+// ---------------------------------------------------------------------
+// Consumed Circuit Destroy (single-use replay protection — R-009 Stage 3)
+// ---------------------------------------------------------------------
+
+/// Per ADR-0022: a CircuitDestroy is single-use. Each participant durably
+/// consumes (commitmentRoot, circuitId, destroyNonce) so a replayed destroy
+/// is rejected. Separate namespace from ConsumedCircuitAck +
+/// ConsumedGatewayAuthorization.
+model ConsumedCircuitDestroy {
+  id                String   @id @default(cuid())
+  /// Hex of the 32-byte commitment_root.
+  commitmentRootHex String
+  /// Hex of the 32-byte circuit_id.
+  circuitIdHex      String
+  /// Hex of the 16-byte destroyNonce.
+  destroyNonceHex   String
+  /// When the destroy was consumed.
+  consumedAt        DateTime @default(now())
+
+  /// Unique: (commitmentRoot, circuitId, destroyNonce) is single-use.
+  @@unique([commitmentRootHex, circuitIdHex, destroyNonceHex])
+  @@index([consumedAt])
+}
+
+// ---------------------------------------------------------------------
 // Gateway Policy (stub — ADR-0011)
 // ---------------------------------------------------------------------
 

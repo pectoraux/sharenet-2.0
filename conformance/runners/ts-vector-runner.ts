@@ -96,6 +96,15 @@ import {
   type GatewayReturnTemplate,
 } from "@reference/circuit/return-template";
 import {
+  signCircuitDestroy,
+  verifyCircuitDestroy,
+  encodeCircuitDestroy,
+  decodeCircuitDestroy,
+  DESTROYER_ROLE_INITIATOR,
+  DESTROY_REASON_OPERATOR_INITIATED,
+  type CircuitDestroy,
+} from "@reference/circuit/destroy";
+import {
   evaluateGatewayRequest,
   defaultGatewayPolicy,
   defaultGatewayCapacity,
@@ -1594,6 +1603,93 @@ function verifyCircuitGatewayTemplateVector(data: any): VectorResult {
   };
 }
 
+// ---------------------------------------------------------------------------
+// V-CIRCUIT-DESTROY-001 — CircuitDestroy (R-009 Stage 3).
+// ---------------------------------------------------------------------------
+
+function verifyCircuitDestroyVector(data: any): VectorResult {
+  const vectors: any[] = data.vectors || [];
+  const shared = data.sharedInputs || {};
+  let allOk = true;
+  const failures: string[] = [];
+
+  const circuitId = hexToBytes(shared.circuitIdHex);
+  const commitmentRoot = hexToBytes(shared.commitmentRootHex);
+  const expiry = shared.expiry;
+  const now = shared.referenceNow;
+  const initEd25519Sk = hexToBytes(shared.initiatorEd25519SecretKeyHex);
+  const initEd25519Pk = hexToBytes(shared.initiatorEd25519PubHex);
+
+  const destroy = signCircuitDestroy(
+    circuitId, commitmentRoot,
+    "initiator-node-id",
+    DESTROYER_ROLE_INITIATOR,
+    DESTROY_REASON_OPERATOR_INITIATED,
+    now, expiry,
+    initEd25519Sk, initEd25519Pk,
+  );
+  const encoded = encodeCircuitDestroy(destroy);
+
+  for (const v of vectors) {
+    try {
+      const expected = v.expected || {};
+      let caseOk = true;
+
+      if (v.name === "sign-destroy") {
+        if (destroy.destroyerNodeId !== expected.destroyerNodeId) { caseOk = false; failures.push(`${v.name}: destroyerNodeId mismatch`); }
+        if (destroy.destroyerRole !== expected.destroyerRole) { caseOk = false; failures.push(`${v.name}: destroyerRole mismatch`); }
+        if (destroy.destroyReason !== expected.destroyReason) { caseOk = false; failures.push(`${v.name}: destroyReason mismatch`); }
+        if (destroy.routeId !== expected.routeId) { caseOk = false; failures.push(`${v.name}: routeId mismatch`); }
+        if (encoded.length !== expected.encodedLen) { caseOk = false; failures.push(`${v.name}: encodedLen ${encoded.length} != ${expected.encodedLen}`); }
+      } else if (v.name === "decode-destroy") {
+        const decoded = decodeCircuitDestroy(hexToBytes(v.input.encodedHex));
+        if (decoded.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${decoded.ok} != ${expected.ok}`); }
+      } else if (v.name === "verify-destroy") {
+        const r = verifyCircuitDestroy(destroy);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+      } else if (v.name === "wrong-signer-rejected") {
+        const tampered: CircuitDestroy = { ...destroy, destroyerNodeId: "wrong-node-id" };
+        const r = verifyCircuitDestroy(tampered);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+        else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
+      } else if (v.name === "tampered-reason-rejected") {
+        const tampered: CircuitDestroy = { ...destroy, destroyReason: 0x99 };
+        const r = verifyCircuitDestroy(tampered);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+        else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
+      } else if (v.name === "tampered-nonce-rejected") {
+        const tampered: CircuitDestroy = { ...destroy, destroyNonce: new Uint8Array(16).fill(0xFF) };
+        const r = verifyCircuitDestroy(tampered);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+        else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
+      } else if (v.name === "invalid-role-rejected") {
+        const tampered: CircuitDestroy = { ...destroy, destroyerRole: 0x03 };
+        const r = verifyCircuitDestroy(tampered);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+        else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
+      } else if (v.name === "wrong-routeId-rejected") {
+        const tampered: CircuitDestroy = { ...destroy, routeId: "route:wrong" };
+        const r = verifyCircuitDestroy(tampered);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+        else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
+      } else {
+        throw new Error(`unknown circuit-destroy case name: ${v.name}`);
+      }
+
+      if (!caseOk) allOk = false;
+    } catch (e) {
+      allOk = false;
+      failures.push(`${v.name}: threw ${(e as Error).message}`);
+    }
+  }
+  return {
+    id: data.id,
+    passed: allOk,
+    expected: `${vectors.length} circuit-destroy cases match`,
+    actual: allOk ? `${vectors.length} circuit-destroy cases match` : `FAILED: ${failures.join("; ")}`,
+  };
+}
+
 function verifyContributionProofVector(data: any): VectorResult {
   const vectors: any[] = data.vectors || [];
   const gatewayPublicKey = hexToBytes(data.sharedKeys.gatewayPublicKeyHex);
@@ -2337,6 +2433,8 @@ for (const file of files) {
     result = verifyCircuitReturnTemplateVector(data);
   } else if (data.id?.startsWith("V-CIRCUIT-GATEWAY-TEMPLATE-")) {
     result = verifyCircuitGatewayTemplateVector(data);
+  } else if (data.id?.startsWith("V-CIRCUIT-DESTROY-")) {
+    result = verifyCircuitDestroyVector(data);
   } else if (data.id?.startsWith("V-CIRCUIT-")) {
     result = verifyCircuitVector(data);
   } else if (data.id?.startsWith("V-GATEWAY-SVC-")) {

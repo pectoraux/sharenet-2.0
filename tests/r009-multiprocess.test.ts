@@ -265,7 +265,10 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
           floorStore: { getFloor: async () => 0n, checkAndAdvance: async () => ({ ok: true }) },
         };
         const wireBytes = new Uint8Array(Buffer.from(data.frameHex, "hex"));
-        processCircuitWireFrame(activeCircuit, data.hopIndex, wireBytes).then((result) => {
+        // R-009 Stage 3: pass 'now' from the parent so the relay's expiry check
+        // uses the test timestamp (NOW = 2026), not the real Date.now() (2025).
+        // 'revocationStore' is undefined — no durable revocation check in this test.
+        processCircuitWireFrame(activeCircuit, data.hopIndex, wireBytes, undefined, data.now).then((result) => {
           if (!result.ok) {
             process.stdout.write(JSON.stringify({ ok: false, reason: result.reason }));
           } else if (result.terminal) {
@@ -308,6 +311,7 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
       circuitJson,
       hopIndex,
       frameHex,
+      now: NOW,
     });
 
     // Relay 1 processes the backward frame.

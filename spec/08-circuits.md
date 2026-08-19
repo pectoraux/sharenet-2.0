@@ -272,6 +272,20 @@ floor. Every hop commits its own floor for both directions.
 
 A circuit carries `valid_until = min(hop.accepted_expiry for hop in
 route)`. Once `now > valid_until`, the circuit MUST be torn down.
+
+Per ADR-0022 (R-009 Stage 3): expiry is NOT merely a local frame
+rejection. It is a **durable terminal-state transition**:
+
+1. The circuit transitions to `CIRCUIT_REVOKED` (§6).
+2. A durable revocation record is written (keyed by `circuitId +
+   commitmentRoot`), with reason `CIRCUIT_EXPIRED`.
+3. Keys are best-effort zeroized.
+4. The replay floor is RETAINED.
+
+After a process restart, the durable revocation record ensures the
+circuit is still known to be dead. A revoked circuit MUST NOT be
+resurrected.
+
 Expiry does NOT lower the sequence floor; a new circuit MUST start
 from a fresh `(eph_priv, eph_pub)` and a new `circuit_nonce_prefix`.
 
@@ -364,19 +378,104 @@ Each hop:
 The source verifies all acks + possession proofs before declaring the
 circuit `ACTIVE`.
 
-## 6. State
+## 6. State Machine (R-009 Stage 3 — amended per ADR-0022)
 
-| State             | Meaning                                                            |
-|-------------------|--------------------------------------------------------------------|
-| `CIRCUIT_PENDING` | Setup messages in flight; not yet all-acks-verified.               |
-| `CIRCUIT_ACTIVE`  | All hops acknowledged; possession proofs verified.                 |
-| `CIRCUIT_EXPIRED` | `now > valid_until`; torn down; keys destroyed.                    |
-| `CIRCUIT_REVOKED` | Operator- or source-initiated teardown; keys destroyed.            |
+### 6.1 States
 
-In `CIRCUIT_EXPIRED` or `CIRCUIT_REVOKED`, all derived keys MUST be
-zeroized from memory. The sequence floor MUST be retained for replay
-protection of any future circuit re-using the same route commitment
-(re-key is permitted; re-key does NOT reset the sequence floor).
+| State               | Meaning                                                            |
+|---------------------|--------------------------------------------------------------------|
+| `CIRCUIT_PENDING`   | Setup messages in flight; not yet all-acks-verified. Not wire-visible. |
+| `CIRCUIT_ACTIVE`    | All hops acknowledged; possession proofs verified.                 |
+| `CIRCUIT_REVOKED`   | Terminal. Keys zeroized (best-effort). Circuit is dead. Durably recorded. |
+
+`CIRCUIT_EXPIRED` is NOT a separate state — it is an **event** that
+transitions the circuit to `CIRCUIT_REVOKED`. Both explicit destroy
+(authenticated wire event) and natural expiry (`now > valid_until`)
+lead to the same terminal state: `CIRCUIT_REVOKED`.
+
+### 6.2 Legal transitions
+
+```
+CIRCUIT_PENDING → CIRCUIT_ACTIVE    (establishDistributedCircuit completes)
+CIRCUIT_ACTIVE  → CIRCUIT_REVOKED    (CircuitDestroy or expiry)
+```
+
+`CIRCUIT_REVOKED` is terminal. No transitions out. No resurrection.
+
+### 6.3 Revocation is durable
+
+When a circuit transitions to `CIRCUIT_REVOKED`:
+1. A durable revocation record is written (keyed by `circuitId +
+   commitmentRoot`).
+2. All derived keys are best-effort zeroized.
+3. The sequence floor is RETAINED (for re-key/recovery protection).
+4. The circuit identity + route identity + destroy evidence are retained.
+
+After a process restart, the durable revocation record ensures the
+circuit is still known to be dead. A revoked circuit MUST NOT be
+resurrected.
+
+### 6.4 Zeroization mandate
+
+In `CIRCUIT_REVOKED`, the following MUST be zeroized (best-effort):
+- `forwardingKey[]`
+- `returnKey[]`
+- `K_ret`
+- `circuit_nonce_prefix`
+- `initiatorX25519SecretKey`
+- Per-relay forwarding state
+
+The sequence floor MUST be retained for replay protection of any future
+circuit re-using the same route commitment (re-key is permitted; re-key
+does NOT reset the sequence floor).
+
+### 6.5 CircuitDestroy wire object (§6a)
+
+### 6.5a CircuitDestroy (R-009 Stage 3)
+
+A `CircuitDestroy` is the authenticated wire object for explicit circuit
+teardown. Per ADR-0022:
+
+```
+CircuitDestroy = {
+    1:  circuitId                  (bstr .size 32)
+    2:  commitmentRoot              (bstr .size 32)
+    3:  routeId                     (text)
+    4:  destroyerNodeId             (text)
+    5:  destroyerRole               (uint — 0x01 = initiator, 0x02 = gateway)
+    6:  destroyReason               (uint — reason code)
+    7:  destroyNonce                (bstr .size 16)
+    8:  issuedAt                    (uint — unix seconds)
+    9:  expiry                      (uint — circuit expiry, for lifetime binding)
+    10: destroyerEd25519PublicKey   (bstr .size 32)
+    11: signature                   (bstr .size 64 — Ed25519)
+}
+```
+
+Domain tag: `SHARENET/CIRCUIT/DESTROY/1`
+
+The signature binds: `domain || circuitId || commitmentRoot || routeId ||
+destroyerNodeId || destroyerRole || destroyReason || destroyNonce ||
+issuedAt || expiry`.
+
+**Authorized destroy originators:**
+- `destroyerRole = 0x01 (INITIATOR)`: the initiator of the circuit.
+- `destroyerRole = 0x02 (GATEWAY)`: the terminal hop (gateway).
+
+Relays (intermediate hops) CANNOT originate a destroy. They MAY
+propagate an authenticated destroy unchanged.
+
+**Reason codes:**
+- `0x01` = `OPERATOR_INITIATED`
+- `0x02` = `CIRCUIT_EXPIRED`
+- `0x03` = `LINK_FAILURE`
+- `0x04` = `GATEWAY_DISAPPEARANCE`
+- `0x05` = `PROTOCOL_VIOLATION`
+
+**Replay protection:** Each participant durably consumes
+`(commitmentRoot, circuitId, destroyNonce)` — a separate namespace from
+setup-ack consumption. A replayed destroy is rejected unless the circuit
+is already revoked (idempotent).
 
 ## 7. Invariants
 

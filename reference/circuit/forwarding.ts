@@ -51,6 +51,7 @@ import {
   type OpenFrameResult,
 } from "./frame";
 import type { ActiveCircuit } from "./circuit";
+import type { CircuitRevocationStore } from "./replay-stores";
 import {
   peelReturnEnvelopeLayer,
   decryptReturnPayload,
@@ -249,7 +250,38 @@ export async function processCircuitWireFrame(
   circuit: ActiveCircuit,
   hopIndex: number,
   wireBytes: Uint8Array,
+  /**
+   * OPTIONAL: durable revocation store. If provided, the production path
+   * checks whether the circuit is revoked BEFORE processing the frame.
+   * Per ADR-0022 (R-009 Stage 3): a revoked circuit MUST NOT process
+   * traffic. If omitted (test-only path), the revocation check is skipped.
+   */
+  revocationStore?: CircuitRevocationStore,
+  /**
+   * OPTIONAL: current time (unix seconds). If provided, the production path
+   * checks circuit expiry. Per ADR-0022: an expired circuit MUST NOT process
+   * traffic. If omitted, uses Math.floor(Date.now() / 1000).
+   */
+  now?: number,
 ): Promise<ProcessCircuitWireFrameResult> {
+  const currentTime = now ?? Math.floor(Date.now() / 1000);
+
+  // Step 0a (R-009 Stage 3): check circuit expiry.
+  // Per ADR-0022: an expired circuit MUST NOT process traffic.
+  // This check happens BEFORE AEAD — a rejected frame never reaches the replay floor.
+  if (circuit.expiry <= currentTime) {
+    return { ok: false, reason: `circuit expired: expiry ${circuit.expiry} ≤ now ${currentTime}` };
+  }
+
+  // Step 0b (R-009 Stage 3): check durable revocation.
+  // Per ADR-0022: a revoked circuit MUST NOT process traffic.
+  if (revocationStore) {
+    const revoked = await revocationStore.isRevoked(circuit.circuitId, circuit.commitmentRoot);
+    if (revoked) {
+      return { ok: false, reason: "circuit revoked: durable revocation record exists" };
+    }
+  }
+
   // Step 1: decode (strict canonical CBOR).
   const decoded = decodeCircuitFrame(wireBytes);
   if (!decoded.ok) {
@@ -258,12 +290,6 @@ export async function processCircuitWireFrame(
   const frame = decoded.frame;
 
   // Step 2 (R-009 Stage 2): both directions accepted.
-  // Stage 1 rejected BACKWARD; Stage 2 lifts that restriction. The return-onion
-  // protocol is now implemented (sealReturnFrame). The receiver-local replay
-  // floor (commitmentRoot, hopIndex, direction) already handles forward +
-  // backward independently (different direction values → different floor rows).
-  // The terminal hop for BACKWARD is hop 0 (the source); for FORWARD it's hop N-1
-  // (the gateway). openFrame computes isTerminal correctly for both directions.
 
   // Step 3 (R-008 frozen ordering): AEAD authenticate + decrypt one layer.
   const forward = forwardFrame(circuit, hopIndex, frame);

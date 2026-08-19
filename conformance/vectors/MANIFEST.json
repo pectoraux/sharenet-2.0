@@ -274,6 +274,13 @@
       "schema_version": "1",
       "expected_result": "GatewayReturnTemplate: sign + verify + decode + wrong-gateway/expired/tampered rejection",
       "file": "V-CIRCUIT-GATEWAY-TEMPLATE-001.json"
+    },
+    {
+      "id": "V-CIRCUIT-DESTROY-001",
+      "protocol": "circuit",
+      "schema_version": "1",
+      "expected_result": "CircuitDestroy: sign + verify + encode + decode + wrong-signer/circuit/role rejection + replay + expired + tampered",
+      "file": "V-CIRCUIT-DESTROY-001.json"
     }
   ]
 }

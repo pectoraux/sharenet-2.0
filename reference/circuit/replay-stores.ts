@@ -405,3 +405,116 @@ export class InMemoryGatewayAuthorizationReplayStore implements GatewayAuthoriza
     return true; // first use
   }
 }
+
+// -----------------------------------------------------------------------
+// CircuitRevocationStore — durable terminal-state tombstone (R-009 Stage 3)
+// -----------------------------------------------------------------------
+
+/**
+ * Durable circuit revocation store.
+ *
+ * Per ADR-0022: when a circuit is destroyed or expired, a durable
+ * revocation record is written. Keyed by (circuitId, commitmentRoot).
+ * Survives process restart.
+ *
+ * Before accepting circuit traffic, the production path checks:
+ *   isRevoked(circuitId, commitmentRoot) → true → REJECT
+ *
+ * A revoked circuit MUST NOT be resurrected after restart.
+ */
+export interface CircuitRevocationStore {
+  /**
+   * Check if a circuit is revoked.
+   * @returns true if the circuit has a durable revocation record.
+   */
+  isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean>;
+
+  /**
+   * Write a durable revocation record.
+   * If the circuit is already revoked, this is idempotent (returns true).
+   * @returns true if the revocation was written (or already existed).
+   *          false if the persistence operation failed (fail-closed).
+   */
+  revoke(
+    circuitId: Uint8Array,
+    commitmentRoot: Uint8Array,
+    destroyerNodeId: string,
+    destroyerRole: number,
+    destroyReason: number,
+    destroyNonce: Uint8Array,
+  ): Promise<boolean>;
+}
+
+/**
+ * In-memory CircuitRevocationStore for tests.
+ */
+export class InMemoryCircuitRevocationStore implements CircuitRevocationStore {
+  private revoked = new Map<string, { destroyerNodeId: string; destroyerRole: number; destroyReason: number; destroyNonce: Uint8Array }>();
+
+  private key(cid: Uint8Array, cr: Uint8Array): string {
+    return `${toHex(cid)}:${toHex(cr)}`;
+  }
+
+  async isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean> {
+    return this.revoked.has(this.key(circuitId, commitmentRoot));
+  }
+
+  async revoke(
+    circuitId: Uint8Array,
+    commitmentRoot: Uint8Array,
+    destroyerNodeId: string,
+    destroyerRole: number,
+    destroyReason: number,
+    destroyNonce: Uint8Array,
+  ): Promise<boolean> {
+    const k = this.key(circuitId, commitmentRoot);
+    if (this.revoked.has(k)) return true; // idempotent
+    this.revoked.set(k, { destroyerNodeId, destroyerRole, destroyReason, destroyNonce });
+    return true;
+  }
+}
+
+// -----------------------------------------------------------------------
+// CircuitDestroyReplayStore — single-use destroy consumption (R-009 Stage 3)
+// -----------------------------------------------------------------------
+
+/**
+ * Durable, single-use consumption for CircuitDestroy messages.
+ *
+ * Per ADR-0022: separate namespace from ConsumedCircuitAck +
+ * ConsumedGatewayAuthorization. Keyed by (commitmentRoot, circuitId,
+ * destroyNonce). Fail-closed on persistence failure.
+ */
+export interface CircuitDestroyReplayStore {
+  /**
+   * Atomically consume a destroy message.
+   * @returns true if first consumption, false if replay or persistence failure.
+   */
+  consume(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    destroyNonce: Uint8Array,
+  ): Promise<boolean>;
+}
+
+/**
+ * In-memory CircuitDestroyReplayStore for tests.
+ */
+export class InMemoryCircuitDestroyReplayStore implements CircuitDestroyReplayStore {
+  private consumed = new Set<string>();
+
+  private key(cr: Uint8Array, cid: Uint8Array, nonce: Uint8Array): string {
+    return `${toHex(cr)}:${toHex(cid)}:${toHex(nonce)}`;
+  }
+
+  async consume(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    destroyNonce: Uint8Array,
+  ): Promise<boolean> {
+    const k = this.key(commitmentRoot, circuitId, destroyNonce);
+    if (this.consumed.has(k)) return false;
+    this.consumed.add(k);
+    return true;
+  }
+}

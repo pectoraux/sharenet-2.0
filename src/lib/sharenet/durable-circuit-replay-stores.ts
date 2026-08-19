@@ -193,3 +193,96 @@ export class DurableSqliteGatewayAuthorizationReplayStore implements GatewayAuth
     }
   }
 }
+
+// -----------------------------------------------------------------------
+// DurableSqliteCircuitRevocationStore (R-009 Stage 3)
+// -----------------------------------------------------------------------
+
+import type {
+  CircuitRevocationStore,
+  CircuitDestroyReplayStore,
+} from "@reference/circuit/replay-stores";
+
+/**
+ * Durable SQLite-backed implementation of CircuitRevocationStore.
+ *
+ * Per ADR-0022: keyed by (circuitIdHex, commitmentRootHex). Survives process
+ * restart. Idempotent: if the circuit is already revoked, revoke() returns true.
+ */
+export class DurableSqliteCircuitRevocationStore implements CircuitRevocationStore {
+  async isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean> {
+    const row = await db.circuitRevocation.findUnique({
+      where: {
+        circuitIdHex_commitmentRootHex: {
+          circuitIdHex: toHex(circuitId),
+          commitmentRootHex: toHex(commitmentRoot),
+        },
+      },
+    });
+    return row !== null;
+  }
+
+  async revoke(
+    circuitId: Uint8Array,
+    commitmentRoot: Uint8Array,
+    destroyerNodeId: string,
+    destroyerRole: number,
+    destroyReason: number,
+    destroyNonce: Uint8Array,
+  ): Promise<boolean> {
+    try {
+      await db.circuitRevocation.upsert({
+        where: {
+          circuitIdHex_commitmentRootHex: {
+            circuitIdHex: toHex(circuitId),
+            commitmentRootHex: toHex(commitmentRoot),
+          },
+        },
+        update: {}, // idempotent — don't overwrite if exists
+        create: {
+          circuitIdHex: toHex(circuitId),
+          commitmentRootHex: toHex(commitmentRoot),
+          destroyerNodeId,
+          destroyerRole,
+          destroyReason,
+          destroyNonceHex: toHex(destroyNonce),
+        },
+      });
+      return true;
+    } catch {
+      return false; // fail-closed
+    }
+  }
+}
+
+// -----------------------------------------------------------------------
+// DurableSqliteCircuitDestroyReplayStore (R-009 Stage 3)
+// -----------------------------------------------------------------------
+
+/**
+ * Durable SQLite-backed implementation of CircuitDestroyReplayStore.
+ *
+ * Per ADR-0022: separate namespace from ConsumedCircuitAck +
+ * ConsumedGatewayAuthorization. Keyed by (commitmentRoot, circuitId,
+ * destroyNonce). Fail-closed on persistence failure.
+ */
+export class DurableSqliteCircuitDestroyReplayStore implements CircuitDestroyReplayStore {
+  async consume(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    destroyNonce: Uint8Array,
+  ): Promise<boolean> {
+    try {
+      await db.consumedCircuitDestroy.create({
+        data: {
+          commitmentRootHex: toHex(commitmentRoot),
+          circuitIdHex: toHex(circuitId),
+          destroyNonceHex: toHex(destroyNonce),
+        },
+      });
+      return true;
+    } catch {
+      return false; // unique constraint — replay or persistence failure
+    }
+  }
+}
