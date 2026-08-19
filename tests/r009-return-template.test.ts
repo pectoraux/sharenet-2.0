@@ -43,7 +43,7 @@ import {
   verifyGatewayReturnAuthorization,
 } from "@reference/circuit/return-template";
 import { handleCircuitSetup, type CircuitSetupAck } from "@reference/circuit/distributed-setup";
-import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
+import { InMemoryCircuitSequenceFloorStore, InMemoryGatewayAuthorizationReplayStore } from "@reference/circuit/replay-stores";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
@@ -1135,24 +1135,25 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
     expect(decoded.authorization.hopNodeIds).toEqual(auth.hopNodeIds);
   });
 
-  test("verify from wire bytes alone → accepts (no WeakSet dependency)", () => {
+  test("verify from wire bytes alone → accepts (no WeakSet dependency)", async () => {
     const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances);
     const wireBytes = encodeGatewayReturnAuthorization(auth);
     const decoded = decodeGatewayReturnAuthorization(wireBytes);
     if (!decoded.ok) return;
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       decoded.authorization,
       gatewayNodeId,
       gatewayX25519Sk,
       gatewayX25519Pk,
       NOW,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(true);
   });
 
-  test("forged terminal ack (wrong relayEd25519PublicKey) → REJECT", () => {
+  test("forged terminal ack (wrong relayEd25519PublicKey) → REJECT", async () => {
     const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     const wrongEd25519Key = randomBytes(32); // not the relay's Ed25519 key
     const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, wrongEd25519Key, terminalAcceptance, hopNodeIds, proposal, acceptances);
@@ -1160,77 +1161,82 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
     const decoded = decodeGatewayReturnAuthorization(wireBytes);
     if (!decoded.ok) return;
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       decoded.authorization,
       gatewayNodeId,
       gatewayX25519Sk,
       gatewayX25519Pk,
       NOW,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("signature invalid");
   });
 
-  test("tampered relaySignature → REJECT", () => {
+  test("tampered relaySignature → REJECT", async () => {
     const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances);
     const tamperedSig = new Uint8Array(auth.relaySignature);
     tamperedSig[0] ^= 0x01;
     const tamperedAuth = { ...auth, relaySignature: tamperedSig };
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       tamperedAuth,
       gatewayNodeId,
       gatewayX25519Sk,
       gatewayX25519Pk,
       NOW,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("signature invalid");
   });
 
-  test("wrong gateway NodeId → REJECT", () => {
+  test("wrong gateway NodeId → REJECT", async () => {
     const { gatewayX25519Sk, gatewayX25519Pk, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances);
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       auth,
       "wrong-gateway-node-id",
       gatewayX25519Sk,
       gatewayX25519Pk,
       NOW,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("NodeId mismatch");
   });
 
-  test("expired template → REJECT", () => {
+  test("expired template → REJECT", async () => {
     const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances);
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       auth,
       gatewayNodeId,
       gatewayX25519Sk,
       gatewayX25519Pk,
       gatewayTemplate.expiry + 1,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("expired");
   });
 
-  test("wrong gateway X25519 key → REJECT", () => {
+  test("wrong gateway X25519 key → REJECT", async () => {
     const { gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances);
     const wrongSk = randomBytes(32);
     const wrongPk = x25519.getPublicKey(wrongSk);
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       auth,
       gatewayNodeId,
       wrongSk,
       wrongPk,
       NOW,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("X25519 public key mismatch");
@@ -1243,7 +1249,7 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
   // (second sub-check: hopNodeIds[hopIndex] === terminalNodeId).
   // -----------------------------------------------------------------
 
-  test("non-terminal relay proof (hopIndex != terminal) → REJECT", () => {
+  test("non-terminal relay proof (hopIndex != terminal) → REJECT", async () => {
     const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances);
     // Attacker tampers hopNodeIds to drop the terminal hop. The acceptance
@@ -1252,18 +1258,19 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
     // the (tampered, truncated) hopNodeIds (length 1 → last index 0).
     const tamperedAuth = { ...auth, hopNodeIds: [hopNodeIds[0]!] };
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       tamperedAuth,
       gatewayNodeId,
       gatewayX25519Sk,
       gatewayX25519Pk,
       NOW,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("terminalNodeId is not the terminal hop");
   });
 
-  test("mismatched relay Ed25519 key (acceptance signed by different key) → REJECT", () => {
+  test("mismatched relay Ed25519 key (acceptance signed by different key) → REJECT", async () => {
     const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     // Attacker uses a DIFFERENT route's terminal acceptance — it was signed
     // by a different relay's Ed25519 secret key. The genuine
@@ -1276,18 +1283,19 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
       proposal, acceptances,
     );
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       auth,
       gatewayNodeId,
       gatewayX25519Sk,
       gatewayX25519Pk,
       NOW,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("RouteAcceptance signature invalid");
   });
 
-  test("hopNodeIds doesn't match (wrong route) → REJECT", () => {
+  test("hopNodeIds doesn't match (wrong route) → REJECT", async () => {
     const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
     const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances);
     // Attacker replaces hopNodeIds with a DIFFERENT route's hopNodeIds.
@@ -1298,15 +1306,146 @@ describe("R-009 Stage 2: GatewayReturnAuthorization (portable proof from wire by
     const otherRoute = makeRoute(2);
     const tamperedAuth = { ...auth, hopNodeIds: otherRoute.hopNodeIds };
 
-    const result = verifyGatewayReturnAuthorization(
+    const result = await verifyGatewayReturnAuthorization(
       tamperedAuth,
       gatewayNodeId,
       gatewayX25519Sk,
       gatewayX25519Pk,
       NOW,
+      new InMemoryGatewayAuthorizationReplayStore(),
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("terminalNodeId is not the terminal hop");
+  });
+
+  // -----------------------------------------------------------------
+  // R-009 Stage 2 — replay-store consumption tests (re-audit of cbdc0cc):
+  // The authorization must be single-use. The first call to verify
+  // consumes the (commitmentRoot, circuitId, ackNonce) tuple; the second
+  // call with the same store must reject. Different circuits / different
+  // ackNonces share the store safely (independent keys).
+  // -----------------------------------------------------------------
+
+  test("authorization replay → second REJECT", async () => {
+    const { gatewayX25519Sk, gatewayX25519Pk, gatewayNodeId, gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances } = setupGatewayEnv();
+    const auth = constructGatewayReturnAuthorization(gatewayTemplate, terminalAck, relayEd25519PublicKey, terminalAcceptance, hopNodeIds, proposal, acceptances);
+    const wireBytes = encodeGatewayReturnAuthorization(auth);
+    const decoded = decodeGatewayReturnAuthorization(wireBytes);
+    if (!decoded.ok) return;
+
+    const replayStore = new InMemoryGatewayAuthorizationReplayStore();
+
+    // First call: fresh authorization → consumed + accepted.
+    const first = await verifyGatewayReturnAuthorization(
+      decoded.authorization,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+      replayStore,
+    );
+    expect(first.ok).toBe(true);
+
+    // Second call: same (commitmentRoot, circuitId, ackNonce) on the
+    // same store → must reject as a replay BEFORE returning the template.
+    const second = await verifyGatewayReturnAuthorization(
+      decoded.authorization,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+      replayStore,
+    );
+    expect(second.ok).toBe(false);
+    if (!second.ok) expect(second.reason).toContain("already consumed");
+  });
+
+  test("different circuitId → independent ACCEPT", async () => {
+    // Two independent circuits (different setupNonce → different
+    // circuitId + different ackNonce). The same replayStore must accept
+    // both — they are different keys in the store.
+    const envA = setupGatewayEnv();
+    const authA = constructGatewayReturnAuthorization(envA.gatewayTemplate, envA.terminalAck, envA.relayEd25519PublicKey, envA.terminalAcceptance, envA.hopNodeIds, envA.proposal, envA.acceptances);
+    const wireA = encodeGatewayReturnAuthorization(authA);
+    const decodedA = decodeGatewayReturnAuthorization(wireA);
+    if (!decodedA.ok) return;
+
+    const envB = setupGatewayEnv();
+    const authB = constructGatewayReturnAuthorization(envB.gatewayTemplate, envB.terminalAck, envB.relayEd25519PublicKey, envB.terminalAcceptance, envB.hopNodeIds, envB.proposal, envB.acceptances);
+    const wireB = encodeGatewayReturnAuthorization(authB);
+    const decodedB = decodeGatewayReturnAuthorization(wireB);
+    if (!decodedB.ok) return;
+
+    // Sanity check: the two circuits are genuinely different.
+    expect(decodedA.authorization.ackNonce).not.toEqual(decodedB.authorization.ackNonce);
+
+    const replayStore = new InMemoryGatewayAuthorizationReplayStore();
+
+    const resultA = await verifyGatewayReturnAuthorization(
+      decodedA.authorization,
+      envA.gatewayNodeId,
+      envA.gatewayX25519Sk,
+      envA.gatewayX25519Pk,
+      NOW,
+      replayStore,
+    );
+    expect(resultA.ok).toBe(true);
+
+    const resultB = await verifyGatewayReturnAuthorization(
+      decodedB.authorization,
+      envB.gatewayNodeId,
+      envB.gatewayX25519Sk,
+      envB.gatewayX25519Pk,
+      NOW,
+      replayStore,
+    );
+    expect(resultB.ok).toBe(true);
+  });
+
+  test("different ackNonce → independent ACCEPT", async () => {
+    // Same route + same circuitId is impossible without re-running
+    // setupCircuit (which produces a fresh circuitId). We instead
+    // exercise the third key dimension independently: two setupGatewayEnv
+    // calls yield two circuits with distinct ackNonce values (the
+    // ackNonce is randomized per ack). The same replayStore must accept
+    // both because the (ackNonce) differs — proving the keying tuple is
+    // (commitmentRoot, circuitId, ackNonce), not a coarser tuple.
+    const envA = setupGatewayEnv();
+    const authA = constructGatewayReturnAuthorization(envA.gatewayTemplate, envA.terminalAck, envA.relayEd25519PublicKey, envA.terminalAcceptance, envA.hopNodeIds, envA.proposal, envA.acceptances);
+    const wireA = encodeGatewayReturnAuthorization(authA);
+    const decodedA = decodeGatewayReturnAuthorization(wireA);
+    if (!decodedA.ok) return;
+
+    const envB = setupGatewayEnv();
+    const authB = constructGatewayReturnAuthorization(envB.gatewayTemplate, envB.terminalAck, envB.relayEd25519PublicKey, envB.terminalAcceptance, envB.hopNodeIds, envB.proposal, envB.acceptances);
+    const wireB = encodeGatewayReturnAuthorization(authB);
+    const decodedB = decodeGatewayReturnAuthorization(wireB);
+    if (!decodedB.ok) return;
+
+    // Sanity check: the two ack nonces are distinct.
+    expect(decodedA.authorization.ackNonce).not.toEqual(decodedB.authorization.ackNonce);
+
+    const replayStore = new InMemoryGatewayAuthorizationReplayStore();
+
+    const resultA = await verifyGatewayReturnAuthorization(
+      decodedA.authorization,
+      envA.gatewayNodeId,
+      envA.gatewayX25519Sk,
+      envA.gatewayX25519Pk,
+      NOW,
+      replayStore,
+    );
+    expect(resultA.ok).toBe(true);
+
+    const resultB = await verifyGatewayReturnAuthorization(
+      decodedB.authorization,
+      envB.gatewayNodeId,
+      envB.gatewayX25519Sk,
+      envB.gatewayX25519Pk,
+      NOW,
+      replayStore,
+    );
+    expect(resultB.ok).toBe(true);
   });
 });
 

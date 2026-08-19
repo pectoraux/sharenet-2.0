@@ -343,3 +343,65 @@ export function createInMemoryCircuitReplayStores(): CircuitReplayStores {
     ackStore: new InMemoryCircuitAckReplayStore(),
   };
 }
+
+// -----------------------------------------------------------------------
+// GatewayAuthorizationReplayStore — single-use gateway authorization (R-009 Stage 2)
+// -----------------------------------------------------------------------
+
+/**
+ * Durable, single-use consumption for GatewayReturnAuthorization.
+ *
+ * Per the re-audit of cbdc0cc: the authorization verification verified
+ * signatures + Merkle proof + ECDH decrypt, but did NOT consume the
+ * authorization. The same valid, unexpired authorization could be replayed
+ * to the gateway. This store closes that gap.
+ *
+ * Keyed by `(commitmentRoot, circuitId, ackNonce)` — the authorization
+ * belongs to a particular circuit instance (not merely the route).
+ *
+ * The `consume` operation is atomic + fail-closed:
+ *   - first call → true (consumed, authorization accepted)
+ *   - second call → false (replay rejected)
+ *   - persistence failure → false (fail-closed: treat as replay)
+ */
+export interface GatewayAuthorizationReplayStore {
+  /**
+   * Atomically consume a gateway authorization.
+   *
+   * @param commitmentRoot - the 32-byte route commitment root
+   * @param circuitId - the 32-byte circuit ID (instance identity)
+   * @param ackNonce - the 16-byte ack nonce from the CircuitSetupAck
+   * @returns `true` if this is the first consumption (safe to proceed),
+   *          `false` if already consumed (replay) or persistence failed (fail-closed).
+   */
+  consume(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    ackNonce: Uint8Array,
+  ): Promise<boolean>;
+}
+
+/**
+ * In-memory `GatewayAuthorizationReplayStore` for tests.
+ *
+ * Does NOT survive process restart. Use `DurableSqliteGatewayAuthorizationReplayStore`
+ * (in `src/lib/sharenet/`) for production.
+ */
+export class InMemoryGatewayAuthorizationReplayStore implements GatewayAuthorizationReplayStore {
+  private consumed = new Set<string>();
+
+  private key(cr: Uint8Array, cid: Uint8Array, nonce: Uint8Array): string {
+    return `${toHex(cr)}:${toHex(cid)}:${toHex(nonce)}`;
+  }
+
+  async consume(
+    commitmentRoot: Uint8Array,
+    circuitId: Uint8Array,
+    ackNonce: Uint8Array,
+  ): Promise<boolean> {
+    const k = this.key(commitmentRoot, circuitId, ackNonce);
+    if (this.consumed.has(k)) return false; // replay
+    this.consumed.add(k);
+    return true; // first use
+  }
+}

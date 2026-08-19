@@ -153,22 +153,24 @@ describe("R-009 Stage 2: real multi-process integration (child_process)", () => 
     //    decrypt — ALL from wire bytes, no WeakSet dependency.
     const gatewayScript = `
       const { decodeGatewayReturnAuthorization, verifyGatewayReturnAuthorization } = require("${join(process.cwd(), "reference/circuit/return-template.ts").replace(/\\/g, "\\\\")}");
+      const { InMemoryGatewayAuthorizationReplayStore } = require("${join(process.cwd(), "reference/circuit/replay-stores.ts").replace(/\\/g, "\\\\")}");
 
       let input = "";
       process.stdin.on("data", (chunk) => { input += chunk; });
-      process.stdin.on("end", () => {
+      process.stdin.on("end", async () => {
         const data = JSON.parse(input);
         const decoded = decodeGatewayReturnAuthorization(new Uint8Array(Buffer.from(data.authWireHex, "hex")));
         if (!decoded.ok) {
           process.stdout.write(JSON.stringify({ ok: false, reason: decoded.reason }));
           return;
         }
-        const result = verifyGatewayReturnAuthorization(
+        const result = await verifyGatewayReturnAuthorization(
           decoded.authorization,
           data.gatewayNodeId,
           new Uint8Array(Buffer.from(data.gatewayX25519SecretKeyHex, "hex")),
           new Uint8Array(Buffer.from(data.gatewayX25519PublicKeyHex, "hex")),
           data.now,
+          new InMemoryGatewayAuthorizationReplayStore(),
         );
         if (!result.ok) {
           process.stdout.write(JSON.stringify({ ok: false, reason: result.reason }));

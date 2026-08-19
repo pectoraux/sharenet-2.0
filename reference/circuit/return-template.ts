@@ -95,6 +95,7 @@ import {
   type RouteProposal,
 } from "../routing/route";
 import { fromHex } from "../encoding/cbor";
+import type { GatewayAuthorizationReplayStore } from "./replay-stores";
 
 // -----------------------------------------------------------------------
 // Constants (R-009 Stage 2 — return-onion template)
@@ -1496,14 +1497,18 @@ export type VerifyGatewayReturnAuthorizationResult =
  * @param gatewayX25519SecretKey - the gateway's own X25519 secret key
  * @param gatewayX25519PublicKey - the gateway's own X25519 public key
  * @param now - the current time (unix seconds)
+ * @param replayStore - REQUIRED durable single-use consumption store. The
+ *   authorization is atomically consumed after all verification passes,
+ *   preventing replay. Fail-closed on persistence failure.
  */
-export function verifyGatewayReturnAuthorization(
+export async function verifyGatewayReturnAuthorization(
   authorization: GatewayReturnAuthorization,
   expectedGatewayNodeId: string,
   gatewayX25519SecretKey: Uint8Array,
   gatewayX25519PublicKey: Uint8Array,
   now: number,
-): VerifyGatewayReturnAuthorizationResult {
+  replayStore: GatewayAuthorizationReplayStore,
+): Promise<VerifyGatewayReturnAuthorizationResult> {
   // 1. Decode the inner GatewayReturnTemplate.
   const decoded = decodeGatewayReturnTemplate(authorization.gatewayTemplateBytes);
   if (!decoded.ok) {
@@ -1636,13 +1641,34 @@ export function verifyGatewayReturnAuthorization(
   }
 
   // 4. Delegate to the standard verifier (NodeId, X25519 key, initiator signature, ECDH decrypt).
-  return verifyGatewayReturnTemplate(
+  const templateResult = verifyGatewayReturnTemplate(
     gt,
     expectedGatewayNodeId,
     gatewayX25519SecretKey,
     gatewayX25519PublicKey,
     now,
   );
+  if (!templateResult.ok) {
+    return templateResult;
+  }
+
+  // 5. ATOMICALLY CONSUME the authorization (single-use).
+  //    Per the re-audit of cbdc0cc: the authorization must be single-use.
+  //    A replayed authorization (same commitmentRoot + circuitId + ackNonce)
+  //    is rejected. Fail-closed: persistence failure also rejects.
+  const consumed = await replayStore.consume(
+    gt.commitmentRoot,
+    gt.circuitId,
+    authorization.ackNonce,
+  );
+  if (!consumed) {
+    return {
+      ok: false,
+      reason: "gateway authorization replay: (commitmentRoot, circuitId, ackNonce) already consumed or persistence failed (fail-closed)",
+    };
+  }
+
+  return templateResult;
 }
 
 export { toHex };
