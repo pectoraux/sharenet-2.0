@@ -34,9 +34,11 @@ import {
   encodeReturnFramePayload,
   signGatewayReturnTemplate,
   verifyGatewayReturnTemplate,
+  verifyGatewayReturnTemplateWithRoute,
   encodeGatewayReturnTemplate,
   decodeGatewayReturnTemplate,
 } from "@reference/circuit/return-template";
+import { handleCircuitSetup, type CircuitSetupAck } from "@reference/circuit/distributed-setup";
 import { InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
@@ -764,5 +766,231 @@ describe("R-009 Stage 2: GatewayReturnTemplate — authenticated transfer", () =
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("K_ret decryption failed");
+  });
+});
+
+// =====================================================================
+// R-009 Stage 2: route-bound gateway verification + distributed transport
+// (per the re-audit of 11d9e35: the gateway verifier must bind the template
+//  to the ACTUAL committed terminal hop, not just a supplied NodeId.)
+// =====================================================================
+
+describe("R-009 Stage 2: route-bound gateway verification (verifyGatewayReturnTemplateWithRoute)", () => {
+  test("valid route + valid template → gateway accepts (route-bound)", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
+
+    const result = verifyGatewayReturnTemplateWithRoute(
+      gt, route.branded, terminalAck,
+      gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  test("wrong terminal gateway (fake NodeId not in route) → REJECT", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+    const fakeNodeId = "fake-gateway-nodeid";
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, fakeNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
+
+    const result = verifyGatewayReturnTemplateWithRoute(
+      gt, route.branded, terminalAck,
+      fakeNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("not the terminal hop");
+  });
+
+  test("cross-route template (wrong commitmentRoot) → REJECT", () => {
+    const routeA = makeRoute(2);
+    const routeB = makeRoute(2);
+    const relayKeysA = makeRelayX25519Keys(routeA.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuitA = setupCircuit(routeA.branded, relayKeysA, NOW, floorStore);
+    const templateA = constructReturnOnionTemplate(circuitA);
+    const gatewayNodeId = routeA.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    const gt = signGatewayReturnTemplate(
+      templateA, routeA.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuitA.initiatorX25519SecretKey, circuitA.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
+
+    const result = verifyGatewayReturnTemplateWithRoute(
+      gt, routeB.branded, terminalAck,
+      gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("commitmentRoot mismatch");
+  });
+
+  test("gateway X25519 key doesn't match terminal hop's ack → REJECT", () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+    const realGatewaySk = randomBytes(32);
+    const realGatewayPk = x25519.getPublicKey(realGatewaySk);
+    const wrongPk = x25519.getPublicKey(randomBytes(32));
+
+    const gt = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      realGatewayPk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    const terminalAck = { relayX25519PublicKey: wrongPk } as any;
+
+    const result = verifyGatewayReturnTemplateWithRoute(
+      gt, route.branded, terminalAck,
+      gatewayNodeId, realGatewaySk, realGatewayPk, NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("does not match the terminal hop");
+  });
+});
+
+// =====================================================================
+// R-009 Stage 2: REAL distributed transport integration test
+// (the gateway receives the GatewayReturnTemplate as wire bytes, not an
+//  in-memory object. All hops are independent — no shared mutable state.)
+// =====================================================================
+
+describe("R-009 Stage 2: real distributed transport (wire bytes → decode → verify route → decrypt → seal → return)", () => {
+  test("full distributed flow: source establishes → gateway receives wire bytes → verifies route → decrypts → seals response → source decrypts", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    // 1. INITIATOR: construct template + sign gateway transfer.
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayTemplate = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    // 2. TRANSPORT: encode to wire bytes (simulating the network).
+    const wireBytes = encodeGatewayReturnTemplate(gatewayTemplate);
+
+    // 3. GATEWAY (independent process): receives wire bytes → decodes.
+    const decoded = decodeGatewayReturnTemplate(wireBytes);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+
+    // 4. GATEWAY: verifies the transfer against the committed route + terminal ack.
+    const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
+    const verifyResult = verifyGatewayReturnTemplateWithRoute(
+      decoded.gatewayTemplate,
+      route.branded,
+      terminalAck,
+      gatewayNodeId,
+      gatewayX25519Sk,
+      gatewayX25519Pk,
+      NOW,
+    );
+    expect(verifyResult.ok).toBe(true);
+    if (!verifyResult.ok) return;
+    const acceptedTemplate = verifyResult.template;
+
+    // 5. GATEWAY: seals a real return response using the accepted template.
+    const httpResponse = new TextEncoder().encode("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    const retCiphertext = sealReturnFrameFromTemplate(acceptedTemplate, 1, httpResponse);
+    const retFrame = {
+      circuitNoncePrefix: circuit.noncePrefix,
+      frameSequence: 1,
+      direction: DIRECTION_BACKWARD,
+      ciphertext: retCiphertext,
+    } as any;
+    const retWire = encodeCircuitFrame(retFrame);
+
+    // 6. RELAY 1 (independent): processes the backward frame (production path).
+    const r1 = await processCircuitWireFrame(circuit, 1, retWire);
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+
+    // 7. SOURCE (independent): processes — terminal, delivers the response.
+    const r0 = await processCircuitWireFrame(circuit, 0, r1.nextWireBytes);
+    expect(r0.ok).toBe(true);
+    if (!r0.ok) return;
+    expect(new TextDecoder().decode(r0.plaintext)).toBe("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+  });
+
+  test("gateway receives tampered wire bytes → verify fails", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+    const initiatorKp = generateNodeKeypair();
+    const gatewayX25519Sk = randomBytes(32);
+    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    const template = constructReturnOnionTemplate(circuit);
+    const gatewayTemplate = signGatewayReturnTemplate(
+      template, route.branded.expiry, gatewayNodeId,
+      gatewayX25519Pk,
+      circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    const wireBytes = new Uint8Array(encodeGatewayReturnTemplate(gatewayTemplate));
+    wireBytes[wireBytes.length - 1] ^= 0x01;
+
+    const decoded = decodeGatewayReturnTemplate(wireBytes);
+    if (decoded.ok) {
+      const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
+      const result = verifyGatewayReturnTemplateWithRoute(
+        decoded.gatewayTemplate, route.branded, terminalAck,
+        gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
+      );
+      expect(result.ok).toBe(false);
+    }
   });
 });

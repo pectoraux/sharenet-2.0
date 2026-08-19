@@ -78,6 +78,8 @@ import {
   type ActiveCircuit,
 } from "./circuit";
 import { DIRECTION_BACKWARD } from "./frame";
+import type { BrandedCommittedRoute } from "../transport/validated-types";
+import { isBrandedCommittedRoute } from "../transport/validated-types";
 
 // -----------------------------------------------------------------------
 // Constants (R-009 Stage 2 — return-onion template)
@@ -803,6 +805,90 @@ export function verifyGatewayReturnTemplate(
     envelope: gatewayTemplate.envelope,
   };
   return { ok: true, template };
+}
+
+/**
+ * Verify a GatewayReturnTemplate at the gateway, bound to the ACTUAL committed route.
+ *
+ * This is the AUTHENTICATED GATEWAY VERIFIER — the gateway uses this to verify
+ * that it is the actual terminal destination of the committed route, not merely
+ * a supplied NodeId. It extends verifyGatewayReturnTemplate with route binding:
+ *
+ *   0a. Verify the route is genuine (BrandedCommittedRoute WeakSet check).
+ *   0b. Verify the template's commitmentRoot matches the route's commitmentRoot.
+ *   0c. Verify the template's gatewayNodeId matches the route's terminal hop's NodeId.
+ *   0d. Verify the template's gatewayX25519PublicKey matches the terminal hop's ack.
+ *
+ * Then it delegates to verifyGatewayReturnTemplate for the standard checks
+ * (NodeId, X25519 key, expiry, signature, ECDH decrypt).
+ *
+ * This closes the authorization-boundary issue flagged in the re-audit of
+ * 11d9e35: previously the verifier accepted a supplied gatewayNodeId without
+ * verifying it's the actual terminal hop of the committed route. A valid
+ * initiator could sign gatewayNodeId = G_fake and the fake gateway could
+ * accept the template. Now the gateway cryptographically verifies:
+ *   - the route is genuine (BrandedCommittedRoute WeakSet)
+ *   - the commitmentRoot matches the route
+ *   - the gatewayNodeId is the actual terminal hop
+ *   - the X25519 key matches the terminal hop's authenticated ack
+ *
+ * @param gatewayTemplate - the signed + confidential GatewayReturnTemplate wire object
+ * @param route - the genuine BrandedCommittedRoute (the gateway verifies this)
+ * @param terminalAck - the CircuitSetupAck from the terminal hop (carries relayX25519PublicKey)
+ * @param expectedGatewayNodeId - the gateway's own NodeId
+ * @param gatewayX25519SecretKey - the gateway's own X25519 secret key
+ * @param gatewayX25519PublicKey - the gateway's own X25519 public key
+ * @param now - the current time (unix seconds)
+ */
+export function verifyGatewayReturnTemplateWithRoute(
+  gatewayTemplate: GatewayReturnTemplate,
+  route: BrandedCommittedRoute,
+  terminalAck: { relayX25519PublicKey: Uint8Array },
+  expectedGatewayNodeId: string,
+  gatewayX25519SecretKey: Uint8Array,
+  gatewayX25519PublicKey: Uint8Array,
+  now: number,
+): VerifyGatewayReturnTemplateResult {
+  // 0a. Verify the route is genuine (WeakSet check).
+  if (!isBrandedCommittedRoute(route)) {
+    return { ok: false, reason: "route is not a genuine BrandedCommittedRoute" };
+  }
+
+  // 0b. Verify the template's commitmentRoot matches the route's commitmentRoot.
+  if (!bytesEqual(gatewayTemplate.commitmentRoot, route.commitmentRoot)) {
+    return {
+      ok: false,
+      reason: "commitmentRoot mismatch: template does not match this route",
+    };
+  }
+
+  // 0c. Verify the template's gatewayNodeId is the actual terminal hop.
+  const terminalHopNodeId = route.hops[route.hops.length - 1]!.nodeId;
+  if (gatewayTemplate.gatewayNodeId !== terminalHopNodeId) {
+    return {
+      ok: false,
+      reason: `gatewayNodeId is not the terminal hop: template has "${gatewayTemplate.gatewayNodeId}", route terminal is "${terminalHopNodeId}"`,
+    };
+  }
+
+  // 0d. Verify the template's gatewayX25519PublicKey matches the terminal hop's ack.
+  if (!bytesEqual(gatewayTemplate.gatewayX25519PublicKey, terminalAck.relayX25519PublicKey)) {
+    return {
+      ok: false,
+      reason: "gatewayX25519PublicKey does not match the terminal hop's CircuitSetupAck",
+    };
+  }
+
+  // Delegate to the standard verifier for the remaining checks
+  // (gatewayNodeId == expectedGatewayNodeId, X25519 key binding, expiry,
+  // signature, ECDH decrypt).
+  return verifyGatewayReturnTemplate(
+    gatewayTemplate,
+    expectedGatewayNodeId,
+    gatewayX25519SecretKey,
+    gatewayX25519PublicKey,
+    now,
+  );
 }
 
 /**
