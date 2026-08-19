@@ -1672,6 +1672,35 @@ function verifyCircuitDestroyVector(data: any): VectorResult {
         const r = verifyCircuitDestroy(tampered);
         if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
         else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch`); }
+      } else if (v.name === "issuedAt-after-expiry-rejected") {
+        // R-009 Stage 3 Phase 2 final hardening: issuedAt > expiry → semantic invalidity.
+        // Re-sign with issuedAt = expiry + 1 (the signature covers issuedAt + expiry,
+        // so the signature is VALID — but the destroy is structurally invalid).
+        const issuedAt = v.input.issuedAt;
+        const mutatedDestroy = signCircuitDestroy(
+          circuitId, commitmentRoot,
+          "initiator-node-id",
+          DESTROYER_ROLE_INITIATOR,
+          DESTROY_REASON_OPERATOR_INITIATED,
+          issuedAt, expiry,
+          initEd25519Sk, initEd25519Pk,
+        );
+        const r = verifyCircuitDestroy(mutatedDestroy);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
+        else if (!r.ok && !r.reason.includes(expected.reasonContains)) { caseOk = false; failures.push(`${v.name}: reason mismatch: "${(r as any).reason}"`); }
+      } else if (v.name === "issuedAt-equals-expiry-accepted") {
+        // Boundary: issuedAt == expiry → ACCEPT (<=, not <).
+        const issuedAt = v.input.issuedAt;
+        const boundaryDestroy = signCircuitDestroy(
+          circuitId, commitmentRoot,
+          "initiator-node-id",
+          DESTROYER_ROLE_INITIATOR,
+          DESTROY_REASON_OPERATOR_INITIATED,
+          issuedAt, expiry,
+          initEd25519Sk, initEd25519Pk,
+        );
+        const r = verifyCircuitDestroy(boundaryDestroy);
+        if (r.ok !== expected.ok) { caseOk = false; failures.push(`${v.name}: ok ${r.ok} != ${expected.ok}`); }
       } else {
         throw new Error(`unknown circuit-destroy case name: ${v.name}`);
       }

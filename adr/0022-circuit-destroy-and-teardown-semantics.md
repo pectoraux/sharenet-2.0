@@ -283,9 +283,36 @@ The `processCircuitDestroy` pipeline (step 7) now calls
   safely retry with the SAME destroy (the nonce is still fresh).
 
 **Durable implementation:** `DurableSqliteCircuitDestroyStore` uses a Prisma
-`$transaction` to atomically insert into `ConsumedCircuitDestroy` + upsert
-into `CircuitRevocation`. If either fails, the entire transaction rolls
-back — no split state.
+`$transaction` to atomically insert into `ConsumedCircuitDestroy` + CREATE
+into `CircuitRevocation` (NOT upsert — the tombstone create is the AUTHORITATIVE
+ACTIVE→REVOKED transition; the unique constraint ensures exactly ONE
+transaction wins; concurrent transactions roll back + re-check isRevoked →
+idempotent). If either fails, the entire transaction rolls back — no split state.
+
+### 14. Expiry tombstones are SYSTEM-generated revocations (R-009 Stage 3 Phase 2 final)
+
+**Expiry tombstones are SYSTEM-generated revocations, NOT initiator-authenticated
+CircuitDestroy evidence.** The expiry path in `processCircuitWireFrame` calls
+`revocationStore.revoke()` directly (with `destroyerNodeId = "system"`,
+`destroyerRole = 0x01`, `destroyReason = CIRCUIT_EXPIRED`, `destroyNonce = 0^16`).
+This tombstone is NOT a signed CircuitDestroy wire object — it has no Ed25519
+signature, no destroy nonce, and no destroyer identity. It is a SYSTEM-generated
+record of a temporal event (the circuit's lifetime elapsed).
+
+This distinction is important for audit trails:
+- An **initiator/gateway-authenticated CircuitDestroy** carries a signed wire
+  object (verifiable by any participant from the wire bytes alone) + a fresh
+  destroy nonce. The tombstone records the destroyer's NodeId + the signed
+  destroy evidence.
+- A **SYSTEM-generated expiry tombstone** carries no signature + a zero nonce.
+  The tombstone records `destroyerNodeId = "system"` + `destroyReason =
+  CIRCUIT_EXPIRED`. Any participant can verify the expiry by checking
+  `circuit.expiry <= now` (the expiry is in the circuit's established state).
+
+Both produce the SAME authoritative terminal state (`CIRCUIT_REVOKED`), but
+the evidence type differs. A future audit can distinguish "the initiator
+explicitly destroyed this circuit" from "this circuit expired naturally"
+by inspecting the tombstone's `destroyReason` + `destroyerNodeId`.
 
 Expiry is NOT merely a local frame rejection. When `now > valid_until`:
 

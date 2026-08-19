@@ -2444,3 +2444,33 @@ Stage Summary:
 - Gateway destroy authorization now uses the SAME portable proof chain frozen for GatewayReturnAuthorization (R-009 Stage 2) — terminal RouteAcceptance → Merkle inclusion → commitmentRoot → terminal hop identity → terminal CircuitSetupAck → identity binding. Works from serialized protocol artifacts alone (no WeakSet/BrandedCommittedRoute).
 - CircuitDestroy freshness enforced before nonce consumption (issuedAt/expiry/circuit.expiry + 300s frozen clock skew). A stale destroy is rejected + the nonce remains fresh for a valid retry.
 - The consume-nonce + revoke-tombstone operation is now ATOMIC (single CircuitDestroyStore.consumeDestroyAndRevoke transaction). No split security state — both succeed or both fail. The operator can safely retry with the SAME destroy after a transaction failure (the nonce is still fresh).
+
+---
+Task ID: R009-S3-P2-final
+Agent: orchestrator
+Task: R-009 Stage 3 Phase 2 final hardening — authoritative tombstone transition + concurrency + issuedAt<=expiry + SYSTEM-generated expiry documentation.
+
+Work Log:
+- Read previous worklog + git log: confirmed at commit 3536797 (R-009 Stage 3 Phase 2: gateway proof chain + destroy freshness + atomic consume/revoke).
+- Read the audit's 6 final-hardening points: (1) authoritative tombstone transition, (2) concurrent different nonces → exactly one transition, (3) nonce in same DB transaction, (4) issuedAt<=expiry semantic check, (5) mutation coverage, (6) document expiry tombstones as SYSTEM-generated.
+- Confirmed the frozen V-CIRCUIT-DESTROY-001 vector uses issuedAt = referenceNow = 1786876545, expiry = 1786880145 → issuedAt <= expiry holds → safe to add the check to verifyCircuitDestroy without breaking frozen vectors.
+
+Fixes applied:
+- Fix #1+#2+#3 (authoritative atomic transition + concurrency + nonce in same transaction): Refactored DurableSqliteCircuitDestroyStore.consumeDestroyAndRevoke — replaced circuitRevocation.upsert with circuitRevocation.CREATE (NOT upsert). The unique constraint on (circuitIdHex, commitmentRootHex) is now the AUTHORITATIVE ACTIVE→REVOKED transition: exactly ONE transaction's create succeeds (the winner); all concurrent transactions' create fails with a unique-constraint violation → transaction rolls back → re-check isRevoked → true → return idempotent. This guarantees: concurrent destroys for the same circuit (regardless of nonce) produce EXACTLY ONE terminal transition; all subsequent requests are idempotent/already-revoked. The nonce insert (consumedCircuitDestroy.create) stays in the SAME $transaction (point 3). On failure: re-check isRevoked → true → idempotent (another transaction won); false → genuine persistence failure (fail-closed, safe to retry).
+- Fix #4 (issuedAt <= expiry semantic validity): Added the check to verifyCircuitDestroy (TS) as step 3 (after role + routeId, before signature) — a structural validity check that rejects a destroy with issuedAt > expiry ("semantic invalidity: issuedAt X > expiry Y — a destroy cannot be issued after it expired"). Also added to verify_circuit_destroy (Python) at the same position. Since processCircuitDestroy calls verifyCircuitDestroy in step 2, the check is inherited by the production path.
+- Fix #5 (mutation coverage): Created conformance/vectors/V-CIRCUIT-DESTROY-002.json (2 vectors: issuedAt-after-expiry-rejected [issuedAt = expiry + 1 = 1786880146] + issuedAt-equals-expiry-accepted [boundary, inclusive]). Updated TS runner (verifyCircuitDestroyVector) + Python runner (verify_circuit_destroy_vector) to handle the 2 new case names. Added 8 unit tests: issuedAt>expiry→REJECT (verifyCircuitDestroy), issuedAt==expiry→ACCEPT (boundary), issuedAt>expiry→REJECT (processCircuitDestroy, before nonce consumption), concurrent different nonces (InMemory) → exactly ONE transition, concurrent same nonce (InMemory) → exactly ONE, concurrent different nonces (DurableSqlite, Promise.all + real $transaction) → exactly ONE, concurrent same nonce (DurableSqlite) → exactly ONE, three concurrent different nonces (DurableSqlite) → exactly ONE + two idempotent.
+- Fix #6 (SYSTEM-generated expiry tombstones): Documented in ADR-0022 §14 (new section) + spec/08 §4.7. Expiry tombstones are SYSTEM-generated revocations (destroyerNodeId="system", no Ed25519 signature, no destroy nonce), NOT initiator-authenticated CircuitDestroy evidence. Both produce the SAME authoritative terminal state (CIRCUIT_REVOKED), but the evidence type differs — an audit trail can distinguish "the initiator explicitly destroyed this circuit" from "this circuit expired naturally" by inspecting the tombstone's destroyReason + destroyerNodeId.
+- Test-hygiene fix: the "destroy expired (now >= expiry)" test was updated to use issuedAt = NOW - 100 (< expiry = NOW - 1) so the semantic validity check (issuedAt <= expiry) passes + the freshness check (now >= expiry) is what gets tested. Without this fix, the new semantic check in verifyCircuitDestroy (step 2) would catch it first (issuedAt = NOW > expiry = NOW - 1), preventing the freshness check from being exercised.
+
+Verification (all five required suites):
+- Unit tests: 509 pass / 0 fail (was 501; +8 final-hardening tests). 1777 expect() calls across 30 files in 4.06s.
+- Architecture tests: 24/24 pass (incl. #21 + #23 layer-separation).
+- TS conformance vectors: 41/41 pass (was 40; +1 new V-CIRCUIT-DESTROY-002 with 2 mutation cases).
+- Python conformance vectors: 41/41 pass (was 40; +1 new V-CIRCUIT-DESTROY-002 — the independent Python verifier reproduces the same 2 mutation cases).
+- Lint: clean (exit 0).
+
+Stage Summary:
+- All 6 final-hardening points closed. No propagation started (per the audit's stop condition — "Do NOT begin propagation until this passes a fresh re-audit").
+- The CircuitRevocation create (not upsert) is the AUTHORITATIVE atomic ACTIVE→REVOKED transition. Concurrent destroys for the same circuit produce EXACTLY ONE terminal transition; all subsequent requests are idempotent/already-revoked. The destroy nonce is recorded in the same DB transaction (no split state).
+- The issuedAt <= expiry semantic validity check is enforced at the portable verifier level (verifyCircuitDestroy), with frozen conformance mutation coverage (V-CIRCUIT-DESTROY-002: issuedAt > expiry → REJECT, issuedAt == expiry → ACCEPT boundary).
+- Expiry tombstones are explicitly documented as SYSTEM-generated revocations (no signature, no nonce, destroyerNodeId="system"), distinct from initiator/gateway-authenticated CircuitDestroy evidence.

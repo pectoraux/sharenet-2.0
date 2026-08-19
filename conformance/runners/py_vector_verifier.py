@@ -3795,7 +3795,19 @@ def verify_circuit_destroy(destroy: dict) -> dict:
                 "reason": f"routeId mismatch: expected \"{expected_route_id}\","
                           f" got \"{actual_route_id}\""}
 
-    # 3. Verify the Ed25519 signature over the 9-field binding payload.
+    # 3. SEMANTIC VALIDITY (R-009 Stage 3 Phase 2 final hardening):
+    #    issuedAt <= expiry. A destroy with issuedAt > expiry is nonsensical
+    #    (it was issued after it expired). This is a structural check — it
+    #    catches a malformed destroy at the portable verifier level, before
+    #    the signature check.
+    issued_at = destroy.get("issuedAt")
+    expiry = destroy.get("expiry")
+    if isinstance(issued_at, int) and isinstance(expiry, int) and issued_at > expiry:
+        return {"ok": False,
+                "reason": f"semantic invalidity: issuedAt {issued_at} > expiry "
+                          f"{expiry} (a destroy cannot be issued after it expired)"}
+
+    # 4. Verify the Ed25519 signature over the 9-field binding payload.
     payload = circuit_destroy_signing_payload(
         destroy["circuitId"],
         destroy["commitmentRoot"],
@@ -4125,6 +4137,49 @@ def verify_circuit_destroy_vector(data: dict) -> dict:
                     failures.append(
                         f"{name}: reason '{r['reason']}' !contains "
                         f"'{expected['reasonContains']}'")
+
+            elif name == "issuedAt-after-expiry-rejected":
+                # R-009 Stage 3 Phase 2 final hardening: issuedAt > expiry →
+                # semantic invalidity. Re-sign with issuedAt = expiry + 1 (the
+                # signature covers issuedAt + expiry, so the signature is VALID
+                # — but the destroy is structurally invalid).
+                issued_at = v["input"]["issuedAt"]
+                mutated_destroy = sign_circuit_destroy(
+                    circuit_id, commitment_root,
+                    "initiator-node-id",
+                    DESTROYER_ROLE_INITIATOR,
+                    DESTROY_REASON_OPERATOR_INITIATED,
+                    issued_at, expiry,
+                    init_ed25519_sk, init_ed25519_pk,
+                )
+                r = verify_circuit_destroy(mutated_destroy)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}")
+                elif not r["ok"] and expected["reasonContains"] not in \
+                        r["reason"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: reason '{r['reason']}' !contains "
+                        f"'{expected['reasonContains']}'")
+
+            elif name == "issuedAt-equals-expiry-accepted":
+                # Boundary: issuedAt == expiry → ACCEPT (<=, not <).
+                issued_at = v["input"]["issuedAt"]
+                boundary_destroy = sign_circuit_destroy(
+                    circuit_id, commitment_root,
+                    "initiator-node-id",
+                    DESTROYER_ROLE_INITIATOR,
+                    DESTROY_REASON_OPERATOR_INITIATED,
+                    issued_at, expiry,
+                    init_ed25519_sk, init_ed25519_pk,
+                )
+                r = verify_circuit_destroy(boundary_destroy)
+                if r["ok"] != expected["ok"]:
+                    case_ok = False
+                    failures.append(
+                        f"{name}: ok {r['ok']} != {expected['ok']}")
 
             else:
                 case_ok = False

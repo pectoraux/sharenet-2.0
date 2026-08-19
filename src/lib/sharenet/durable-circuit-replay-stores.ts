@@ -299,27 +299,37 @@ import type {
 /**
  * Durable SQLite-backed implementation of `CircuitDestroyStore`.
  *
- * Per the re-audit of 60e4364 (R-009 Stage 3 Phase 2): the previous design
- * used two separate operations (`revoke()` + `consume()`) that could leave
- * a SPLIT security state if one succeeded and the other failed. This
- * implementation uses a single Prisma `$transaction` to atomically:
- *   1. Insert into `ConsumedCircuitDestroy` (unique constraint on
- *      `(commitmentRootHex, circuitIdHex, destroyNonceHex)` — catches replays).
- *   2. Upsert into `CircuitRevocation` (idempotent — if the tombstone already
- *      exists, the upsert is a no-op).
+ * Per the re-audit of 3536797 (R-009 Stage 3 Phase 2 final hardening):
+ * the previous design used `circuitRevocation.upsert` for the tombstone,
+ * which is idempotent — but it could not distinguish "I wrote the tombstone"
+ * from "the tombstone already existed". Two concurrent destroys with
+ * different nonces could BOTH return `{ ok: true, idempotent: false }`,
+ * even though only ONE actually performed the ACTIVE→REVOKED transition.
  *
- * If EITHER operation fails, the ENTIRE transaction rolls back — no split state.
- * The nonce is NOT consumed if the tombstone cannot be written; the tombstone is
- * NOT written if the nonce is a replay.
+ * This implementation uses `circuitRevocation.create` (NOT upsert) for the
+ * tombstone. The unique constraint on `(circuitIdHex, commitmentRootHex)` is
+ * the AUTHORITATIVE ACTIVE→REVOKED transition: exactly ONE transaction's
+ * `create` succeeds (the winner); all concurrent transactions' `create`
+ * fails with a unique-constraint violation → the transaction rolls back →
+ * the loser re-checks `isRevoked` → true → returns `{ ok: true, idempotent: true }`.
  *
- * Idempotency: if the tombstone already exists (the circuit was already
- * revoked by a prior destroy), the operation returns `{ ok: true, idempotent: true }`
- * WITHOUT attempting to insert the nonce (checked first via `isRevoked`).
+ * This guarantees: concurrent destroys for the same circuit (regardless of
+ * nonce) produce EXACTLY ONE terminal transition; all subsequent requests
+ * are idempotent/already-revoked.
  *
- * The `$transaction` uses the default isolation level (Read Committed in
- * SQLite). The unique constraint on `ConsumedCircuitDestroy` provides the
- * replay protection — a concurrent destroy with the same nonce will fail the
- * insert (unique violation → transaction abort → rollback → no split state).
+ * The destroy nonce is recorded in the SAME `$transaction` (point 3 of the
+ * final hardening): `consumedCircuitDestroy.create` + `circuitRevocation.create`
+ * are a single atomic transaction. Both succeed or both fail — no split state.
+ *
+ * Idempotency (pre-check): if the tombstone already exists (the circuit was
+ * already revoked by a prior destroy or expiry), the operation returns
+ * `{ ok: true, idempotent: true }` WITHOUT entering the transaction.
+ *
+ * Idempotency (post-failure): if the transaction fails (unique-constraint
+ * violation on the tombstone — a concurrent destroy won — OR a genuine
+ * persistence failure), the operation re-checks `isRevoked`:
+ *   - true → another transaction won the race → return idempotent.
+ *   - false → genuine persistence failure → return fail-closed.
  */
 export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
   async isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean> {
@@ -342,15 +352,15 @@ export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
     destroyerRole: number,
     destroyReason: number,
   ): Promise<ConsumeDestroyAndRevokeResult> {
-    // Idempotency: if the tombstone already exists, return idempotent success
-    // WITHOUT consuming the nonce. The tombstone is the authoritative state.
+    // Pre-check idempotency: if the tombstone already exists, the circuit is
+    // already revoked. Return idempotent success WITHOUT entering the transaction.
     const alreadyRevoked = await this.isRevoked(circuitId, commitmentRoot);
     if (alreadyRevoked) {
       return { ok: true, idempotent: true };
     }
 
-    // ATOMIC transaction: consume the nonce + write the tombstone.
-    // If EITHER fails, the ENTIRE transaction rolls back — no split state.
+    // ATOMIC transaction: consume the nonce + create the tombstone (authoritative
+    // ACTIVE→REVOKED transition). Both in the SAME transaction — no split state.
     try {
       await db.$transaction([
         // 1. Consume the destroy nonce (unique constraint catches replays).
@@ -361,18 +371,12 @@ export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
             destroyNonceHex: toHex(destroyNonce),
           },
         }),
-        // 2. Write the revocation tombstone (upsert — idempotent if a concurrent
-        //    transaction wrote it first; the upsert avoids a unique-constraint
-        //    failure on the tombstone that would abort the whole transaction).
-        db.circuitRevocation.upsert({
-          where: {
-            circuitIdHex_commitmentRootHex: {
-              circuitIdHex: toHex(circuitId),
-              commitmentRootHex: toHex(commitmentRoot),
-            },
-          },
-          update: {}, // idempotent — don't overwrite if exists
-          create: {
+        // 2. CREATE the tombstone (NOT upsert). The unique constraint on
+        //    (circuitIdHex, commitmentRootHex) is the AUTHORITATIVE transition:
+        //    exactly ONE transaction's create succeeds. Concurrent transactions'
+        //    create fails → rollback → re-check isRevoked → idempotent.
+        db.circuitRevocation.create({
+          data: {
             circuitIdHex: toHex(circuitId),
             commitmentRootHex: toHex(commitmentRoot),
             destroyerNodeId,
@@ -382,21 +386,38 @@ export class DurableSqliteCircuitDestroyStore implements CircuitDestroyStore {
           },
         }),
       ]);
+      // This transaction performed the terminal transition.
       return { ok: true, idempotent: false };
     } catch {
-      // Transaction failed (unique-constraint violation on the nonce → replay,
-      // OR a persistence failure → disk error, DB down, etc.). The ENTIRE
-      // transaction rolled back — no split state. The nonce was NOT consumed
-      // (unless the failure was a replay of the SAME nonce, in which case the
-      // tombstone would have been written by the first transaction). Either way,
-      // the caller MUST reject the destroy (fail-closed). A retry with the SAME
-      // nonce will be rejected as a replay (the nonce insert failed on the
-      // unique constraint, but the rollback removed it — a retry is safe ONLY
-      // if the first transaction fully committed; if it aborted, the nonce is
-      // still fresh and the retry will succeed).
+      // Transaction failed — EITHER a concurrent destroy won the race
+      // (tombstone create unique-constraint violation) OR a nonce replay
+      // (consumedCircuitDestroy create unique-constraint violation) OR a
+      // genuine persistence failure. The ENTIRE transaction rolled back —
+      // no split state (the nonce was NOT consumed if the tombstone create
+      // failed, and vice versa).
+      //
+      // Re-check isRevoked to distinguish:
+      //   - true → another transaction won the race (the circuit is now
+      //     durably revoked) → return idempotent.
+      //   - false → genuine persistence failure (DB error, etc.) OR a nonce
+      //     replay of a nonce whose transaction was rolled back (shouldn't
+      //     happen in normal operation since nonce + tombstone are atomic,
+      //     but if it did, isRevoked would be false) → return fail-closed.
+      const nowRevoked = await this.isRevoked(circuitId, commitmentRoot);
+      if (nowRevoked) {
+        // Another transaction won the race — the circuit is now durably revoked.
+        // This destroy is idempotent (the terminal transition was performed by
+        // the winner). The loser's nonce was NOT consumed (rolled back), but
+        // that's correct — the circuit is already revoked, so the nonce is
+        // irrelevant. A retry with the same nonce would hit the pre-check
+        // idempotency (isRevoked → true) and return idempotent.
+        return { ok: true, idempotent: true };
+      }
+      // Genuine persistence failure — fail closed. The nonce was NOT consumed
+      // (rolled back). The operator can safely retry with the SAME destroy.
       return {
         ok: false,
-        reason: "atomic consumeDestroyAndRevoke transaction failed (replay or persistence failure, fail-closed, no split state)",
+        reason: "atomic consumeDestroyAndRevoke transaction failed (persistence failure, fail-closed, no split state — safe to retry)",
       };
     }
   }

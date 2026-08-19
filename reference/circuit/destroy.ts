@@ -233,7 +233,9 @@ export type VerifyCircuitDestroyResult =
  *   1. The Ed25519 signature (authenticates the destroyer).
  *   2. The routeId derivation (routeId = "route:" + hex(commitmentRoot)).
  *   3. The destroyerRole is valid (0x01 or 0x02).
- *   4. The expiry binding (the destroy's expiry matches the circuit's).
+ *   4. Semantic validity: issuedAt <= expiry (a destroy issued after it
+ *      expired is nonsensical — rejected at the structural level).
+ *   5. The expiry binding (the destroy's expiry matches the circuit's).
  *
  * Authorization checks (is the destroyer the actual initiator/gateway?)
  * are performed separately by the caller using the circuit context
@@ -256,7 +258,23 @@ export function verifyCircuitDestroy(
     return { ok: false, reason: `routeId mismatch: expected "${expectedRouteId}", got "${destroy.routeId}"` };
   }
 
-  // 3. Verify the Ed25519 signature.
+  // 3. SEMANTIC VALIDITY (R-009 Stage 3 Phase 2 final hardening):
+  //    issuedAt <= expiry. A destroy with issuedAt > expiry is nonsensical
+  //    (it was issued after it expired). This is a structural check — it
+  //    catches a malformed destroy at the portable verifier level, before
+  //    the signature check. An attacker cannot construct a validly-signed
+  //    destroy with issuedAt > expiry because issuedAt + expiry are both
+  //    covered by the signature; the check rejects a destroy that was
+  //    correctly signed but semantically invalid (e.g., a buggy destroyer
+  //    that set issuedAt = expiry + 1 by mistake).
+  if (destroy.issuedAt > destroy.expiry) {
+    return {
+      ok: false,
+      reason: `semantic invalidity: issuedAt ${destroy.issuedAt} > expiry ${destroy.expiry} (a destroy cannot be issued after it expired)`,
+    };
+  }
+
+  // 4. Verify the Ed25519 signature.
   const payload = circuitDestroySigningPayload(
     destroy.circuitId,
     destroy.commitmentRoot,

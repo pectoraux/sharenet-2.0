@@ -1,0 +1,44 @@
+{
+  "id": "V-CIRCUIT-DESTROY-002",
+  "status": "frozen",
+  "spec": "spec/08-circuits.md §6.5a, ADR-0022 §12",
+  "description": "CircuitDestroy semantic validity mutations (R-009 Stage 3 Phase 2 final hardening). A destroy with issuedAt > expiry is nonsensical (it was issued after it expired) and MUST be rejected at the portable verifier level (verifyCircuitDestroy), before the signature check. Domain: SHARENET/CIRCUIT/DESTROY/1.",
+  "sharedInputs": {
+    "circuitIdHex": "e41914691e4a3886c301568795f37f7e9bb2c7b96a271c0804e55626d07a5c83",
+    "commitmentRootHex": "971320035fea4752f89a8ebd8475fdb2e313b182c9831876d642f707f29051eb",
+    "routeId": "route:971320035fea4752f89a8ebd8475fdb2e313b182c9831876d642f707f29051eb",
+    "expiry": 1786880145,
+    "referenceNow": 1786876545,
+    "initiatorEd25519SecretKeyHex": "1010101010101010101010101010101010101010101010101010101010101010",
+    "initiatorEd25519PubHex": "5c9c6df261c9cb840475776aaefcd944b405328fab28f9b3a95ef40490d3de84",
+    "gatewayEd25519SecretKeyHex": "2020202020202020202020202020202020202020202020202020202020202020",
+    "gatewayEd25519PubHex": "4ed32f63bf35f0eeefcb25f28a2e1fbdc873ae2835671b0c9460f5f12e4556a8"
+  },
+  "vectors": [
+    {
+      "name": "issuedAt-after-expiry-rejected",
+      "description": "verifyCircuitDestroy with issuedAt > expiry → semantic invalidity (the destroy was issued after it expired — nonsensical). The signature is VALID (issuedAt + expiry are both covered by the signature), but the destroy is structurally invalid.",
+      "input": {
+        "issuedAt": 1786880146
+      },
+      "expected": {
+        "ok": false,
+        "reasonContains": "semantic invalidity"
+      }
+    },
+    {
+      "name": "issuedAt-equals-expiry-accepted",
+      "description": "verifyCircuitDestroy with issuedAt == expiry (boundary) → ACCEPT (issuedAt <= expiry holds at the boundary). Confirms the check is <=, not <.",
+      "input": {
+        "issuedAt": 1786880145
+      },
+      "expected": {
+        "ok": true
+      }
+    }
+  ],
+  "verification": {
+    "runner": "ts-vector-runner.ts:verifyCircuitDestroyVector + py_vector_verifier.py:verify_circuit_destroy_vector",
+    "notes": "Mutation coverage for the issuedAt <= expiry semantic validity check (R-009 Stage 3 Phase 2 final hardening). The issuedAt-after-expiry-rejected case uses issuedAt = expiry + 1 = 1786880146 > expiry 1786880145. The signature is valid (the signer honestly signs the issuedAt + expiry pair), but the destroy is structurally invalid. The issuedAt-equals-expiry-accepted case confirms the boundary is inclusive (<=)."
+  }
+}

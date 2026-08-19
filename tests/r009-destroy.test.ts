@@ -1438,13 +1438,16 @@ describe("R-009 Stage 3 Phase 2: CircuitDestroy freshness (issuedAt / expiry / c
 
     // Sign a destroy with expiry in the past (expired). The circuit itself is
     // still alive (circuit.expiry > NOW), but the destroy's expiry is NOW - 1.
+    // Set issuedAt = NOW - 100 (< expiry) so the semantic validity check
+    // (issuedAt <= expiry) passes; the freshness check (now >= expiry) is
+    // what rejects this destroy.
     const expiredExpiry = NOW - 1;
     const destroy = signCircuitDestroy(
       circuit.circuitId, circuit.commitmentRoot,
       route.initiator.nodeId,
       DESTROYER_ROLE_INITIATOR,
       DESTROY_REASON_OPERATOR_INITIATED,
-      NOW, expiredExpiry,
+      NOW - 100, expiredExpiry, // issuedAt = NOW - 100 < expiry = NOW - 1
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
     const result = await processCircuitDestroy(
@@ -1782,5 +1785,250 @@ describe("R-009 Stage 3 Phase 2: DurableSqliteCircuitDestroyStore (atomic transa
     const result = await destroyStore.consumeDestroyAndRevoke(cr, cid, nonce, "initiator", 0x01, 0x01);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.idempotent).toBe(true);
+  });
+});
+
+// =====================================================================
+// R-009 Stage 3 Phase 2 final hardening (re-audit of 3536797):
+//   - issuedAt <= expiry semantic validity (conformance mutation coverage)
+//   - concurrent different nonces → exactly ONE terminal transition
+//   - concurrent same nonce → exactly ONE terminal transition
+//   - authoritative tombstone create (not upsert)
+// =====================================================================
+
+describe("R-009 Stage 3 Phase 2 final: issuedAt <= expiry semantic validity", () => {
+  test("issuedAt > expiry → REJECT (semantic invalidity, via verifyCircuitDestroy)", () => {
+    const route = makeRoute(1);
+    const initiatorKp = route.initiator;
+    const circuitId = randomBytes(32);
+    const expiry = route.branded.expiry;
+
+    // Sign a destroy with issuedAt = expiry + 1 (issued after it expired).
+    // The signature is VALID (issuedAt + expiry are both covered by the signature)
+    // — but the destroy is structurally invalid (nonsensical).
+    const destroy = signCircuitDestroy(
+      circuitId, route.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      expiry + 1, // issuedAt = expiry + 1 (AFTER expiry — nonsensical)
+      expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    const result = verifyCircuitDestroy(destroy);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("semantic invalidity");
+      expect(result.reason).toContain("issuedAt");
+      expect(result.reason).toContain("> expiry");
+    }
+  });
+
+  test("issuedAt == expiry (boundary) → ACCEPT (<=, not <)", () => {
+    const route = makeRoute(1);
+    const initiatorKp = route.initiator;
+    const circuitId = randomBytes(32);
+    const expiry = route.branded.expiry;
+
+    // issuedAt == expiry (boundary — inclusive).
+    const destroy = signCircuitDestroy(
+      circuitId, route.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      expiry, // issuedAt == expiry
+      expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+
+    const result = verifyCircuitDestroy(destroy);
+    expect(result.ok).toBe(true);
+  });
+
+  test("issuedAt > expiry → processCircuitDestroy REJECTS before nonce consumption", async () => {
+    const route = makeRoute(2);
+    const relayKeys = makeRelayX25519Keys(route.branded);
+    const floorStore = new InMemoryCircuitSequenceFloorStore();
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
+    const initiatorKp = route.initiator;
+    const gatewayNodeId = route.branded.hops[1]!.nodeId;
+
+    // issuedAt = expiry + 1 (after expiry). verifyCircuitDestroy (step 2)
+    // catches this + rejects before any freshness/nonce logic runs.
+    const destroy = signCircuitDestroy(
+      circuit.circuitId, circuit.commitmentRoot,
+      route.initiator.nodeId,
+      DESTROYER_ROLE_INITIATOR,
+      DESTROY_REASON_OPERATOR_INITIATED,
+      route.branded.expiry + 1, // issuedAt > expiry
+      route.branded.expiry,
+      initiatorKp.secretKey, initiatorKp.publicKey,
+    );
+    const result = await processCircuitDestroy(
+      encodeCircuitDestroy(destroy), circuit,
+      route.initiator.nodeId, gatewayNodeId,
+      destroyStore,
+      NOW,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("semantic invalidity");
+    }
+    // Nonce NOT consumed (rejected at step 2, before step 7).
+    const reConsume = await destroyStore.consumeDestroyAndRevoke(
+      circuit.commitmentRoot, circuit.circuitId, destroy.destroyNonce,
+      "test-verify", 0x01, 0x01,
+    );
+    expect(reConsume.ok).toBe(true);
+    if (reConsume.ok) expect(reConsume.idempotent).toBe(false);
+  });
+});
+
+// ---- Concurrent different nonces → exactly ONE terminal transition --------
+
+describe("R-009 Stage 3 Phase 2 final: concurrent different nonces (InMemory)", () => {
+  test("two concurrent destroys with different nonces → exactly ONE terminal transition, other idempotent", async () => {
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const cid = randomBytes(32);
+    const cr = randomBytes(32);
+    const nonceA = randomBytes(16);
+    const nonceB = randomBytes(16);
+
+    // Fire two concurrent consumeDestroyAndRevoke with DIFFERENT nonces.
+    // In single-threaded JS with Promise.all, the first resolves synchronously
+    // (sets the tombstone), the second sees the tombstone → idempotent.
+    const [r1, r2] = await Promise.all([
+      destroyStore.consumeDestroyAndRevoke(cr, cid, nonceA, "initiator", 0x01, 0x01),
+      destroyStore.consumeDestroyAndRevoke(cr, cid, nonceB, "initiator", 0x01, 0x01),
+    ]);
+
+    // Exactly ONE performed the terminal transition (idempotent: false).
+    const transitions = [r1, r2].filter(r => r.ok && !r.idempotent);
+    expect(transitions.length).toBe(1);
+
+    // The OTHER is idempotent (already-revoked).
+    const idempotents = [r1, r2].filter(r => r.ok && r.idempotent);
+    expect(idempotents.length).toBe(1);
+
+    // The circuit is durably revoked (exactly one tombstone).
+    expect(await destroyStore.isRevoked(cid, cr)).toBe(true);
+  });
+});
+
+describe("R-009 Stage 3 Phase 2 final: concurrent same nonce (InMemory)", () => {
+  test("two concurrent destroys with the SAME nonce → exactly ONE terminal transition, other idempotent", async () => {
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const cid = randomBytes(32);
+    const cr = randomBytes(32);
+    const nonce = randomBytes(16); // SAME nonce for both
+
+    const [r1, r2] = await Promise.all([
+      destroyStore.consumeDestroyAndRevoke(cr, cid, nonce, "initiator", 0x01, 0x01),
+      destroyStore.consumeDestroyAndRevoke(cr, cid, nonce, "initiator", 0x01, 0x01),
+    ]);
+
+    // Exactly ONE performed the terminal transition (idempotent: false).
+    const transitions = [r1, r2].filter(r => r.ok && !r.idempotent);
+    expect(transitions.length).toBe(1);
+
+    // The OTHER is idempotent (the circuit is already revoked).
+    const idempotents = [r1, r2].filter(r => r.ok && r.idempotent);
+    expect(idempotents.length).toBe(1);
+
+    expect(await destroyStore.isRevoked(cid, cr)).toBe(true);
+  });
+});
+
+// ---- Concurrent different nonces (DurableSqlite) — real DB transaction ----
+
+describe("R-009 Stage 3 Phase 2 final: concurrent different nonces (DurableSqlite)", () => {
+  let destroyStore: DurableSqliteCircuitDestroyStore;
+
+  beforeAll(async () => {
+    destroyStore = new DurableSqliteCircuitDestroyStore();
+    await db.circuitRevocation.deleteMany({});
+    await db.consumedCircuitDestroy.deleteMany({});
+  });
+
+  afterAll(async () => {
+    await db.circuitRevocation.deleteMany({});
+    await db.consumedCircuitDestroy.deleteMany({});
+  });
+
+  test("two concurrent destroys with different nonces → exactly ONE terminal transition, other idempotent", async () => {
+    const cid = randomBytes(32);
+    const cr = randomBytes(32);
+    const nonceA = randomBytes(16);
+    const nonceB = randomBytes(16);
+
+    // Fire two concurrent transactions. SQLite serializes writers (DB-level
+    // lock); the second transaction's tombstone `create` fails with a
+    // unique-constraint violation → rollback → re-check isRevoked → idempotent.
+    const [r1, r2] = await Promise.all([
+      destroyStore.consumeDestroyAndRevoke(cr, cid, nonceA, "initiator", 0x01, 0x01),
+      destroyStore.consumeDestroyAndRevoke(cr, cid, nonceB, "initiator", 0x01, 0x01),
+    ]);
+
+    // Exactly ONE performed the terminal transition (idempotent: false).
+    const transitions = [r1, r2].filter(r => r.ok && !r.idempotent);
+    expect(transitions.length).toBe(1);
+
+    // The OTHER is idempotent (the circuit is already revoked by the winner).
+    const idempotents = [r1, r2].filter(r => r.ok && r.idempotent);
+    expect(idempotents.length).toBe(1);
+
+    // The circuit is durably revoked (exactly one tombstone in the DB).
+    expect(await destroyStore.isRevoked(cid, cr)).toBe(true);
+
+    // Exactly ONE nonce was consumed (the winner's). The loser's nonce
+    // was NOT consumed (the transaction rolled back). A retry with the
+    // loser's nonce would hit the isRevoked pre-check → idempotent.
+    const loserResult = transitions[0]!.ok && !transitions[0]!.idempotent
+      ? (r1 === transitions[0] ? r2 : r1)
+      : (r2 === transitions[0] ? r1 : r2);
+    expect(loserResult.ok).toBe(true);
+    if (loserResult.ok) expect(loserResult.idempotent).toBe(true);
+  });
+
+  test("two concurrent destroys with the SAME nonce → exactly ONE terminal transition, other idempotent", async () => {
+    const cid = randomBytes(32);
+    const cr = randomBytes(32);
+    const nonce = randomBytes(16); // SAME nonce
+
+    const [r1, r2] = await Promise.all([
+      destroyStore.consumeDestroyAndRevoke(cr, cid, nonce, "initiator", 0x01, 0x01),
+      destroyStore.consumeDestroyAndRevoke(cr, cid, nonce, "initiator", 0x01, 0x01),
+    ]);
+
+    // Exactly ONE performed the terminal transition.
+    const transitions = [r1, r2].filter(r => r.ok && !r.idempotent);
+    expect(transitions.length).toBe(1);
+
+    // The OTHER is idempotent.
+    const idempotents = [r1, r2].filter(r => r.ok && r.idempotent);
+    expect(idempotents.length).toBe(1);
+
+    expect(await destroyStore.isRevoked(cid, cr)).toBe(true);
+  });
+
+  test("three concurrent destroys with different nonces → exactly ONE terminal transition, two idempotent", async () => {
+    const cid = randomBytes(32);
+    const cr = randomBytes(32);
+
+    const results = await Promise.all([
+      destroyStore.consumeDestroyAndRevoke(cr, cid, randomBytes(16), "initiator", 0x01, 0x01),
+      destroyStore.consumeDestroyAndRevoke(cr, cid, randomBytes(16), "initiator", 0x01, 0x01),
+      destroyStore.consumeDestroyAndRevoke(cr, cid, randomBytes(16), "initiator", 0x01, 0x01),
+    ]);
+
+    const transitions = results.filter(r => r.ok && !r.idempotent);
+    expect(transitions.length).toBe(1);
+
+    const idempotents = results.filter(r => r.ok && r.idempotent);
+    expect(idempotents.length).toBe(2);
+
+    expect(await destroyStore.isRevoked(cid, cr)).toBe(true);
   });
 });

@@ -292,6 +292,17 @@ There is no false "durably revoked" state. Either the tombstone is
 persisted (circuit is durably dead + keys destroyed) or it is not (circuit
 is still live-but-expired, awaiting retry).
 
+**Expiry tombstones are SYSTEM-generated revocations, NOT initiator-
+authenticated CircuitDestroy evidence** (R-009 Stage 3 Phase 2 final). The
+expiry path writes the tombstone directly (no Ed25519 signature, no destroy
+nonce, `destroyerNodeId = "system"`, `destroyReason = CIRCUIT_EXPIRED`).
+This is distinct from an initiator/gateway-authenticated CircuitDestroy,
+which carries a signed wire object + a fresh destroy nonce. Both produce
+the same authoritative terminal state (`CIRCUIT_REVOKED`), but the evidence
+type differs — an audit trail can distinguish "the initiator explicitly
+destroyed this circuit" from "this circuit expired naturally" by inspecting
+the tombstone's `destroyReason` + `destroyerNodeId`.
+
 After a process restart, the durable revocation record ensures the
 circuit is still known to be dead. A revoked circuit MUST NOT be
 resurrected.
@@ -525,9 +536,18 @@ structure-only contract.
 2. `now < expiry` (strict; `now == expiry` → REJECT) — not expired.
 3. `expiry <= circuit.expiry` — does not exceed the circuit's actual expiry.
 
-A validly signed but expired/future-dated destroy is rejected with an explicit
-reason. The nonce is NOT consumed — a retry with a valid destroy (same nonce)
-will succeed.
+**Semantic validity (R-009 Stage 3 Phase 2 final — re-audit of 3536797):**
+The portable verifier `verifyCircuitDestroy` enforces, at the structural level
+(before the signature check):
+4. `issuedAt <= expiry` — a destroy issued after it expired is nonsensical.
+   This is a structural check on the destroy's validity (not a freshness check
+   — it doesn't depend on `now`). An attacker cannot construct a validly-signed
+   destroy with `issuedAt > expiry` that passes this check; the check catches
+   a buggy destroyer that set `issuedAt = expiry + 1` by mistake.
+
+A validly signed but expired/future-dated/semantically-invalid destroy is
+rejected with an explicit reason. The nonce is NOT consumed — a retry with a
+valid destroy (same nonce) will succeed.
 
 **Reason codes:**
 - `0x01` = `OPERATOR_INITIATED`
