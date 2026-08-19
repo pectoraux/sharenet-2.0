@@ -435,6 +435,119 @@ export function computeCommitmentRoot(
   return level[0]!;
 }
 
+// -----------------------------------------------------------------------
+// Merkle inclusion proof (R-009 Stage 2: portable gateway authorization)
+// -----------------------------------------------------------------------
+
+/**
+ * A Merkle inclusion proof element.
+ * Each element is a sibling hash + whether it's the left or right sibling.
+ */
+export interface MerkleProofElement {
+  /** The sibling hash (32 bytes). */
+  sibling: Uint8Array;
+  /** Whether the sibling is on the left (true) or right (false). */
+  isLeft: boolean;
+}
+
+/**
+ * Generate a Merkle inclusion proof for a specific acceptance leaf.
+ *
+ * The proof is a list of (sibling, isLeft) elements from the leaf to the root.
+ * The verifier recomputes the root by hashing the leaf with each sibling in order.
+ *
+ * @param proposal - the route proposal (for the proposal leaf)
+ * @param acceptances - all acceptances (for the acceptance leaves)
+ * @param hopIndex - which acceptance to generate the proof for
+ * @returns the Merkle proof elements + the computed commitmentRoot
+ */
+export function generateMerkleInclusionProof(
+  proposal: RouteProposal,
+  acceptances: RouteAcceptance[],
+  hopIndex: number,
+): { proof: MerkleProofElement[]; commitmentRoot: Uint8Array } {
+  // 1. Build the leaf level.
+  const leaves: Uint8Array[] = [computeProposalLeaf(proposal)];
+  for (let i = 0; i < acceptances.length; i++) {
+    leaves.push(computeAcceptanceLeaf(acceptances[i]!, i));
+  }
+
+  // The target leaf is at index hopIndex + 1 (leaf 0 is the proposal).
+  const targetIndex = hopIndex + 1;
+  const proof: MerkleProofElement[] = [];
+
+  // 2. Build the tree, recording siblings.
+  let level = leaves;
+  let currentIndex = targetIndex;
+  while (level.length > 1) {
+    const nextLevel: Uint8Array[] = [];
+    for (let i = 0; i < level.length; i += 2) {
+      const left = level[i]!;
+      const right = i + 1 < level.length ? level[i + 1]! : left; // duplicate last if odd
+      nextLevel.push(computeParent(left, right));
+
+      // If the current node is at this pair, record the sibling.
+      if (i === currentIndex || i + 1 === currentIndex) {
+        if (currentIndex === i) {
+          // Current is left, sibling is right.
+          proof.push({ sibling: right, isLeft: false });
+        } else {
+          // Current is right, sibling is left.
+          proof.push({ sibling: left, isLeft: true });
+        }
+      }
+    }
+    currentIndex = Math.floor(currentIndex / 2);
+    level = nextLevel;
+  }
+
+  return { proof, commitmentRoot: level[0]! };
+}
+
+/**
+ * Verify a Merkle inclusion proof.
+ *
+ * Recomputes the root from the leaf + the proof elements, then compares
+ * against the expected commitmentRoot.
+ *
+ * @param leaf - the acceptance leaf hash (32 bytes)
+ * @param proof - the Merkle proof elements
+ * @param expectedCommitmentRoot - the expected commitment_root (32 bytes)
+ * @returns true if the proof is valid (the leaf is included in the Merkle tree)
+ */
+export function verifyMerkleInclusionProof(
+  leaf: Uint8Array,
+  proof: MerkleProofElement[],
+  expectedCommitmentRoot: Uint8Array,
+): boolean {
+  let hash = leaf;
+  for (const element of proof) {
+    if (element.isLeft) {
+      // Sibling is on the left: parent = computeParent(sibling, hash)
+      hash = computeParent(element.sibling, hash);
+    } else {
+      // Sibling is on the right: parent = computeParent(hash, sibling)
+      hash = computeParent(hash, element.sibling);
+    }
+  }
+  // Constant-time comparison with the expected root.
+  if (hash.length !== expectedCommitmentRoot.length) return false;
+  let diff = 0;
+  for (let i = 0; i < hash.length; i++) diff |= hash[i]! ^ expectedCommitmentRoot[i]!;
+  return diff === 0;
+}
+
+/**
+ * Compute the acceptance leaf hash for a given acceptance + hopIndex.
+ * Exported so the gateway verifier can compute it from the authorization fields.
+ */
+export function computeAcceptanceLeafForVerification(
+  acceptance: RouteAcceptance,
+  hopIndex: number,
+): Uint8Array {
+  return computeAcceptanceLeaf(acceptance, hopIndex);
+}
+
 /**
  * Derive the canonical route_id from a commitment_root.
  *
