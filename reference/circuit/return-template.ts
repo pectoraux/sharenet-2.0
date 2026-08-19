@@ -80,6 +80,11 @@ import {
 import { DIRECTION_BACKWARD } from "./frame";
 import type { BrandedCommittedRoute } from "../transport/validated-types";
 import { isBrandedCommittedRoute } from "../transport/validated-types";
+import {
+  circuitAckSigningPayload,
+  routeCommitmentDigest,
+  type CircuitSetupAck,
+} from "./distributed-setup";
 
 // -----------------------------------------------------------------------
 // Constants (R-009 Stage 2 — return-onion template)
@@ -808,33 +813,38 @@ export function verifyGatewayReturnTemplate(
 }
 
 /**
- * Verify a GatewayReturnTemplate at the gateway, bound to the ACTUAL committed route.
+ * Verify a GatewayReturnTemplate at the gateway, bound to the ACTUAL committed route
+ * + the VERIFIED terminal CircuitSetupAck.
  *
  * This is the AUTHENTICATED GATEWAY VERIFIER — the gateway uses this to verify
  * that it is the actual terminal destination of the committed route, not merely
- * a supplied NodeId. It extends verifyGatewayReturnTemplate with route binding:
+ * a supplied NodeId. It verifies the COMPLETE proof chain:
  *
  *   0a. Verify the route is genuine (BrandedCommittedRoute WeakSet check).
  *   0b. Verify the template's commitmentRoot matches the route's commitmentRoot.
  *   0c. Verify the template's gatewayNodeId matches the route's terminal hop's NodeId.
- *   0d. Verify the template's gatewayX25519PublicKey matches the terminal hop's ack.
+ *   0d. VERIFY THE TERMINAL ACK'S Ed25519 SIGNATURE (the ack is a proof-bearing
+ *       artifact, not a bare { relayX25519PublicKey } — the gateway cannot accept
+ *       a forged plain object because the signature would fail).
+ *   0e. Verify the ack's routeId matches the route's routeId.
+ *   0f. Verify the ack's routeCommitmentDigest matches the route's digest.
+ *   0g. Verify the ack's hopIndex is the terminal hop index (route.hops.length - 1).
+ *   0h. Verify the ack's initiatorX25519PublicKey matches the template's.
+ *   0i. Verify the ack's relayX25519PublicKey matches the template's gatewayX25519PublicKey.
  *
  * Then it delegates to verifyGatewayReturnTemplate for the standard checks
  * (NodeId, X25519 key, expiry, signature, ECDH decrypt).
  *
- * This closes the authorization-boundary issue flagged in the re-audit of
- * 11d9e35: previously the verifier accepted a supplied gatewayNodeId without
- * verifying it's the actual terminal hop of the committed route. A valid
- * initiator could sign gatewayNodeId = G_fake and the fake gateway could
- * accept the template. Now the gateway cryptographically verifies:
- *   - the route is genuine (BrandedCommittedRoute WeakSet)
- *   - the commitmentRoot matches the route
- *   - the gatewayNodeId is the actual terminal hop
- *   - the X25519 key matches the terminal hop's authenticated ack
+ * Per the re-audit of e165ba2: the previous version accepted a bare
+ * { relayX25519PublicKey } structural type — an attacker could create a fake
+ * ack with any X25519 key. Now the verifier consumes a GENUINE CircuitSetupAck
+ * + the terminal relay's Ed25519 public key, and verifies the ack's signature
+ * before extracting the X25519 key. A forged ack fails the signature check.
  *
  * @param gatewayTemplate - the signed + confidential GatewayReturnTemplate wire object
  * @param route - the genuine BrandedCommittedRoute (the gateway verifies this)
- * @param terminalAck - the CircuitSetupAck from the terminal hop (carries relayX25519PublicKey)
+ * @param terminalAck - the FULL CircuitSetupAck from the terminal hop (proof-bearing)
+ * @param relayEd25519PublicKey - the terminal relay's Ed25519 public key (verifies the ack signature)
  * @param expectedGatewayNodeId - the gateway's own NodeId
  * @param gatewayX25519SecretKey - the gateway's own X25519 secret key
  * @param gatewayX25519PublicKey - the gateway's own X25519 public key
@@ -843,7 +853,8 @@ export function verifyGatewayReturnTemplate(
 export function verifyGatewayReturnTemplateWithRoute(
   gatewayTemplate: GatewayReturnTemplate,
   route: BrandedCommittedRoute,
-  terminalAck: { relayX25519PublicKey: Uint8Array },
+  terminalAck: CircuitSetupAck,
+  relayEd25519PublicKey: Uint8Array,
   expectedGatewayNodeId: string,
   gatewayX25519SecretKey: Uint8Array,
   gatewayX25519PublicKey: Uint8Array,
@@ -863,7 +874,8 @@ export function verifyGatewayReturnTemplateWithRoute(
   }
 
   // 0c. Verify the template's gatewayNodeId is the actual terminal hop.
-  const terminalHopNodeId = route.hops[route.hops.length - 1]!.nodeId;
+  const terminalHopIndex = route.hops.length - 1;
+  const terminalHopNodeId = route.hops[terminalHopIndex]!.nodeId;
   if (gatewayTemplate.gatewayNodeId !== terminalHopNodeId) {
     return {
       ok: false,
@@ -871,11 +883,70 @@ export function verifyGatewayReturnTemplateWithRoute(
     };
   }
 
-  // 0d. Verify the template's gatewayX25519PublicKey matches the terminal hop's ack.
-  if (!bytesEqual(gatewayTemplate.gatewayX25519PublicKey, terminalAck.relayX25519PublicKey)) {
+  // 0d. VERIFY THE TERMINAL ACK'S Ed25519 SIGNATURE.
+  // This is the critical proof-bearing check: the ack is signed by the terminal
+  // relay's Ed25519 key. A forged ack (with a different relayX25519PublicKey)
+  // will fail this signature check because the attacker doesn't have the relay's
+  // Ed25519 secret key. Per the re-audit of e165ba2: the previous version accepted
+  // a bare { relayX25519PublicKey } — now the verifier consumes the FULL
+  // CircuitSetupAck and verifies its signature.
+  const ackPayload = circuitAckSigningPayload(
+    terminalAck.routeId,
+    terminalAck.routeCommitmentDigestHex,
+    terminalAck.hopIndex,
+    terminalAck.relayX25519PublicKey,
+    terminalAck.initiatorX25519PublicKey,
+    terminalAck.possessionProofCiphertext,
+    terminalAck.possessionChallenge,
+    terminalAck.ackNonce,
+    terminalAck.ackTimestamp,
+    terminalAck.ackExpiry,
+  );
+  if (!verifySignature(relayEd25519PublicKey, ackPayload, terminalAck.relaySignature)) {
     return {
       ok: false,
-      reason: "gatewayX25519PublicKey does not match the terminal hop's CircuitSetupAck",
+      reason: "terminal CircuitSetupAck signature invalid (forged or tampered ack)",
+    };
+  }
+
+  // 0e. Verify the ack's routeId matches the route's routeId.
+  if (terminalAck.routeId !== route.routeId) {
+    return {
+      ok: false,
+      reason: "terminal ack routeId does not match the route",
+    };
+  }
+
+  // 0f. Verify the ack's routeCommitmentDigest matches the route's digest.
+  const expectedDigestHex = toHex(routeCommitmentDigest(route));
+  if (terminalAck.routeCommitmentDigestHex !== expectedDigestHex) {
+    return {
+      ok: false,
+      reason: "terminal ack routeCommitmentDigest does not match the route",
+    };
+  }
+
+  // 0g. Verify the ack's hopIndex is the terminal hop index.
+  if (terminalAck.hopIndex !== terminalHopIndex) {
+    return {
+      ok: false,
+      reason: `terminal ack hopIndex ${terminalAck.hopIndex} is not the terminal hop index ${terminalHopIndex}`,
+    };
+  }
+
+  // 0h. Verify the ack's initiatorX25519PublicKey matches the template's.
+  if (!bytesEqual(terminalAck.initiatorX25519PublicKey, gatewayTemplate.initiatorX25519PublicKey)) {
+    return {
+      ok: false,
+      reason: "terminal ack initiatorX25519PublicKey does not match the template's",
+    };
+  }
+
+  // 0i. Verify the ack's relayX25519PublicKey matches the template's gatewayX25519PublicKey.
+  if (!bytesEqual(terminalAck.relayX25519PublicKey, gatewayTemplate.gatewayX25519PublicKey)) {
+    return {
+      ok: false,
+      reason: "gatewayX25519PublicKey does not match the terminal hop's verified CircuitSetupAck",
     };
   }
 

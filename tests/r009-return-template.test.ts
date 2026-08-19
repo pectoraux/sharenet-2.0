@@ -62,6 +62,58 @@ function makeRelayX25519Keys(route: { hops: Array<{ nodeId: string }> }) {
   });
 }
 
+/**
+ * Generate a GENUINE proof-bearing `CircuitSetupAck` from the terminal hop of
+ * the route (the gateway). Per R-009 Stage 2 (re-audit of e165ba2):
+ * `verifyGatewayReturnTemplateWithRoute` now consumes the FULL ack + the
+ * terminal relay's Ed25519 public key — it verifies the ack's Ed25519
+ * signature before extracting the X25519 key. A forged ack (with a different
+ * `relayX25519PublicKey`) fails the signature check because the attacker
+ * doesn't have the relay's Ed25519 secret key.
+ *
+ * The ack is produced by `handleCircuitSetup`, which generates the relay's
+ * X25519 keypair internally. Since the gateway IS the terminal relay, the
+ * gateway's X25519 keypair IS the ack's relay X25519 keypair — the gateway
+ * keeps the secret (in `ackResult.state.relayX25519SecretKey`) and the public
+ * key travels in the ack (`ackResult.ack.relayX25519PublicKey`). The
+ * GatewayReturnTemplate is then signed against this X25519 public key.
+ *
+ * The circuit's `initiatorX25519PublicKey` is passed to `handleCircuitSetup`
+ * as the transcript-binding public key — this matches the
+ * `circuit.initiatorX25519SecretKey` used to sign the GatewayReturnTemplate
+ * (ECDH partner on the initiator side).
+ */
+function makeTerminalAck(
+  route: ReturnType<typeof makeRoute>,
+  circuit: { initiatorX25519PublicKey: Uint8Array },
+): {
+  terminalAck: CircuitSetupAck;
+  relayEd25519PublicKey: Uint8Array;
+  gatewayX25519SecretKey: Uint8Array;
+  gatewayX25519PublicKey: Uint8Array;
+} {
+  const terminalHopIndex = route.branded.hops.length - 1;
+  const relayKp = route.kps[terminalHopIndex]!;
+  const ackResult = handleCircuitSetup(
+    {
+      route: route.branded,
+      hopIndex: terminalHopIndex,
+      initiatorX25519PublicKey: circuit.initiatorX25519PublicKey,
+      setupNonce: randomBytes(16),
+    },
+    relayKp.secretKey,
+    route.commitmentRoot,
+    NOW,
+  );
+  if (!ackResult.ok) throw new Error(`terminal ack setup failed: ${ackResult.reason}`);
+  return {
+    terminalAck: ackResult.ack,
+    relayEd25519PublicKey: relayKp.publicKey,
+    gatewayX25519SecretKey: ackResult.state.relayX25519SecretKey,
+    gatewayX25519PublicKey: ackResult.state.relayX25519PublicKey,
+  };
+}
+
 describe("R-009 Stage 2: distributed return-onion template", () => {
   test("initiator constructs template; gateway holds K_ret + opaque envelope (NOT returnKeys)", () => {
     const route = makeRoute(2);
@@ -784,21 +836,29 @@ describe("R-009 Stage 2: route-bound gateway verification (verifyGatewayReturnTe
     const template = constructReturnOnionTemplate(circuit);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
-    const gatewayX25519Sk = randomBytes(32);
-    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    // The terminal hop (the gateway) produces a GENUINE proof-bearing
+    // CircuitSetupAck via handleCircuitSetup. The ack carries the gateway's
+    // X25519 public key + the terminal relay's Ed25519 signature over it.
+    // The gateway's X25519 secret key is held in ackResult.state.
+    const {
+      terminalAck, relayEd25519PublicKey,
+      gatewayX25519SecretKey, gatewayX25519PublicKey,
+    } = makeTerminalAck(route, circuit);
 
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
-      gatewayX25519Pk,
+      gatewayX25519PublicKey,
       circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
-    const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
-
+    // Verifier consumes the FULL ack + the terminal relay's Ed25519 public key.
+    // It verifies the ack's signature before extracting the X25519 key —
+    // a forged ack would fail the signature check.
     const result = verifyGatewayReturnTemplateWithRoute(
-      gt, route.branded, terminalAck,
-      gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
+      gt, route.branded, terminalAck, relayEd25519PublicKey,
+      gatewayNodeId, gatewayX25519SecretKey, gatewayX25519PublicKey, NOW,
     );
     expect(result.ok).toBe(true);
   });
@@ -810,22 +870,29 @@ describe("R-009 Stage 2: route-bound gateway verification (verifyGatewayReturnTe
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const template = constructReturnOnionTemplate(circuit);
     const initiatorKp = generateNodeKeypair();
-    const gatewayX25519Sk = randomBytes(32);
-    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
     const fakeNodeId = "fake-gateway-nodeid";
+
+    // Genuine terminal ack for the real terminal hop (the gateway's actual
+    // Ed25519 identity in the route). The ack signature verifies against
+    // route.kps[terminalHopIndex].publicKey — but the gatewayTemplate below
+    // is signed with a DIFFERENT (fake) NodeId, so the verifier rejects at
+    // step 0c (gatewayNodeId != route's terminal hop NodeId) BEFORE the ack
+    // signature check.
+    const {
+      terminalAck, relayEd25519PublicKey,
+      gatewayX25519SecretKey, gatewayX25519PublicKey,
+    } = makeTerminalAck(route, circuit);
 
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, fakeNodeId,
-      gatewayX25519Pk,
+      gatewayX25519PublicKey,
       circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
-    const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
-
     const result = verifyGatewayReturnTemplateWithRoute(
-      gt, route.branded, terminalAck,
-      fakeNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
+      gt, route.branded, terminalAck, relayEd25519PublicKey,
+      fakeNodeId, gatewayX25519SecretKey, gatewayX25519PublicKey, NOW,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("not the terminal hop");
@@ -840,21 +907,26 @@ describe("R-009 Stage 2: route-bound gateway verification (verifyGatewayReturnTe
     const templateA = constructReturnOnionTemplate(circuitA);
     const gatewayNodeId = routeA.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
-    const gatewayX25519Sk = randomBytes(32);
-    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    // Genuine terminal ack for routeA's terminal hop. The verifier is then
+    // called with routeB — the gatewayTemplate's commitmentRoot (routeA's)
+    // doesn't match routeB's commitmentRoot → step 0b rejects BEFORE the ack
+    // signature is even checked.
+    const {
+      terminalAck, relayEd25519PublicKey,
+      gatewayX25519SecretKey, gatewayX25519PublicKey,
+    } = makeTerminalAck(routeA, circuitA);
 
     const gt = signGatewayReturnTemplate(
       templateA, routeA.branded.expiry, gatewayNodeId,
-      gatewayX25519Pk,
+      gatewayX25519PublicKey,
       circuitA.initiatorX25519SecretKey, circuitA.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
-    const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
-
     const result = verifyGatewayReturnTemplateWithRoute(
-      gt, routeB.branded, terminalAck,
-      gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
+      gt, routeB.branded, terminalAck, relayEd25519PublicKey,
+      gatewayNodeId, gatewayX25519SecretKey, gatewayX25519PublicKey, NOW,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("commitmentRoot mismatch");
@@ -868,22 +940,34 @@ describe("R-009 Stage 2: route-bound gateway verification (verifyGatewayReturnTe
     const template = constructReturnOnionTemplate(circuit);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
-    const realGatewaySk = randomBytes(32);
-    const realGatewayPk = x25519.getPublicKey(realGatewaySk);
-    const wrongPk = x25519.getPublicKey(randomBytes(32));
+
+    // Genuine terminal ack — its relayX25519PublicKey is generated internally
+    // by handleCircuitSetup and is signed by the terminal relay's Ed25519 key.
+    // An attacker CANNOT forge an ack with a different relayX25519PublicKey
+    // (the ack signature would fail). The only way the gatewayTemplate's
+    // gatewayX25519PublicKey can differ from the ack's relayX25519PublicKey is
+    // if the initiator signed the template against a DIFFERENT key — which is
+    // exactly the identity-to-key substitution attack the new check blocks.
+    const { terminalAck, relayEd25519PublicKey } = makeTerminalAck(route, circuit);
+
+    // Attacker-controlled X25519 keypair (NOT the ack's relayX25519PublicKey).
+    const attackerSk = randomBytes(32);
+    const attackerPk = x25519.getPublicKey(attackerSk);
 
     const gt = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
-      realGatewayPk,
+      attackerPk, // DIFFERENT from terminalAck.relayX25519PublicKey
       circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
 
-    const terminalAck = { relayX25519PublicKey: wrongPk } as any;
-
+    // Verifier uses the genuine terminalAck (signature verifies against
+    // relayEd25519PublicKey) but the template's gatewayX25519PublicKey
+    // (attackerPk) doesn't match the ack's relayX25519PublicKey → step 0i
+    // rejects AFTER the ack signature check (step 0d) passes.
     const result = verifyGatewayReturnTemplateWithRoute(
-      gt, route.branded, terminalAck,
-      gatewayNodeId, realGatewaySk, realGatewayPk, NOW,
+      gt, route.branded, terminalAck, relayEd25519PublicKey,
+      gatewayNodeId, attackerSk, attackerPk, NOW,
     );
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("does not match the terminal hop");
@@ -904,14 +988,22 @@ describe("R-009 Stage 2: real distributed transport (wire bytes → decode → v
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
-    const gatewayX25519Sk = randomBytes(32);
-    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    // 0. RELAY (terminal hop) produces a GENUINE proof-bearing CircuitSetupAck.
+    //    The gateway IS the terminal relay — it keeps the relayX25519SecretKey
+    //    (from ackResult.state) and uses it to decrypt K_ret during verify.
+    const {
+      terminalAck, relayEd25519PublicKey,
+      gatewayX25519SecretKey, gatewayX25519PublicKey,
+    } = makeTerminalAck(route, circuit);
 
     // 1. INITIATOR: construct template + sign gateway transfer.
+    //    The template is signed against the ack's relayX25519PublicKey (the
+    //    gateway's X25519 public key) so the proof-bearing binding holds.
     const template = constructReturnOnionTemplate(circuit);
     const gatewayTemplate = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
-      gatewayX25519Pk,
+      gatewayX25519PublicKey,
       circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
@@ -924,15 +1016,17 @@ describe("R-009 Stage 2: real distributed transport (wire bytes → decode → v
     expect(decoded.ok).toBe(true);
     if (!decoded.ok) return;
 
-    // 4. GATEWAY: verifies the transfer against the committed route + terminal ack.
-    const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
+    // 4. GATEWAY: verifies the transfer against the committed route + the
+    //    GENUINE terminal ack + the terminal relay's Ed25519 public key.
+    //    The ack signature is verified (step 0d) before any binding check.
     const verifyResult = verifyGatewayReturnTemplateWithRoute(
       decoded.gatewayTemplate,
       route.branded,
       terminalAck,
+      relayEd25519PublicKey,
       gatewayNodeId,
-      gatewayX25519Sk,
-      gatewayX25519Pk,
+      gatewayX25519SecretKey,
+      gatewayX25519PublicKey,
       NOW,
     );
     expect(verifyResult.ok).toBe(true);
@@ -969,13 +1063,17 @@ describe("R-009 Stage 2: real distributed transport (wire bytes → decode → v
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
     const gatewayNodeId = route.branded.hops[1]!.nodeId;
     const initiatorKp = generateNodeKeypair();
-    const gatewayX25519Sk = randomBytes(32);
-    const gatewayX25519Pk = x25519.getPublicKey(gatewayX25519Sk);
+
+    // 0. RELAY (terminal hop) produces a GENUINE proof-bearing CircuitSetupAck.
+    const {
+      terminalAck, relayEd25519PublicKey,
+      gatewayX25519SecretKey, gatewayX25519PublicKey,
+    } = makeTerminalAck(route, circuit);
 
     const template = constructReturnOnionTemplate(circuit);
     const gatewayTemplate = signGatewayReturnTemplate(
       template, route.branded.expiry, gatewayNodeId,
-      gatewayX25519Pk,
+      gatewayX25519PublicKey,
       circuit.initiatorX25519SecretKey, circuit.initiatorX25519PublicKey,
       initiatorKp.secretKey, initiatorKp.publicKey,
     );
@@ -985,10 +1083,14 @@ describe("R-009 Stage 2: real distributed transport (wire bytes → decode → v
 
     const decoded = decodeGatewayReturnTemplate(wireBytes);
     if (decoded.ok) {
-      const terminalAck = { relayX25519PublicKey: gatewayX25519Pk } as any;
+      // The genuine terminal ack + relayEd25519PublicKey are passed to the
+      // route-bound verifier. The tampered wire bytes break either the
+      // signature check (step 4 inside verifyGatewayReturnTemplate) or one
+      // of the route-binding checks — either way, verify must reject.
       const result = verifyGatewayReturnTemplateWithRoute(
         decoded.gatewayTemplate, route.branded, terminalAck,
-        gatewayNodeId, gatewayX25519Sk, gatewayX25519Pk, NOW,
+        relayEd25519PublicKey,
+        gatewayNodeId, gatewayX25519SecretKey, gatewayX25519PublicKey, NOW,
       );
       expect(result.ok).toBe(false);
     }
