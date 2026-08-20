@@ -44,7 +44,7 @@
  *     sockets, Prisma, or the platform.
  */
 
-import { processCircuitDestroy, propagationDirection, type CircuitDestroy, type ProcessCircuitDestroyResult } from "./destroy";
+import { processCircuitDestroy, propagationDirection, verifyCircuitDestroy, decodeCircuitDestroy, type CircuitDestroy, type ProcessCircuitDestroyResult } from "./destroy";
 import type { ActiveCircuit } from "./circuit";
 import type { CircuitDestroyStore } from "./replay-stores";
 import type { AuthenticatedLink } from "../transport/authenticated-link";
@@ -699,6 +699,106 @@ export type PropagateCircuitDestroyResult =
   | { ok: true; action: "ALREADY_REVOKED"; propagated: false; wireBytes: Uint8Array; direction: "FORWARD" | "BACKWARD" }
   | { ok: true; action: "REVOKED"; terminal: true; wireBytes: Uint8Array; direction: "FORWARD" | "BACKWARD" }
   | { ok: false; reason: string };
+
+// -----------------------------------------------------------------------
+// receiveAuthenticatedCircuitDestroy — the canonical production receive path
+// -----------------------------------------------------------------------
+
+/**
+ * The result of the canonical production receive path.
+ *
+ * On success, the receiver has VERIFIED:
+ *   - the PropagationChannelProof signature + identity binding
+ *   - the peer binding (receiverNodeId === localNodeId, senderNodeId === expectedRemoteNodeId)
+ *   - the circuit binding (circuitId + commitmentRoot)
+ *   - the destroyDigest (BLAKE3 of the EXACT raw destroy bytes)
+ *   - the CircuitDestroy authenticity (signature + routeId + role + semantic validity)
+ *   - the DIRECTION (proof.direction === propagationDirection(destroy.destroyerRole))
+ *
+ * The `wireBytes` is the EXACT raw bytes received — byte-for-byte, no re-encoding.
+ * The `proof` is the verified PropagationChannelProof.
+ * The `destroy` is the decoded + verified CircuitDestroy.
+ * The `direction` is derived from the signed `destroyerRole` — NOT caller-supplied.
+ */
+export type ReceiveAuthenticatedCircuitDestroyResult =
+  | {
+      ok: true;
+      wireBytes: Uint8Array;
+      proof: PropagationChannelProof;
+      destroy: CircuitDestroy;
+      direction: "FORWARD" | "BACKWARD";
+    }
+  | { ok: false; reason: string };
+
+/**
+ * The CANONICAL PRODUCTION RECEIVE function. Owns the FULL receive pipeline:
+ *
+ *   1. transport.receive(ctx) — receives the raw proof + raw destroy bytes
+ *      over the authenticated transport. The transport verifies:
+ *        - proof signature + identity binding
+ *        - peer binding (receiverNodeId === ctx.localNodeId, senderNodeId === ctx.expectedRemoteNodeId)
+ *        - circuit binding (circuitId + commitmentRoot)
+ *        - destroyDigest (BLAKE3 of the EXACT raw destroy bytes)
+ *   2. decodeCircuitDestroy(rawWireBytes) — decode the destroy.
+ *   3. verifyCircuitDestroy(destroy) — verify the destroy's signature + routeId +
+ *      role + semantic validity (issuedAt <= expiry).
+ *   4. propagationDirection(destroy.destroyerRole) — derive the direction from
+ *      the SIGNED destroyerRole (NOT caller-supplied).
+ *   5. verifyPropagationDirection(proof, destroy) — verify the proof's
+ *      direction matches the derived direction.
+ *   6. Return the authenticated destroy artifact (wireBytes + proof + destroy +
+ *      direction).
+ *
+ * A caller CANNOT obtain an authenticated destroy from the transport while
+ * direction remains unchecked — this function owns the direction check.
+ *
+ * @param transport - the authenticated transport
+ * @param ctx - the receiver's authenticated receive context
+ */
+export async function receiveAuthenticatedCircuitDestroy(
+  transport: CircuitDestroyTransport,
+  ctx: AuthenticatedReceiveContext,
+): Promise<ReceiveAuthenticatedCircuitDestroyResult> {
+  // 1. Receive the raw proof + raw destroy bytes over the authenticated transport.
+  //    The transport verifies: proof signature + identity + peer + circuit +
+  //    route + destroyDigest. If ANY of these fail, receive returns { ok: false }.
+  const receiveResult = await transport.receive(ctx);
+  if (!receiveResult.ok) {
+    return { ok: false, reason: `receive failed: ${receiveResult.reason}` };
+  }
+  const { wireBytes, proof } = receiveResult;
+
+  // 2. Decode the CircuitDestroy from the raw bytes.
+  const decoded = decodeCircuitDestroy(wireBytes);
+  if (!decoded.ok) {
+    return { ok: false, reason: `destroy decode failed: ${decoded.reason}` };
+  }
+  const destroy = decoded.circuitDestroy;
+
+  // 3. Verify the CircuitDestroy authenticity (signature + routeId + role +
+  //    semantic validity). This is the portable verifier — it does NOT do
+  //    authorization (the production path processCircuitDestroy does that).
+  const verifyResult = verifyCircuitDestroy(destroy);
+  if (!verifyResult.ok) {
+    return { ok: false, reason: `destroy verification failed: ${verifyResult.reason}` };
+  }
+
+  // 4. Derive the propagation direction from the SIGNED destroyerRole.
+  //    NOT caller-supplied — the direction is protocol state.
+  const direction = propagationDirection(destroy);
+
+  // 5. Verify the proof's direction matches the derived direction.
+  //    A proof with the wrong direction (e.g., a BACKWARD proof for a FORWARD
+  //    destroy) is REJECTED. This prevents an attacker from redirecting
+  //    propagation by tampering with the proof's direction field.
+  const dirResult = verifyPropagationDirection(proof, destroy);
+  if (!dirResult.ok) {
+    return { ok: false, reason: dirResult.reason };
+  }
+
+  // 6. Return the authenticated destroy artifact.
+  return { ok: true, wireBytes, proof, destroy, direction };
+}
 
 /**
  * The production destroy-propagation path.

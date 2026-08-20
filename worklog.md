@@ -2832,3 +2832,41 @@ Verification (all five required suites):
 
 Stage Summary:
 - The PropagationChannelProof now cryptographically authenticates: sender, receiver, circuit, route, direction, AND the EXACT CircuitDestroy event (via destroyDigest = BLAKE3(exact wire bytes)). An attacker cannot substitute a different destroy, mutate bytes, forge a proof, copy a proof from another circuit, or redirect propagation via direction tampering. The direction is derived from the signed destroyerRole — NOT caller-supplied.
+
+---
+Task ID: R009-S3-P3-production-direction
+Agent: orchestrator
+Task: R-009 Stage 3 Phase 3 — move direction verification into the production receive path.
+
+Work Log:
+- Audited 90036a7: confirmed verifyPropagationDirection exists but has NO production caller. The multi-process test called it itself (test-side). The production receive path was: transport.receive() → returns {proof, wireBytes} → caller responsible for direction → processCircuitDestroy(). Unacceptable — direction is security-critical.
+
+Fix: Added `receiveAuthenticatedCircuitDestroy()` — the canonical production receive function in reference/circuit/propagation.ts. Owns the FULL receive pipeline:
+  1. transport.receive(ctx) — receives raw proof + raw destroy bytes. Transport verifies: proof signature + identity + peer + circuit + route + destroyDigest.
+  2. decodeCircuitDestroy(rawWireBytes) — decode the destroy.
+  3. verifyCircuitDestroy(destroy) — verify signature + routeId + role + semantic validity.
+  4. propagationDirection(destroy.destroyerRole) — derive direction from the SIGNED destroyerRole (NOT caller-supplied).
+  5. verifyPropagationDirection(proof, destroy) — verify proof.direction === derived direction.
+  6. Return authenticated destroy artifact (wireBytes + proof + destroy + direction).
+
+A caller CANNOT obtain an authenticated destroy while direction remains unchecked — this function owns the direction check. Returns ReceiveAuthenticatedCircuitDestroyResult (ok + wireBytes + proof + destroy + direction | ok: false + reason).
+
+Updated the PARTICIPANT_SCRIPT: replaced the test-side transport.receive() + decodeCircuitDestroy() + verifyPropagationDirection() sequence with a single call to receiveAuthenticatedCircuitDestroy(). The test no longer calls verifyPropagationDirection itself.
+
+Adversarial tests (+4, proving the PRODUCTION path rejects direction mismatch WITHOUT the test calling verifyPropagationDirection):
+- PRODUCTION receiveAuthenticatedCircuitDestroy ACCEPTS correct FORWARD direction
+- PRODUCTION receiveAuthenticatedCircuitDestroy REJECTS BACKWARD proof + FORWARD destroy
+- PRODUCTION receiveAuthenticatedCircuitDestroy REJECTS FORWARD proof + BACKWARD destroy
+- PRODUCTION receiveAuthenticatedCircuitDestroy REJECTS same-circuit opposite-direction proof
+
+These tests use the InProcessCircuitDestroyTransport to send a destroy with a WRONG direction in the ctx, then call receiveAuthenticatedCircuitDestroy (the production function). The production function catches the mismatch — the test does NOT call verifyPropagationDirection directly.
+
+Verification (all five required suites):
+- Unit tests: 556 pass / 0 fail (was 552; +4 production direction tests). 2046 expect() calls across 33 files.
+- Architecture tests: 24/24 pass.
+- TS conformance vectors: 41/41 pass.
+- Python conformance vectors: 41/41 pass.
+- Lint: clean (exit 0).
+
+Stage Summary:
+- The production receive path — receiveAuthenticatedCircuitDestroy() — now OWNS direction enforcement. A caller cannot obtain an authenticated destroy from the transport while direction remains unchecked. The direction is derived from the signed destroyerRole (NOT caller-supplied) + verified against the proof's direction inside the production function. The multi-process tests use this canonical function; the test no longer calls verifyPropagationDirection itself.
