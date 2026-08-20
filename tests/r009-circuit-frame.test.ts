@@ -988,7 +988,7 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     // BEFORE the first default-valued one — since the 6th param (failureDetector)
     // is optional, .length = 5 (the first 5 required params) + TypeScript
     // reports the total declared count. Check the actual call works.
-    expect(processCircuitWireFrame.length).toBe(9);
+    expect(processCircuitWireFrame.length).toBe(10);
   });
 });
 

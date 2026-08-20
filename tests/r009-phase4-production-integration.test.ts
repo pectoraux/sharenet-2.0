@@ -1,15 +1,15 @@
 /**
  * ShareNet 2.0 — R-009 Stage 3 Phase 4: PRODUCTION failure-detection integration tests.
  *
- * These tests prove the ACTUAL production chain:
+ * These tests prove the ACTUAL production chain using the FailureEventDispatcher:
  *
  *   REAL socket/protocol failure
  *       ↓
- *   LinkFailureDetector (production path)
+ *   FailureEventDispatcher.recordObservation() (PRODUCTION — inline dispatch)
  *       ↓
  *   LINK_DOWN
  *       ↓
- *   durable circuit invalidation
+ *   durable circuit invalidation (INLINE — no manual dispatch)
  *       ↓
  *   zeroize
  *       ↓
@@ -17,46 +17,25 @@
  *       ↓
  *   RecoveryPlan
  *
- * The tests do NOT directly call recordObservation(), handleLinkEvent(), or
- * invalidateCircuitOnFailure() to simulate failures. The production code
- * paths (socket error → detector, AEAD failure → detector, drainEvents →
- * invalidation → RecoveryManager) generate the events.
+ * The tests do NOT directly call dispatchFailureEvents(), invalidateCircuitOnFailure(),
+ * or RecoveryManager.handleLinkEvent(). The dispatcher records the observation
+ * AND immediately dispatches — the production code path owns the entire chain.
  */
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createServer } from "node:net";
-import { join } from "node:path";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { randomBytes, generateNodeKeypair } from "@reference/identity/keys";
+import { randomBytes } from "@reference/identity/keys";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { toHex } from "@reference/encoding/cbor";
-import {
-  setupCircuit,
-} from "@reference/circuit/circuit";
-import {
-  sealForwardFrame,
-  encodeCircuitFrame,
-  DIRECTION_FORWARD,
-} from "@reference/circuit/frame";
-import {
-  processCircuitWireFrame,
-} from "@reference/circuit/forwarding";
-import {
-  LinkFailureDetector,
-  dispatchFailureEvents,
-} from "@reference/failure/link-failure-detector";
+import { setupCircuit } from "@reference/circuit/circuit";
+import { sealForwardFrame, encodeCircuitFrame } from "@reference/circuit/frame";
+import { processCircuitWireFrame } from "@reference/circuit/forwarding";
+import { LinkFailureDetector as LFD, type CircuitLinkAssociation, FailureEventDispatcher as FED } from "@reference/failure/failure-event-dispatcher";
 import { InMemoryCircuitDestroyStore, InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import { RecoveryManager, createRecoveryPlan, type GatewayCandidate } from "@reference/routing/recovery";
-import { zeroizeCircuit } from "@reference/circuit/zeroize";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
 
 const NOW = 1786876545;
-let tmpDir: string;
-
-beforeAll(() => { tmpDir = mkdtempSync(join(tmpdir(), "sharenet-p4-prod-")); });
-afterAll(() => { try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ } });
 
 function makeRoute(numHops = 1) {
   const ctx = makeGenuineBrandedRouteHelper(numHops, NOW);
@@ -76,81 +55,81 @@ function makeRelayX25519Keys(route: { hops: Array<{ nodeId: string }> }) {
   });
 }
 
+// Helper: create a fully-wired dispatcher (detector + associations + store + RecoveryManager).
+function createDispatcher(circuit: any, route: any) {
+  const detector = new LFD();
+  const destroyStore = new InMemoryCircuitDestroyStore();
+  const rm = new RecoveryManager();
+  rm.registerLink("link-1", "node-a", "node-b");
+  rm.registerRoute(route.branded as any, toHex(circuit.circuitId), ["link-1"], NOW);
+
+  const associations = new Map<string, CircuitLinkAssociation[]>([
+    ["link-1", [{ circuitId: circuit.circuitId, commitmentRoot: circuit.commitmentRoot, circuitObj: circuit }]],
+  ]);
+
+  const dispatcher = new FED(detector, associations, destroyStore, rm);
+  return { dispatcher, detector, destroyStore, rm };
+}
+
 // =====================================================================
-// Phase 9: REAL AEAD failure → detector → threshold → LINK_DOWN
+// AEAD threshold integration — production path via processCircuitWireFrame
 // =====================================================================
 
-describe("R-009 Phase 4 PRODUCTION: AEAD failure threshold integration", () => {
-  test("3 tampered frames via processCircuitWireFrame → detector LINK_DOWN → durable revoke → zeroize → RecoveryPlan", async () => {
+describe("R-009 Phase 4 PRODUCTION: AEAD threshold via processCircuitWireFrame + dispatcher", () => {
+  test("3 tampered frames → DEGRADED → DEGRADED → LINK_DOWN → durable revoke → zeroize → RecoveryPlan (NO manual dispatch)", async () => {
     const route = makeRoute(1);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
-    const destroyStore = new InMemoryCircuitDestroyStore();
-    const detector = new LinkFailureDetector();
-    const rm = new RecoveryManager();
-
-    // Register the link + route with RecoveryManager.
-    rm.registerLink("link-1", "node-a", "node-b");
-    rm.registerRoute(route.branded as any, toHex(circuit.circuitId), ["link-1"], NOW);
-
-    // Associate the circuit with link-1.
-    const circuitAssociations = new Map([
-      ["link-1", [{ circuitId: circuit.circuitId, commitmentRoot: circuit.commitmentRoot, circuitObj: circuit }]],
-    ]);
+    const { dispatcher, destroyStore, rm } = createDispatcher(circuit, route);
 
     // Seal a valid frame.
     const plaintext = new TextEncoder().encode("test");
     const sealed = sealForwardFrame(circuit, 1, plaintext);
-    const wireBytes = encodeCircuitFrame(sealed);
 
-    // --- Frame 1: tamper the ciphertext → AEAD failure ---
+    // --- Frame 1: tamper → AEAD failure → DEGRADED (via production path) ---
     const tampered1 = { ...sealed, ciphertext: new Uint8Array([...sealed.ciphertext].map((b, i) => i === 0 ? b ^ 0x01 : b)) };
-    const wire1 = encodeCircuitFrame(tampered1);
-    const result1 = await processCircuitWireFrame(circuit, 0, wire1, destroyStore, NOW, detector, "link-1", "node-a", "node-b");
-    expect(result1.ok).toBe(false); // AEAD failure
-    expect(detector.getState("link-1")).toBe("DEGRADED"); // 1 failure → DEGRADED
-
-    // Dispatch events (should be a DEGRADED event → forwarded to RecoveryManager, no invalidation).
-    const dispatch1 = await dispatchFailureEvents(detector, circuitAssociations, destroyStore, rm);
-    expect(dispatch1.invalidatedCircuits.length).toBe(0); // NOT invalidated yet
-
-    // The circuit is still ACTIVE.
+    const result1 = await processCircuitWireFrame(
+      circuit, 0, encodeCircuitFrame(tampered1), destroyStore, NOW,
+      dispatcher, undefined, "link-1", "node-a", "node-b",
+    );
+    expect(result1.ok).toBe(false);
+    expect(dispatcher.getState("link-1")).toBe("DEGRADED");
+    // Circuit is still ACTIVE (no manual dispatch needed — the dispatcher did NOT invalidate yet).
     expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
 
-    // --- Frame 2: another tampered frame ---
+    // --- Frame 2: another tampered frame → still DEGRADED ---
     const tampered2 = { ...sealed, ciphertext: new Uint8Array([...sealed.ciphertext].map((b, i) => i === 1 ? b ^ 0x02 : b)) };
-    const wire2 = encodeCircuitFrame(tampered2);
-    const result2 = await processCircuitWireFrame(circuit, 0, wire2, destroyStore, NOW, detector, "link-1", "node-a", "node-b");
+    const result2 = await processCircuitWireFrame(
+      circuit, 0, encodeCircuitFrame(tampered2), destroyStore, NOW,
+      dispatcher, undefined, "link-1", "node-a", "node-b",
+    );
     expect(result2.ok).toBe(false);
-    expect(detector.getState("link-1")).toBe("DEGRADED"); // 2 failures → still DEGRADED
+    expect(dispatcher.getState("link-1")).toBe("DEGRADED");
+    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
 
-    await dispatchFailureEvents(detector, circuitAssociations, destroyStore, rm);
-    expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false); // still ACTIVE
-
-    // --- Frame 3: third tampered frame → threshold reached → LINK_DOWN ---
+    // --- Frame 3: third tampered frame → threshold → LINK_DOWN ---
+    // The dispatcher records the observation + IMMEDIATELY dispatches:
+    // durable invalidation + zeroize + RecoveryManager — INLINE, no manual call.
     const tampered3 = { ...sealed, ciphertext: new Uint8Array([...sealed.ciphertext].map((b, i) => i === 2 ? b ^ 0x04 : b)) };
-    const wire3 = encodeCircuitFrame(tampered3);
-    const result3 = await processCircuitWireFrame(circuit, 0, wire3, destroyStore, NOW, detector, "link-1", "node-a", "node-b");
+    const result3 = await processCircuitWireFrame(
+      circuit, 0, encodeCircuitFrame(tampered3), destroyStore, NOW,
+      dispatcher, undefined, "link-1", "node-a", "node-b",
+    );
     expect(result3.ok).toBe(false);
-    expect(detector.getState("link-1")).toBe("LINK_DOWN"); // 3 failures → LINK_DOWN
+    expect(dispatcher.getState("link-1")).toBe("LINK_DOWN");
 
-    // Dispatch events → the detector emits LINK_DOWN → dispatchFailureEvents
-    // calls invalidateCircuitOnFailure + RecoveryManager.handleLinkEvent.
-    const dispatch3 = await dispatchFailureEvents(detector, circuitAssociations, destroyStore, rm);
-    expect(dispatch3.invalidatedCircuits.length).toBe(1); // circuit invalidated
-
-    // The circuit is durably revoked.
+    // The dispatcher ALREADY dispatched — circuit is durably revoked (NO manual dispatchFailureEvents call).
     expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
 
-    // Keys were zeroized (circuitObj was provided).
+    // Keys were zeroized (the dispatcher did it inline).
     expect(circuit.hops[0]!.forwardingKey.every((b) => b === 0)).toBe(true);
 
-    // RecoveryManager: the route should be invalidated.
+    // RecoveryManager received the event — route invalidated.
     const invalidatedRoutes = rm.getInvalidatedRoutes();
     expect(invalidatedRoutes.length).toBeGreaterThan(0);
 
-    // A RecoveryPlan can be created (descriptive, no execution).
+    // RecoveryPlan can be created (NO execution).
     const plan = createRecoveryPlan(
       invalidatedRoutes.map(r => r.routeId),
       "LINK_DOWN",
@@ -160,49 +139,46 @@ describe("R-009 Phase 4 PRODUCTION: AEAD failure threshold integration", () => {
     expect(plan.invalidatedRouteIds.length).toBeGreaterThan(0);
   });
 
-  test("1 good frame after DEGRADED resets suspicion", async () => {
+  test("1 good frame after DEGRADED → resets suspicion (NO manual dispatch)", async () => {
     const route = makeRoute(1);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
-    const destroyStore = new InMemoryCircuitDestroyStore();
-    const detector = new LinkFailureDetector();
+    const { dispatcher, destroyStore } = createDispatcher(circuit, route);
 
     // 1 bad frame → DEGRADED.
     const sealed = sealForwardFrame(circuit, 1, new TextEncoder().encode("test"));
     const tampered = { ...sealed, ciphertext: new Uint8Array([...sealed.ciphertext].map((b, i) => i === 0 ? b ^ 0x01 : b)) };
-    await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(tampered), destroyStore, NOW, detector, "link-1", "node-a", "node-b");
-    expect(detector.getState("link-1")).toBe("DEGRADED");
+    await processCircuitWireFrame(
+      circuit, 0, encodeCircuitFrame(tampered), destroyStore, NOW,
+      dispatcher, undefined, "link-1", "node-a", "node-b",
+    );
+    expect(dispatcher.getState("link-1")).toBe("DEGRADED");
 
-    // 1 good frame → HEALTHY (reset).
-    const goodResult = await processCircuitWireFrame(circuit, 0, encodeCircuitFrame(sealed), destroyStore, NOW, detector, "link-1", "node-a", "node-b");
+    // 1 good frame → HEALTHY (reset — the dispatcher did it inline).
+    const goodResult = await processCircuitWireFrame(
+      circuit, 0, encodeCircuitFrame(sealed), destroyStore, NOW,
+      dispatcher, undefined, "link-1", "node-a", "node-b",
+    );
     expect(goodResult.ok).toBe(true);
-    expect(detector.getState("link-1")).toBe("HEALTHY");
-
-    // Circuit is still ACTIVE.
+    expect(dispatcher.getState("link-1")).toBe("HEALTHY");
     expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(false);
   });
 });
 
 // =====================================================================
-// Phase 10: REAL TCP disconnect → detector → LINK_DOWN
+// Real TCP disconnect → dispatcher → LINK_DOWN → durable revoke
 // =====================================================================
 
-describe("R-009 Phase 4 PRODUCTION: real TCP disconnect → detector → LINK_DOWN", () => {
-  test("real socket failure on authenticated send → TRANSPORT_CONFIRMED → LINK_DOWN → durable revoke", async () => {
-    // This test uses the REAL TcpCircuitDestroyTransport with a failure
-    // detector wired in. When the send fails (connection refused — nobody
-    // listening on the port), the transport's socket error handler calls
-    // detector.recordObservation({ category: "TRANSPORT_CONFIRMED" }) →
-    // immediate LINK_DOWN.
+describe("R-009 Phase 4 PRODUCTION: real TCP disconnect → dispatcher → LINK_DOWN", () => {
+  test("real socket failure → TRANSPORT_CONFIRMED → LINK_DOWN → durable revoke (NO manual dispatch)", async () => {
     const { TcpCircuitDestroyTransport } = await import("@/lib/sharenet/circuit-destroy-transport");
     const route = makeRoute(1);
     const relayKeys = makeRelayX25519Keys(route.branded);
     const floorStore = new InMemoryCircuitSequenceFloorStore();
     const circuit = setupCircuit(route.branded, relayKeys, NOW, floorStore);
 
-    // Allocate a port for the "next hop" but DON'T start a server —
-    // simulate the peer going away (connection refused).
+    // Allocate a port for the "next hop" but DON'T start a server.
     const deadPort = await new Promise<number>((resolve) => {
       const srv = createServer();
       srv.listen(0, "127.0.0.1", () => {
@@ -214,21 +190,20 @@ describe("R-009 Phase 4 PRODUCTION: real TCP disconnect → detector → LINK_DO
       });
     });
 
-    const detector = new LinkFailureDetector();
-    const destroyStore = new InMemoryCircuitDestroyStore();
+    const { dispatcher, destroyStore, rm } = createDispatcher(circuit, route);
 
-    // Create the transport WITH the failure detector wired in.
-    // linkId = "link-1", remoteNodeId = "node-b" (the dead peer).
+    // Create the transport WITH the dispatcher wired in.
     const transport = new TcpCircuitDestroyTransport(
       "node-a", 0, new Map([["node-b", deadPort]]),
-      detector, "link-1", "node-b",
+      dispatcher, undefined, "link-1", "node-b",
     );
 
-    // The link is HEALTHY initially.
-    expect(detector.getState("link-1")).toBe("HEALTHY");
+    expect(dispatcher.getState("link-1")).toBe("HEALTHY");
 
     // Attempt to send — this will fail (connection refused) + the transport's
-    // socket error handler will call detector.recordObservation(TRANSPORT_CONFIRMED).
+    // socket error handler will call dispatcher.recordObservation(TRANSPORT_CONFIRMED)
+    // → the dispatcher IMMEDIATELY dispatches: durable invalidation + zeroize +
+    // RecoveryManager — INLINE, no manual dispatchFailureEvents call.
     const fakeLink = {
       localNodeId: "node-a", remoteNodeId: "node-b",
       linkIdHex: "mock", linkIdBytes: new Uint8Array(32),
@@ -247,24 +222,10 @@ describe("R-009 Phase 4 PRODUCTION: real TCP disconnect → detector → LINK_DO
       senderEd25519PublicKey: randomBytes(32),
     }, new Uint8Array(32));
 
-    // The send failed (connection refused).
     expect(sendResult.ok).toBe(false);
+    expect(dispatcher.getState("link-1")).toBe("LINK_DOWN");
 
-    // The detector recorded the TRANSPORT_CONFIRMED → LINK_DOWN.
-    expect(detector.getState("link-1")).toBe("LINK_DOWN");
-
-    // Dispatch events → invalidate the circuit.
-    const circuitAssociations = new Map([
-      ["link-1", [{ circuitId: circuit.circuitId, commitmentRoot: circuit.commitmentRoot, circuitObj: circuit }]],
-    ]);
-    const rm = new RecoveryManager();
-    rm.registerLink("link-1", "node-a", "node-b");
-    rm.registerRoute(route.branded as any, toHex(circuit.circuitId), ["link-1"], NOW);
-
-    const dispatch = await dispatchFailureEvents(detector, circuitAssociations, destroyStore, rm);
-
-    // Circuit is durably revoked.
-    expect(dispatch.invalidatedCircuits.length).toBe(1);
+    // The dispatcher ALREADY dispatched — circuit is durably revoked.
     expect(await destroyStore.isRevoked(circuit.circuitId, circuit.commitmentRoot)).toBe(true);
 
     // Keys were zeroized.
@@ -277,98 +238,83 @@ describe("R-009 Phase 4 PRODUCTION: real TCP disconnect → detector → LINK_DO
 });
 
 // =====================================================================
-// Phase 11: Anti-DoS against production paths
+// Anti-DoS + idempotency against production paths
 // =====================================================================
 
-describe("R-009 Phase 4 PRODUCTION: anti-DoS against real paths", () => {
-  test("unauthenticated TCP client cannot produce TRANSPORT_CONFIRMED", () => {
-    // The transport only calls recordObservation(TRANSPORT_CONFIRMED) AFTER
-    // the link-binding check (step 1 of send). An unauthenticated connection
-    // that sends garbage to the TCP server will be handled by handleIncoming's
-    // readProofAndWire — which will fail to decode, but this is a RECEIVE-side
-    // failure, not a TRANSPORT_CONFIRMED failure. The TRANSPORT_CONFIRMED
-    // is only produced by the SEND path (authenticated send → socket error).
-    //
-    // This is a structural property: the detector is only called from
-    // authenticated code paths.
-    const detector = new LinkFailureDetector();
-    expect(detector.getState("any-link")).toBe("HEALTHY");
-    // No way to call recordObservation(TRANSPORT_CONFIRMED) without going
-    // through the authenticated send path — it's a protocol-level invariant.
-  });
-
-  test("wrong link cannot invalidate another circuit", async () => {
+describe("R-009 Phase 4 PRODUCTION: anti-DoS + idempotency", () => {
+  test("wrong link cannot invalidate another circuit (production dispatcher)", async () => {
+    const detector = new LFD();
     const destroyStore = new InMemoryCircuitDestroyStore();
-    const detector = new LinkFailureDetector();
     const rm = new RecoveryManager();
+    rm.registerLink("link-1", "a", "b");
+    rm.registerLink("link-2", "a", "c");
 
     // Circuit A is on link-1.
     const cidA = randomBytes(32);
     const crA = randomBytes(32);
-    const associations = new Map([
+    const associations = new Map<string, CircuitLinkAssociation[]>([
       ["link-1", [{ circuitId: cidA, commitmentRoot: crA }]],
     ]);
+    const dispatcher = new FED(detector, associations, destroyStore, rm);
 
     // A failure on link-2 (different link) — circuit A should NOT be affected.
-    detector.recordObservation({
+    await dispatcher.recordObservation({
       linkId: "link-2", localNodeId: "a", remoteNodeId: "c",
       category: "TRANSPORT_CONFIRMED", reason: "test", observedAt: NOW,
     });
 
-    const dispatch = await dispatchFailureEvents(detector, associations, destroyStore, rm);
-    expect(dispatch.invalidatedCircuits.length).toBe(0); // NOT invalidated
     expect(await destroyStore.isRevoked(cidA, crA)).toBe(false); // still ACTIVE
   });
 
-  test("persistence failure during invalidation → fail closed", async () => {
+  test("persistence failure → fail closed (NO manual dispatch)", async () => {
     const failingStore = {
       isRevoked: async () => false,
       consumeDestroyAndRevoke: async () => ({ ok: false as const, reason: "simulated" }),
       revoke: async () => false,
     };
-    const detector = new LinkFailureDetector();
-    const cid = randomBytes(32);
-    const cr = randomBytes(32);
+    const detector = new LFD();
+    const rm = new RecoveryManager();
+    rm.registerLink("link-1", "a", "b");
 
-    detector.recordObservation({
+    const associations = new Map<string, CircuitLinkAssociation[]>([
+      ["link-1", [{ circuitId: randomBytes(32), commitmentRoot: randomBytes(32) }]],
+    ]);
+    const dispatcher = new FED(detector, associations, failingStore as any, rm);
+
+    const result = await dispatcher.recordObservation({
       linkId: "link-1", localNodeId: "a", remoteNodeId: "b",
       category: "TRANSPORT_CONFIRMED", reason: "test", observedAt: NOW,
     });
-
-    const associations = new Map([
-      ["link-1", [{ circuitId: cid, commitmentRoot: cr }]],
-    ]);
-
-    const dispatch = await dispatchFailureEvents(detector, associations, failingStore as any);
-    expect(dispatch.invalidatedCircuits.length).toBe(0); // NOT invalidated — fail closed
+    expect(result.state).toBe("LINK_DOWN");
+    expect(result.invalidatedCircuits.length).toBe(0); // NOT invalidated — fail closed
   });
 
-  test("duplicate LINK_DOWN → exactly one durable transition", async () => {
+  test("duplicate LINK_DOWN → exactly one durable transition (NO manual dispatch)", async () => {
+    const detector = new LFD();
     const destroyStore = new InMemoryCircuitDestroyStore();
-    const detector = new LinkFailureDetector();
+    const rm = new RecoveryManager();
+    rm.registerLink("link-1", "a", "b");
+
     const cid = randomBytes(32);
     const cr = randomBytes(32);
+    const associations = new Map<string, CircuitLinkAssociation[]>([
+      ["link-1", [{ circuitId: cid, commitmentRoot: cr }]],
+    ]);
+    const dispatcher = new FED(detector, associations, destroyStore, rm);
 
-    // First LINK_DOWN.
-    detector.recordObservation({
+    // First LINK_DOWN — dispatched INLINE → circuit revoked.
+    const result1 = await dispatcher.recordObservation({
       linkId: "link-1", localNodeId: "a", remoteNodeId: "b",
       category: "TRANSPORT_CONFIRMED", reason: "first", observedAt: NOW,
     });
+    expect(result1.invalidatedCircuits.length).toBe(1);
+    expect(await destroyStore.isRevoked(cid, cr)).toBe(true);
 
-    const associations = new Map([
-      ["link-1", [{ circuitId: cid, commitmentRoot: cr }]],
-    ]);
-
-    const dispatch1 = await dispatchFailureEvents(detector, associations, destroyStore);
-    expect(dispatch1.invalidatedCircuits.length).toBe(1); // first transition
-
-    // Second LINK_DOWN (duplicate — the detector is already LINK_DOWN, no new event).
-    detector.recordObservation({
+    // Second LINK_DOWN (duplicate — idempotent).
+    const result2 = await dispatcher.recordObservation({
       linkId: "link-1", localNodeId: "a", remoteNodeId: "b",
       category: "TRANSPORT_CONFIRMED", reason: "second", observedAt: NOW + 1,
     });
-
-    const dispatch2 = await dispatchFailureEvents(detector, associations, destroyStore);
-    expect(dispatch2.invalidatedCircuits.length).toBe(0); // idempotent — no duplicate transition
+    expect(result2.invalidatedCircuits.length).toBe(0); // idempotent — no duplicate
   });
 });

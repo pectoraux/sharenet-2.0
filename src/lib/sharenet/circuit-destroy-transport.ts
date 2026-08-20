@@ -44,6 +44,7 @@ import {
   type TransportSendResult,
 } from "@reference/circuit/propagation";
 import type { LinkFailureDetector, FailureObservation } from "@reference/failure/link-failure-detector";
+import type { FailureEventDispatcher } from "@reference/failure/failure-event-dispatcher";
 
 /**
  * A TCP-backed CircuitDestroyTransport. Each participant runs a TCP server
@@ -63,21 +64,23 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
    * @param localNodeId - the local participant's NodeId
    * @param listenPort - the port this participant listens on
    * @param peerPortRegistry - a map from peer NodeId → TCP port
-   * @param failureDetector - OPTIONAL: when provided, socket errors during
+   * @param failureDispatcher - OPTIONAL: when provided, socket errors during
    *   `send()` are recorded as TRANSPORT_CONFIRMED observations (immediate
-   *   LINK_DOWN) + successful sends call `recordSuccess()` (reset DEGRADED).
-   *   Only a genuinely authenticated send context (verified link binding at
-   *   step 1 of send) produces the observation — unauthenticated connections
-   *   never reach the detector.
-   * @param linkId - the linkId for failure observations (required if
-   *   failureDetector is provided)
+   *   LINK_DOWN) + the dispatcher IMMEDIATELY drains + dispatches the event
+   *   (durable invalidation + zeroize + RecoveryManager notification —
+   *   INLINE, no polling). Successful sends call `recordSuccess()` (reset
+   *   DEGRADED → HEALTHY). Only authenticated sends reach this point.
+   * @param failureDetector - DEPRECATED: use failureDispatcher instead.
+   *   Kept for backward compatibility. If failureDispatcher is not provided
+   *   but failureDetector is, falls back to raw detector (no dispatch).
+   * @param linkId - the linkId for failure observations
    * @param remoteNodeId - the remote peer's NodeId for failure observations
-   *   (required if failureDetector is provided)
    */
   constructor(
     private readonly localNodeId: string,
     private readonly listenPort: number,
     private readonly peerPortRegistry: Map<string, number>,
+    private readonly failureDispatcher?: FailureEventDispatcher,
     private readonly failureDetector?: LinkFailureDetector,
     private readonly linkId?: string,
     private readonly remoteNodeId?: string,
@@ -166,8 +169,11 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
         setTimeout(() => {
           sock.end();
           // PRODUCTION SUCCESS WIRING: a successful authenticated send
-          // resets the link's suspicion (DEGRADED → HEALTHY).
-          if (this.failureDetector && this.linkId) {
+          // resets the link's suspicion (DEGRADED → HEALTHY) + dispatches
+          // any pending events INLINE.
+          if (this.failureDispatcher && this.linkId) {
+            this.failureDispatcher.recordSuccess(this.linkId, Math.floor(Date.now() / 1000));
+          } else if (this.failureDetector && this.linkId) {
             this.failureDetector.recordSuccess(this.linkId, Math.floor(Date.now() / 1000));
           }
           resolve({ ok: true });
@@ -175,11 +181,22 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
       });
       sock.on("error", (err) => {
         // PRODUCTION FAILURE WIRING: a socket error on an AUTHENTICATED
-        // send (we've already verified the link binding at step 1) is a
-        // TRANSPORT_CONFIRMED failure. Feed it to the detector → immediate
-        // LINK_DOWN. Only authenticated sends reach this point —
-        // unauthenticated connections never pass the link-binding check.
-        if (this.failureDetector && this.linkId && this.remoteNodeId) {
+        // send (verified link binding at step 1) is a TRANSPORT_CONFIRMED
+        // failure. Feed it to the dispatcher → immediate LINK_DOWN +
+        // INLINE dispatch (durable invalidation + zeroize + RecoveryManager).
+        // Only authenticated sends reach this point.
+        if (this.failureDispatcher && this.linkId && this.remoteNodeId) {
+          this.failureDispatcher.recordObservation({
+            linkId: this.linkId,
+            localNodeId: this.localNodeId,
+            remoteNodeId: this.remoteNodeId,
+            circuitId: ctx.circuitId,
+            category: "TRANSPORT_CONFIRMED",
+            reason: `TCP send to ${ctx.nextHopNodeId}:${port} failed: ${err.message}`,
+            observedAt: Math.floor(Date.now() / 1000),
+          });
+        } else if (this.failureDetector && this.linkId && this.remoteNodeId) {
+          // Fallback to raw detector (no dispatch) for backward compat.
           this.failureDetector.recordObservation({
             linkId: this.linkId,
             localNodeId: this.localNodeId,

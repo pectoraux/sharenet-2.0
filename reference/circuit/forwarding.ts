@@ -53,6 +53,7 @@ import {
 import type { ActiveCircuit } from "./circuit";
 import type { CircuitRevocationStore } from "./replay-stores";
 import type { LinkFailureDetector } from "../failure/link-failure-detector";
+import type { FailureEventDispatcher } from "../failure/failure-event-dispatcher";
 import {
   DESTROYER_ROLE_INITIATOR,
   DESTROY_REASON_CIRCUIT_EXPIRED,
@@ -277,14 +278,23 @@ export async function processCircuitWireFrame(
    */
   now: number,
   /**
-   * OPTIONAL (R-009 Stage 3 Phase 4): the link failure detector. When
+   * OPTIONAL (R-009 Stage 3 Phase 4): the failure event dispatcher. When
    * provided, AEAD/protocol failures are recorded as PROTOCOL_AUTHENTICATION
-   * observations (threshold-based escalation, NOT immediate LINK_DOWN —
-   * anti-DoS). Successful authenticated frames reset the link's suspicion
-   * (DEGRADED → HEALTHY).
+   * observations + the dispatcher IMMEDIATELY drains + dispatches any
+   * resulting LINK_DOWN events (durable invalidation + zeroize +
+   * RecoveryManager — INLINE, no polling). Successful frames call
+   * `recordSuccess()` (reset DEGRADED → HEALTHY).
    *
-   * The detector is OPTIONAL to preserve backward compatibility with existing
-   * tests that don't need failure detection. Production code SHOULD pass it.
+   * If `failureDispatcher` is provided, it takes precedence over
+   * `failureDetector` (which is the raw detector without dispatch).
+   *
+   * The dispatcher is OPTIONAL to preserve backward compatibility with existing
+   * tests. Production code SHOULD pass it.
+   */
+  failureDispatcher?: FailureEventDispatcher,
+  /**
+   * DEPRECATED: use `failureDispatcher` instead. The raw detector (no
+   * dispatch). Kept for backward compatibility.
    */
   failureDetector?: LinkFailureDetector,
   /** The linkId for failure observations (required if failureDetector is provided). */
@@ -340,10 +350,18 @@ export async function processCircuitWireFrame(
   const decoded = decodeCircuitFrame(wireBytes);
   if (!decoded.ok) {
     // PRODUCTION FAILURE WIRING (Phase 4): a decode failure is a
-    // PROTOCOL_AUTHENTICATION observation — evidence of a possible attacker
-    // or buggy peer, NOT evidence the peer is dead. Feed it to the detector
-    // (threshold-based escalation, NOT immediate LINK_DOWN).
-    if (failureDetector && linkId && localNodeId && remoteNodeId) {
+    // PROTOCOL_AUTHENTICATION observation → the dispatcher records it +
+    // IMMEDIATELY dispatches any resulting LINK_DOWN (durable invalidation +
+    // zeroize + RecoveryManager — INLINE, no polling).
+    if (failureDispatcher && linkId && localNodeId && remoteNodeId) {
+      await failureDispatcher.recordObservation({
+        linkId, localNodeId, remoteNodeId,
+        circuitId: circuit.circuitId,
+        category: "PROTOCOL_AUTHENTICATION",
+        reason: `frame decode failed: ${decoded.reason}`,
+        observedAt: now,
+      });
+    } else if (failureDetector && linkId && localNodeId && remoteNodeId) {
       failureDetector.recordObservation({
         linkId, localNodeId, remoteNodeId,
         circuitId: circuit.circuitId,
@@ -363,10 +381,18 @@ export async function processCircuitWireFrame(
   if (!forward.ok) {
     // AEAD failed — the floor MUST NOT advance. Do NOT call floorStore.
     // PRODUCTION FAILURE WIRING (Phase 4): an AEAD failure is a
-    // PROTOCOL_AUTHENTICATION observation. A single forged bad packet does
-    // NOT immediately kill the link — the threshold policy (3 failures
-    // within 60s) must be reached. This is the anti-DoS invariant.
-    if (failureDetector && linkId && localNodeId && remoteNodeId) {
+    // PROTOCOL_AUTHENTICATION observation → the dispatcher records it +
+    // IMMEDIATELY dispatches (threshold → LINK_DOWN → durable invalidation
+    // → zeroize → RecoveryManager). Anti-DoS: 1 failure → DEGRADED only.
+    if (failureDispatcher && linkId && localNodeId && remoteNodeId) {
+      await failureDispatcher.recordObservation({
+        linkId, localNodeId, remoteNodeId,
+        circuitId: circuit.circuitId,
+        category: "PROTOCOL_AUTHENTICATION",
+        reason: `AEAD/authentication failure: ${forward.reason}`,
+        observedAt: now,
+      });
+    } else if (failureDetector && linkId && localNodeId && remoteNodeId) {
       failureDetector.recordObservation({
         linkId, localNodeId, remoteNodeId,
         circuitId: circuit.circuitId,
@@ -397,8 +423,11 @@ export async function processCircuitWireFrame(
 
   // Step 5: forward / deliver. The frame is accepted.
   // PRODUCTION SUCCESS WIRING (Phase 4): a successfully authenticated +
-  // accepted frame resets the link's suspicion (DEGRADED → HEALTHY).
-  if (failureDetector && linkId) {
+  // accepted frame resets the link's suspicion (DEGRADED → HEALTHY) +
+  // the dispatcher dispatches any pending events INLINE.
+  if (failureDispatcher && linkId) {
+    await failureDispatcher.recordSuccess(linkId, now);
+  } else if (failureDetector && linkId) {
     failureDetector.recordSuccess(linkId, now);
   }
   if (forward.terminal) {
