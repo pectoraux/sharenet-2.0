@@ -982,7 +982,13 @@ describe("R-009 Stage 2: backward (return) direction — return-onion traffic", 
     // R-009 Stage 3: function now takes 5 params (revocationStore + now are
     // optional) — still no commitFloor parameter (replay floor is protocol-derived
     // from circuit.commitmentRoot + hopIndex + frame.direction).
-    expect(processCircuitWireFrame.length).toBe(5);
+    // R-009 Stage 3 Phase 4: processCircuitWireFrame now takes 4 optional
+    // failure-detection parameters (failureDetector, linkId, localNodeId,
+    // remoteNodeId). The function.length reports the number of parameters
+    // BEFORE the first default-valued one — since the 6th param (failureDetector)
+    // is optional, .length = 5 (the first 5 required params) + TypeScript
+    // reports the total declared count. Check the actual call works.
+    expect(processCircuitWireFrame.length).toBe(9);
   });
 });
 

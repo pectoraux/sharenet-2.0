@@ -52,6 +52,7 @@ import {
 } from "./frame";
 import type { ActiveCircuit } from "./circuit";
 import type { CircuitRevocationStore } from "./replay-stores";
+import type { LinkFailureDetector } from "../failure/link-failure-detector";
 import {
   DESTROYER_ROLE_INITIATOR,
   DESTROY_REASON_CIRCUIT_EXPIRED,
@@ -275,6 +276,23 @@ export async function processCircuitWireFrame(
    * (revocation + zeroize), not merely a local rejection.
    */
   now: number,
+  /**
+   * OPTIONAL (R-009 Stage 3 Phase 4): the link failure detector. When
+   * provided, AEAD/protocol failures are recorded as PROTOCOL_AUTHENTICATION
+   * observations (threshold-based escalation, NOT immediate LINK_DOWN —
+   * anti-DoS). Successful authenticated frames reset the link's suspicion
+   * (DEGRADED → HEALTHY).
+   *
+   * The detector is OPTIONAL to preserve backward compatibility with existing
+   * tests that don't need failure detection. Production code SHOULD pass it.
+   */
+  failureDetector?: LinkFailureDetector,
+  /** The linkId for failure observations (required if failureDetector is provided). */
+  linkId?: string,
+  /** The local participant's NodeId (required if failureDetector is provided). */
+  localNodeId?: string,
+  /** The remote peer's NodeId (required if failureDetector is provided). */
+  remoteNodeId?: string,
 ): Promise<ProcessCircuitWireFrameResult> {
   // Step 0a (R-009 Stage 3): check circuit expiry.
   // Per ADR-0022: an expired circuit MUST NOT process traffic.
@@ -321,6 +339,19 @@ export async function processCircuitWireFrame(
   // Step 1: decode (strict canonical CBOR).
   const decoded = decodeCircuitFrame(wireBytes);
   if (!decoded.ok) {
+    // PRODUCTION FAILURE WIRING (Phase 4): a decode failure is a
+    // PROTOCOL_AUTHENTICATION observation — evidence of a possible attacker
+    // or buggy peer, NOT evidence the peer is dead. Feed it to the detector
+    // (threshold-based escalation, NOT immediate LINK_DOWN).
+    if (failureDetector && linkId && localNodeId && remoteNodeId) {
+      failureDetector.recordObservation({
+        linkId, localNodeId, remoteNodeId,
+        circuitId: circuit.circuitId,
+        category: "PROTOCOL_AUTHENTICATION",
+        reason: `frame decode failed: ${decoded.reason}`,
+        observedAt: now,
+      });
+    }
     return { ok: false, reason: decoded.reason };
   }
   const frame = decoded.frame;
@@ -331,6 +362,19 @@ export async function processCircuitWireFrame(
   const forward = forwardFrame(circuit, hopIndex, frame);
   if (!forward.ok) {
     // AEAD failed — the floor MUST NOT advance. Do NOT call floorStore.
+    // PRODUCTION FAILURE WIRING (Phase 4): an AEAD failure is a
+    // PROTOCOL_AUTHENTICATION observation. A single forged bad packet does
+    // NOT immediately kill the link — the threshold policy (3 failures
+    // within 60s) must be reached. This is the anti-DoS invariant.
+    if (failureDetector && linkId && localNodeId && remoteNodeId) {
+      failureDetector.recordObservation({
+        linkId, localNodeId, remoteNodeId,
+        circuitId: circuit.circuitId,
+        category: "PROTOCOL_AUTHENTICATION",
+        reason: `AEAD/authentication failure: ${forward.reason}`,
+        observedAt: now,
+      });
+    }
     return { ok: false, reason: forward.reason };
   }
 
@@ -352,6 +396,11 @@ export async function processCircuitWireFrame(
   }
 
   // Step 5: forward / deliver. The frame is accepted.
+  // PRODUCTION SUCCESS WIRING (Phase 4): a successfully authenticated +
+  // accepted frame resets the link's suspicion (DEGRADED → HEALTHY).
+  if (failureDetector && linkId) {
+    failureDetector.recordSuccess(linkId, now);
+  }
   if (forward.terminal) {
     return { ok: true, terminal: true, plaintext: forward.plaintext, committedSequence: seq };
   }

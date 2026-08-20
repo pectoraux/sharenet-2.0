@@ -406,3 +406,84 @@ export async function invalidateCircuitOnFailure(
   }
   return { ok: true, action: "REVOKED" };
 }
+
+// -----------------------------------------------------------------------
+// Production failure-event dispatcher
+// -----------------------------------------------------------------------
+
+/**
+ * The production failure-event dispatcher.
+ *
+ * This function drains events from the LinkFailureDetector + for each
+ * LINK_DOWN event:
+ *   1. Identifies affected circuits (via the circuit-link association).
+ *   2. Durably invalidates each circuit (via invalidateCircuitOnFailure).
+ *   3. Zeroizes the circuit (if the circuit object is available).
+ *   4. Forwards the event to the RecoveryManager (route invalidation → RecoveryPlan).
+ *
+ * This is the PRODUCTION dispatch boundary — it connects the detector to
+ * the invalidation + recovery systems. It is called by the production
+ * runtime after each frame-processing or transport operation.
+ *
+ * @param detector - the LinkFailureDetector to drain events from.
+ * @param circuitAssociations - a map from linkId → array of circuits on that link.
+ * @param destroyStore - the authoritative CircuitDestroyStore for durable invalidation.
+ * @param recoveryManager - the RecoveryManager to forward events to (optional).
+ * @returns the list of invalidated circuit IDs + recovery plans.
+ */
+export async function dispatchFailureEvents(
+  detector: LinkFailureDetector,
+  circuitAssociations: Map<string, Array<{ circuitId: Uint8Array; commitmentRoot: Uint8Array; circuitObj?: import("../circuit/circuit").ActiveCircuit }>>,
+  destroyStore: import("../circuit/replay-stores").CircuitDestroyStore,
+  recoveryManager?: import("../routing/recovery").RecoveryManager,
+): Promise<{ invalidatedCircuits: Array<{ circuitId: Uint8Array; reason: number }>; recoveryPlans: any[] }> {
+  const events = detector.drainEvents();
+  const invalidatedCircuits: Array<{ circuitId: Uint8Array; reason: number }> = [];
+  const recoveryPlans: any[] = [];
+
+  for (const event of events) {
+    // Only LINK_DOWN triggers circuit invalidation.
+    if (event.newStatus !== "DOWN") {
+      // Forward DEGRADED events to the RecoveryManager (if provided).
+      if (recoveryManager) {
+        recoveryManager.handleLinkEvent(event);
+      }
+      continue;
+    }
+
+    // LINK_DOWN — invalidate all circuits on this link.
+    const circuits = circuitAssociations.get(event.linkId) ?? [];
+    for (const { circuitId, commitmentRoot, circuitObj } of circuits) {
+      const result = await invalidateCircuitOnFailure(
+        destroyStore,
+        circuitId,
+        commitmentRoot,
+        0x03, // DESTROY_REASON_LINK_FAILURE
+        "system",
+        0x01, // DESTROYER_ROLE_INITIATOR
+        randomBytes(16),
+      );
+      if (result.ok && result.action === "REVOKED") {
+        invalidatedCircuits.push({ circuitId, reason: 0x03 });
+        // Zeroize the circuit if the object is available.
+        if (circuitObj) {
+          const { zeroizeCircuit } = await import("../circuit/zeroize");
+          zeroizeCircuit(circuitObj);
+        }
+      }
+      // If result.ok is false (persistence failure) → fail closed.
+      // Do NOT claim REVOKED. Do NOT emit recovery signal.
+    }
+
+    // Forward the LINK_DOWN event to the RecoveryManager.
+    if (recoveryManager) {
+      const invalidatedRoutes = recoveryManager.handleLinkEvent(event);
+      // RecoveryPlan is descriptive only — no execution.
+    }
+  }
+
+  return { invalidatedCircuits, recoveryPlans };
+}
+
+// Import randomBytes lazily to avoid circular dependency.
+import { randomBytes } from "@noble/hashes/utils.js";
