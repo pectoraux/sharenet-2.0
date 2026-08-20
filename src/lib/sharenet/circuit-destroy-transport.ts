@@ -57,7 +57,7 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
   // The pending receiver: its resolve callback + the context to verify
   // the incoming proof against. When a connection arrives, handleIncoming
   // verifies the proof against this context + resolves the promise.
-  private pendingReceiver: { resolve: (r: { ok: true; wireBytes: Uint8Array } | { ok: false; reason: string }) => void; ctx: AuthenticatedReceiveContext } | null = null;
+  private pendingReceiver: { resolve: (r: { ok: true; wireBytes: Uint8Array; proof: import("@reference/circuit/propagation").PropagationChannelProof } | { ok: false; reason: string }) => void; ctx: AuthenticatedReceiveContext } | null = null;
   // Queue of received (proof, wireBytes) pairs (in case a destroy arrives
   // before receive() is called — the destroy is buffered until a receiver
   // waits). The receiver verifies the proof against its context on delivery.
@@ -122,10 +122,12 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
       };
     }
 
-    // 2. Sign the PropagationChannelProof (binds the channel context).
+    // 2. Sign the PropagationChannelProof (binds the channel context + the
+    //    destroyDigest — the EXACT destroy bytes being propagated).
     const proof = signPropagationChannelProof(
       ctx.localNodeId, ctx.nextHopNodeId,
       ctx.circuitId, ctx.commitmentRoot, ctx.direction,
+      wireBytes, // hash the EXACT bytes being sent
       ctx.senderEd25519SecretKey, ctx.senderEd25519PublicKey,
     );
     const proofBytes = encodePropagationChannelProof(proof);
@@ -168,7 +170,7 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
    * PropagationChannelProof against the receiver's context before delivering.
    * Blocks until a destroy arrives. The caller MUST have called `start()`.
    */
-  async receive(ctx: AuthenticatedReceiveContext): Promise<{ ok: true; wireBytes: Uint8Array } | { ok: false; reason: string }> {
+  async receive(ctx: AuthenticatedReceiveContext): Promise<{ ok: true; wireBytes: Uint8Array; proof: import("@reference/circuit/propagation").PropagationChannelProof } | { ok: false; reason: string }> {
     if (ctx.localNodeId !== this.localNodeId) {
       throw new Error(`receive() called with localNodeId "${ctx.localNodeId}" but transport is for "${this.localNodeId}"`);
     }
@@ -179,11 +181,11 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
       if (!proofDecoded.ok) {
         return { ok: false, reason: `received proof decode failed: ${proofDecoded.reason}` };
       }
-      const verifyResult = verifyIncomingPropagationChannelProof(proofDecoded.proof, ctx);
+      const verifyResult = verifyIncomingPropagationChannelProof(proofDecoded.proof, ctx, item.wireBytes);
       if (!verifyResult.ok) {
         return { ok: false, reason: verifyResult.reason };
       }
-      return { ok: true, wireBytes: item.wireBytes };
+      return { ok: true, wireBytes: item.wireBytes, proof: proofDecoded.proof };
     }
     // No queued destroy — wait for one. Store the ctx so handleIncoming
     // can verify the incoming proof when it arrives.
@@ -207,11 +209,11 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
         if (!proofDecoded.ok) {
           resolve({ ok: false, reason: `received proof decode failed: ${proofDecoded.reason}` });
         } else {
-          const verifyResult = verifyIncomingPropagationChannelProof(proofDecoded.proof, ctx);
+          const verifyResult = verifyIncomingPropagationChannelProof(proofDecoded.proof, ctx, wireBytes);
           if (!verifyResult.ok) {
             resolve({ ok: false, reason: verifyResult.reason });
           } else {
-            resolve({ ok: true, wireBytes });
+            resolve({ ok: true, wireBytes, proof: proofDecoded.proof });
           }
         }
       } else {

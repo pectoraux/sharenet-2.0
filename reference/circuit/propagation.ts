@@ -49,6 +49,7 @@ import type { ActiveCircuit } from "./circuit";
 import type { CircuitDestroyStore } from "./replay-stores";
 import type { AuthenticatedLink } from "../transport/authenticated-link";
 import { signMessage, verifySignature, verifyNodeIdBinding } from "../identity/keys";
+import { blake3 } from "@noble/hashes/blake3.js";
 import { canonicalEncode, canonicalDecode, toHex } from "../encoding/cbor";
 
 // -----------------------------------------------------------------------
@@ -116,6 +117,19 @@ export interface PropagationChannelProof {
   readonly commitmentRoot: Uint8Array;
   /** The propagation direction (FORWARD or BACKWARD, derived from destroyerRole). */
   readonly direction: "FORWARD" | "BACKWARD";
+  /**
+   * The BLAKE3-256 digest of the EXACT CircuitDestroy wire bytes being
+   * propagated (R-009 Stage 3 Phase 3 final transport-proof hardening).
+   *
+   * This binds the proof to the EXACT destroy artifact — not just the circuit
+   * context. An attacker cannot substitute a different destroy (even a valid
+   * one for the same circuit) because its digest will not match.
+   *
+   * Computed as: BLAKE3(exact CircuitDestroy wire bytes) BEFORE any decoding.
+   * The sender hashes the raw wireBytes; the receiver hashes the raw received
+   * bytes + compares. No decode + re-encode before hashing.
+   */
+  readonly destroyDigest: Uint8Array;
   /** The sender's Ed25519 public key (verifies the signature). */
   readonly senderEd25519PublicKey: Uint8Array;
   /** The sender's Ed25519 signature over the binding payload. */
@@ -128,15 +142,38 @@ const PCP_KEY_RECEIVER_NODE_ID = 2;
 const PCP_KEY_CIRCUIT_ID = 3;
 const PCP_KEY_COMMITMENT_ROOT = 4;
 const PCP_KEY_DIRECTION = 5;
-const PCP_KEY_SENDER_ED25519_PUBKEY = 6;
-const PCP_KEY_SIGNATURE = 7;
+const PCP_KEY_DESTROY_DIGEST = 6;
+const PCP_KEY_SENDER_ED25519_PUBKEY = 7;
+const PCP_KEY_SIGNATURE = 8;
+
+/**
+ * Compute the BLAKE3-256 digest of the EXACT CircuitDestroy wire bytes.
+ *
+ * Per the re-audit of 4828b5f (R-009 Stage 3 Phase 3 final transport-proof
+ * hardening): the proof MUST be bound to the EXACT destroy artifact — not
+ * just the circuit context. This prevents an attacker from substituting a
+ * different destroy (even a valid one for the same circuit) at the transport
+ * layer.
+ *
+ * The digest is computed over the RAW wire bytes BEFORE any decoding. The
+ * sender hashes the wireBytes it is about to send; the receiver hashes the
+ * wireBytes it received + compares with proof.destroyDigest. No decode +
+ * re-encode before hashing — the exact-byte invariant.
+ */
+export function computeDestroyDigest(wireBytes: Uint8Array): Uint8Array {
+  return blake3(wireBytes, { dkLen: 32 });
+}
 
 /**
  * Compute the signing payload for a PropagationChannelProof.
  *
  * The payload binds: domain || senderNodeId || receiverNodeId || circuitId ||
- * commitmentRoot || direction. The signature is verified by anyone who has
- * the senderEd25519PublicKey — no WeakSet or in-process proof required.
+ * commitmentRoot || direction || destroyDigest. The signature is verified by
+ * anyone who has the senderEd25519PublicKey — no WeakSet or in-process proof
+ * required.
+ *
+ * The destroyDigest binds the proof to the EXACT CircuitDestroy wire bytes —
+ * an attacker cannot substitute a different destroy at the transport layer.
  */
 export function propagationChannelProofSigningPayload(
   senderNodeId: string,
@@ -144,6 +181,7 @@ export function propagationChannelProofSigningPayload(
   circuitId: Uint8Array,
   commitmentRoot: Uint8Array,
   direction: "FORWARD" | "BACKWARD",
+  destroyDigest: Uint8Array,
 ): Uint8Array {
   const m = new Map<number, unknown>([
     [1, senderNodeId],
@@ -151,6 +189,7 @@ export function propagationChannelProofSigningPayload(
     [3, circuitId],
     [4, commitmentRoot],
     [5, direction],
+    [6, destroyDigest],
   ]);
   const body = canonicalEncode(m);
   const domain = new TextEncoder().encode(PROPAGATION_CHANNEL_PROOF_DOMAIN);
@@ -169,6 +208,8 @@ export function propagationChannelProofSigningPayload(
  * @param circuitId - the circuitId the destroy is bound to
  * @param commitmentRoot - the commitmentRoot the destroy is bound to
  * @param direction - the propagation direction (FORWARD or BACKWARD)
+ * @param wireBytes - the EXACT CircuitDestroy wire bytes being propagated
+ *   (hashed to produce the destroyDigest — NOT decoded)
  * @param senderEd25519SecretKey - the sender's Ed25519 secret key
  * @param senderEd25519PublicKey - the sender's Ed25519 public key
  */
@@ -178,11 +219,13 @@ export function signPropagationChannelProof(
   circuitId: Uint8Array,
   commitmentRoot: Uint8Array,
   direction: "FORWARD" | "BACKWARD",
+  wireBytes: Uint8Array,
   senderEd25519SecretKey: Uint8Array,
   senderEd25519PublicKey: Uint8Array,
 ): PropagationChannelProof {
+  const destroyDigest = computeDestroyDigest(wireBytes);
   const payload = propagationChannelProofSigningPayload(
-    senderNodeId, receiverNodeId, circuitId, commitmentRoot, direction,
+    senderNodeId, receiverNodeId, circuitId, commitmentRoot, direction, destroyDigest,
   );
   const signature = signMessage(senderEd25519SecretKey, payload);
   return {
@@ -191,6 +234,7 @@ export function signPropagationChannelProof(
     circuitId,
     commitmentRoot,
     direction,
+    destroyDigest,
     senderEd25519PublicKey,
     signature,
   };
@@ -220,10 +264,10 @@ export function verifyPropagationChannelProof(
       reason: "propagation channel proof: senderEd25519PublicKey does not derive senderNodeId (identity binding failed) — forged proof rejected",
     };
   }
-  // 2. Verify the Ed25519 signature.
+  // 2. Verify the Ed25519 signature (covers destroyDigest now).
   const payload = propagationChannelProofSigningPayload(
     proof.senderNodeId, proof.receiverNodeId, proof.circuitId,
-    proof.commitmentRoot, proof.direction,
+    proof.commitmentRoot, proof.direction, proof.destroyDigest,
   );
   if (!verifySignature(proof.senderEd25519PublicKey, payload, proof.signature)) {
     return {
@@ -244,6 +288,7 @@ export function encodePropagationChannelProof(proof: PropagationChannelProof): U
     [PCP_KEY_CIRCUIT_ID, proof.circuitId],
     [PCP_KEY_COMMITMENT_ROOT, proof.commitmentRoot],
     [PCP_KEY_DIRECTION, proof.direction],
+    [PCP_KEY_DESTROY_DIGEST, proof.destroyDigest],
     [PCP_KEY_SENDER_ED25519_PUBKEY, proof.senderEd25519PublicKey],
     [PCP_KEY_SIGNATURE, proof.signature],
   ]);
@@ -271,11 +316,13 @@ export function decodePropagationChannelProof(bytes: Uint8Array): { ok: true; pr
   const direction = m.get(PCP_KEY_DIRECTION);
   const senderPubKey = m.get(PCP_KEY_SENDER_ED25519_PUBKEY);
   const signature = m.get(PCP_KEY_SIGNATURE);
+  const destroyDigest = m.get(PCP_KEY_DESTROY_DIGEST);
   if (typeof senderNodeId !== "string") return { ok: false, reason: "senderNodeId must be a text string" };
   if (typeof receiverNodeId !== "string") return { ok: false, reason: "receiverNodeId must be a text string" };
   if (!(circuitId instanceof Uint8Array) || circuitId.length !== 32) return { ok: false, reason: "circuitId must be a 32-byte bstr" };
   if (!(commitmentRoot instanceof Uint8Array) || commitmentRoot.length !== 32) return { ok: false, reason: "commitmentRoot must be a 32-byte bstr" };
   if (direction !== "FORWARD" && direction !== "BACKWARD") return { ok: false, reason: "direction must be FORWARD or BACKWARD" };
+  if (!(destroyDigest instanceof Uint8Array) || destroyDigest.length !== 32) return { ok: false, reason: "destroyDigest must be a 32-byte bstr" };
   if (!(senderPubKey instanceof Uint8Array) || senderPubKey.length !== 32) return { ok: false, reason: "senderEd25519PublicKey must be a 32-byte bstr" };
   if (!(signature instanceof Uint8Array) || signature.length !== 64) return { ok: false, reason: "signature must be a 64-byte bstr" };
   return {
@@ -283,6 +330,7 @@ export function decodePropagationChannelProof(bytes: Uint8Array): { ok: true; pr
     proof: {
       senderNodeId, receiverNodeId, circuitId, commitmentRoot,
       direction: direction as "FORWARD" | "BACKWARD",
+      destroyDigest,
       senderEd25519PublicKey: senderPubKey, signature,
     },
   };
@@ -503,14 +551,19 @@ export interface CircuitDestroyTransport {
    *   - circuitId + commitmentRoot (my circuit context)
    *
    * The transport verifies the incoming PropagationChannelProof against this
-   * context before delivering the destroy bytes. A wrong peer, wrong circuit,
-   * wrong commitmentRoot, or forged/copyed proof is REJECTED.
+   * context (signature + identity + peer + circuit + route + destroyDigest)
+   * before delivering the destroy bytes. A wrong peer, wrong circuit, wrong
+   * commitmentRoot, forged proof, or destroy substitution is REJECTED.
+   *
+   * The proof is returned alongside the wire bytes so the caller can verify
+   * the DIRECTION (derived from the decoded destroy's signed `destroyerRole`)
+   * via `verifyPropagationDirection(proof, destroy)` after decoding.
    *
    * @param ctx - the authenticated receive context (the receiver's expectations)
-   * @returns the received wire bytes (exactly as sent — no decode + re-encode),
-   *   or a failure reason if the peer/circuit/proof verification failed.
+   * @returns the received wire bytes (exactly as sent — no decode + re-encode)
+   *   + the verified proof, or a failure reason.
    */
-  receive(ctx: AuthenticatedReceiveContext): Promise<{ ok: true; wireBytes: Uint8Array } | { ok: false; reason: string }>;
+  receive(ctx: AuthenticatedReceiveContext): Promise<{ ok: true; wireBytes: Uint8Array; proof: PropagationChannelProof } | { ok: false; reason: string }>;
 }
 
 /**
@@ -523,17 +576,25 @@ export interface CircuitDestroyTransport {
  *   3. The receiverNodeId === ctx.localNodeId (I am the intended recipient).
  *   4. The senderNodeId === ctx.expectedRemoteNodeId (the sender is my expected peer).
  *   5. The circuitId + commitmentRoot match my circuit context.
+ *   6. The destroyDigest matches BLAKE3(rawWireBytes) — the proof is bound to
+ *      the EXACT destroy artifact (not just the circuit context).
  *
- * The `direction` is NOT checked here — the receiver verifies the direction
- * AFTER decoding the destroy (the direction must match the signed
- * `destroyerRole`, which is verified inside `processCircuitDestroy`).
+ * The `direction` is verified SEPARATELY, AFTER decoding the destroy: the
+ * receiver decodes the destroy, calls `propagationDirection(destroy)` to
+ * derive the expected direction from the signed `destroyerRole`, then
+ * verifies `proof.direction === expectedDirection`. This ensures the proof's
+ * direction matches the signed destroy's direction — NOT a caller-supplied
+ * direction. Use `verifyPropagationDirection()` for this check.
  *
  * @param proof - the incoming PropagationChannelProof (decoded from wire)
  * @param ctx - the receiver's authenticated receive context
+ * @param rawWireBytes - the EXACT wire bytes received over the transport
+ *   (hashed to compute the destroyDigest for comparison — NOT decoded)
  */
 export function verifyIncomingPropagationChannelProof(
   proof: PropagationChannelProof,
   ctx: AuthenticatedReceiveContext,
+  rawWireBytes: Uint8Array,
 ): { ok: true } | { ok: false; reason: string } {
   // 1. Verify the proof's signature + identity binding (portable verifier).
   const proofResult = verifyPropagationChannelProof(proof);
@@ -565,6 +626,44 @@ export function verifyIncomingPropagationChannelProof(
     return {
       ok: false,
       reason: `incoming peer authentication failed: proof.commitmentRoot does not match the receiver's commitmentRoot (wrong route context)`,
+    };
+  }
+  // 5. Verify the destroyDigest — the proof is bound to the EXACT destroy bytes.
+  //    This prevents an attacker from substituting a different destroy (even a
+  //    valid one for the same circuit) at the transport layer.
+  const actualDigest = computeDestroyDigest(rawWireBytes);
+  if (!bytesEqual(proof.destroyDigest, actualDigest)) {
+    return {
+      ok: false,
+      reason: `incoming peer authentication failed: proof.destroyDigest does not match BLAKE3(rawWireBytes) (destroy substitution detected)`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Verify that the proof's direction matches the direction derived from the
+ * decoded destroy's signed `destroyerRole`.
+ *
+ * This is the DIRECTION check, performed AFTER decoding the destroy. The
+ * direction is NOT caller-supplied — it is derived from the signed
+ * `destroyerRole` (via `propagationDirection()`). The proof's `direction`
+ * MUST match this derived direction. A proof with the wrong direction
+ * (e.g., a BACKWARD proof for a FORWARD destroy) is REJECTED.
+ *
+ * @param proof - the incoming PropagationChannelProof (already verified via
+ *   `verifyIncomingPropagationChannelProof`)
+ * @param destroy - the decoded CircuitDestroy (from the raw wire bytes)
+ */
+export function verifyPropagationDirection(
+  proof: PropagationChannelProof,
+  destroy: CircuitDestroy,
+): { ok: true } | { ok: false; reason: string } {
+  const expectedDirection = propagationDirection(destroy);
+  if (proof.direction !== expectedDirection) {
+    return {
+      ok: false,
+      reason: `propagation direction mismatch: proof.direction "${proof.direction}" !== derived direction "${expectedDirection}" (the proof's direction contradicts the signed destroyerRole)`,
     };
   }
   return { ok: true };
@@ -901,7 +1000,7 @@ export class InProcessCircuitDestroyTransport implements CircuitDestroyTransport
   // Queue of (wireBytes, proof) per next-hop NodeId.
   private readonly queues = new Map<string, Array<{ wireBytes: Uint8Array; proof: PropagationChannelProof }>>();
   // Pending receive() waiters per localNodeId.
-  private readonly waiters = new Map<string, Array<(result: { ok: true; wireBytes: Uint8Array } | { ok: false; reason: string }) => void>>();
+  private readonly waiters = new Map<string, Array<(result: { ok: true; wireBytes: Uint8Array; proof: PropagationChannelProof } | { ok: false; reason: string }) => void>>();
 
   /**
    * Send the destroy wire bytes to the next hop. Signs a PropagationChannelProof
@@ -917,10 +1016,13 @@ export class InProcessCircuitDestroyTransport implements CircuitDestroyTransport
       return { ok: false, reason: `transport binding failed: link.remoteNodeId "${ctx.authenticatedLink.remoteNodeId}" !== ctx.nextHopNodeId "${ctx.nextHopNodeId}" (peer mismatch)` };
     }
     // 2. Sign the PropagationChannelProof (binds senderNodeId, receiverNodeId,
-    //    circuitId, commitmentRoot, direction — signed by the sender's Ed25519 key).
+    //    circuitId, commitmentRoot, direction, AND destroyDigest — signed by
+    //    the sender's Ed25519 key). The destroyDigest binds the proof to the
+    //    EXACT destroy bytes being propagated.
     const proof = signPropagationChannelProof(
       ctx.localNodeId, ctx.nextHopNodeId,
       ctx.circuitId, ctx.commitmentRoot, ctx.direction,
+      wireBytes, // hash the EXACT bytes being sent
       ctx.senderEd25519SecretKey, ctx.senderEd25519PublicKey,
     );
     // 3. Enqueue the wire bytes + proof for the next hop.
@@ -936,15 +1038,15 @@ export class InProcessCircuitDestroyTransport implements CircuitDestroyTransport
     if (waiters && waiters.length > 0) {
       const waiter = waiters.shift()!;
       const item = queue.shift()!;
-      // The receiver verifies the proof against its context.
+      // The receiver verifies the proof against its context + the raw wire bytes.
       const verifyResult = verifyIncomingPropagationChannelProof(item.proof, {
         localNodeId: ctx.nextHopNodeId,
         expectedRemoteNodeId: ctx.localNodeId,
         circuitId: ctx.circuitId,
         commitmentRoot: ctx.commitmentRoot,
-      });
+      }, item.wireBytes);
       if (verifyResult.ok) {
-        waiter({ ok: true, wireBytes: item.wireBytes });
+        waiter({ ok: true, wireBytes: item.wireBytes, proof: item.proof });
       } else {
         waiter({ ok: false, reason: verifyResult.reason });
       }
@@ -957,14 +1059,14 @@ export class InProcessCircuitDestroyTransport implements CircuitDestroyTransport
    * Receive the destroy wire bytes, AUTHENTICATED. Verifies the incoming
    * PropagationChannelProof against the receiver's context before delivering.
    */
-  async receive(ctx: AuthenticatedReceiveContext): Promise<{ ok: true; wireBytes: Uint8Array } | { ok: false; reason: string }> {
+  async receive(ctx: AuthenticatedReceiveContext): Promise<{ ok: true; wireBytes: Uint8Array; proof: PropagationChannelProof } | { ok: false; reason: string }> {
     return new Promise((resolve) => {
       const queue = this.queues.get(ctx.localNodeId);
       if (queue && queue.length > 0) {
         const item = queue.shift()!;
-        const verifyResult = verifyIncomingPropagationChannelProof(item.proof, ctx);
+        const verifyResult = verifyIncomingPropagationChannelProof(item.proof, ctx, item.wireBytes);
         if (verifyResult.ok) {
-          resolve({ ok: true, wireBytes: item.wireBytes });
+          resolve({ ok: true, wireBytes: item.wireBytes, proof: item.proof });
         } else {
           resolve({ ok: false, reason: verifyResult.reason });
         }

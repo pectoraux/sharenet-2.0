@@ -183,7 +183,8 @@ function pushSchemaToDb(dbPath: string) {
  */
 const PARTICIPANT_SCRIPT = `
 const { createServer, connect } = require("net");
-const { propagateCircuitDestroy, TopologyNextHopResolver, propagationDirection } = require("${join(process.cwd(), "reference/circuit/propagation.ts").replace(/\\/g, "\\\\")}");
+const { propagateCircuitDestroy, TopologyNextHopResolver, propagationDirection, verifyPropagationDirection } = require("${join(process.cwd(), "reference/circuit/propagation.ts").replace(/\\/g, "\\\\")}");
+const { decodeCircuitDestroy } = require("${join(process.cwd(), "reference/circuit/destroy.ts").replace(/\\/g, "\\\\")}");
 const { DurableSqliteCircuitDestroyStore } = require("${join(process.cwd(), "src/lib/sharenet/durable-circuit-replay-stores.ts").replace(/\\/g, "\\\\")}");
 const { TcpCircuitDestroyTransport } = require("${join(process.cwd(), "src/lib/sharenet/circuit-destroy-transport.ts").replace(/\\/g, "\\\\")}");
 
@@ -214,7 +215,13 @@ process.stdin.on("end", async () => {
     floorStore: { getFloor: async () => 0n, checkAndAdvance: async () => ({ ok: true }) },
   };
 
-  const destroyStore = new DurableSqliteCircuitDestroyStore();
+  // The DurableSqliteCircuitDestroyStore uses the app-global db (which reads
+  // DATABASE_URL from the env). In the child process, the "@/lib/db" alias
+  // does NOT resolve via bun -e — so we construct a PrismaClient directly
+  // + pass it to the store constructor.
+  const { PrismaClient } = require("@prisma/client");
+  const prisma = new PrismaClient();
+  const destroyStore = new DurableSqliteCircuitDestroyStore(prisma);
   const gatewayProofBytes = config.gatewayProofHex ? Buffer.from(config.gatewayProofHex, "hex") : undefined;
 
   // Build the authenticated links map: a mock AuthenticatedLink per neighbor.
@@ -273,7 +280,8 @@ process.stdin.on("end", async () => {
   // Receive the destroy wire bytes over TCP (the real authenticated transport).
   // The receive context binds: localNodeId, expectedRemoteNodeId, circuitId,
   // commitmentRoot. The transport verifies the incoming PropagationChannelProof
-  // against this context before delivering the bytes.
+  // against this context before delivering the bytes. The receive also returns
+  // the verified proof (so the caller can verify the direction after decoding).
   const receiveResult = await transport.receive({
     localNodeId: config.localNodeId,
     expectedRemoteNodeId: config.expectedRemoteNodeId,
@@ -287,6 +295,26 @@ process.stdin.on("end", async () => {
     return;
   }
   const wireBytes = receiveResult.wireBytes;
+  const proof = receiveResult.proof;
+
+  // Verify the DIRECTION at the receive boundary: decode the destroy +
+  // derive the direction from the signed destroyerRole, then verify the
+  // proof's direction matches. This is NOT caller-supplied — the direction
+  // is protocol state (from the signed destroy).
+  const decoded = decodeCircuitDestroy(wireBytes);
+  if (!decoded.ok) {
+    process.stdout.write(JSON.stringify({ ok: false, reason: "destroy decode failed at receive boundary: " + decoded.reason }));
+    await transport.stop();
+    process.exit(0);
+    return;
+  }
+  const dirResult = verifyPropagationDirection(proof, decoded.circuitDestroy);
+  if (!dirResult.ok) {
+    process.stdout.write(JSON.stringify({ ok: false, reason: "direction verification failed at receive boundary: " + dirResult.reason }));
+    await transport.stop();
+    process.exit(0);
+    return;
+  }
 
   // Call the PRODUCTION propagateCircuitDestroy (owns process + resolve + send).
   const senderSk = Buffer.from(config.senderEd25519SecretKeyHex, "hex");
@@ -821,14 +849,15 @@ describe("R-009 Stage 3 Phase 3 (production transport): restart", () => {
     // delivering the destroy to propagateCircuitDestroy().
     const { connect } = await import("node:net");
     const buildProofAndWireBytes = (): Buffer => {
+      const wireBytes = Buffer.from(encodeCircuitDestroy(destroy));
       const proof = signPropagationChannelProof(
         topo.route.initiator.nodeId, // senderNodeId (the previous hop)
         topo.hopNodeIds[0]!, // receiverNodeId (relay0)
         topo.circuit.circuitId, topo.circuit.commitmentRoot, "FORWARD",
+        wireBytes, // hash the EXACT destroy bytes
         topo.initiatorKp.secretKey, topo.initiatorKp.publicKey,
       );
       const proofBytes = Buffer.from(encodePropagationChannelProof(proof));
-      const wireBytes = Buffer.from(encodeCircuitDestroy(destroy));
       const proofLenBuf = Buffer.alloc(4);
       proofLenBuf.writeUInt32BE(proofBytes.length, 0);
       const destroyLenBuf = Buffer.alloc(4);
@@ -1094,12 +1123,14 @@ describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", 
 
     const circuitId = new Uint8Array(32).fill(0xab);
     const commitmentRoot = new Uint8Array(32).fill(0xcd);
+    const fakeWireBytes = new Uint8Array([1, 2, 3, 4, 5]);
 
     // FORGE: sign the proof with the ATTACKER's key, but claim the sender's NodeId.
     // The verifyNodeIdBinding check catches this (attacker's key doesn't derive
     // the sender's NodeId).
     const forgedProof = signPropagationChannelProof(
       senderNodeId, "receiver", circuitId, commitmentRoot, "FORWARD",
+      fakeWireBytes,
       attackerKp.secretKey, attackerKp.publicKey, // attacker's key
     );
     const result = verifyPropagationChannelProof(forgedProof);
@@ -1115,8 +1146,10 @@ describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", 
     // A proof for circuit A.
     const circuitAId = new Uint8Array(32).fill(0xab);
     const commitmentRootA = new Uint8Array(32).fill(0xcd);
+    const wireBytesA = new Uint8Array([1, 2, 3, 4, 5]);
     const proofA = signPropagationChannelProof(
       senderNodeId, "receiver", circuitAId, commitmentRootA, "FORWARD",
+      wireBytesA,
       senderKp.secretKey, senderKp.publicKey,
     );
 
@@ -1129,8 +1162,181 @@ describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", 
       expectedRemoteNodeId: senderNodeId,
       circuitId: circuitBId, // MISMATCH — expects circuit B
       commitmentRoot: commitmentRootB,
-    });
+    }, wireBytesA);
     expect(result.ok).toBe(false);
     if (!result.ok) expect(result.reason).toContain("wrong circuit context");
+  });
+
+  // ---- destroyDigest adversarial tests (Fix #1) ----
+
+  test("receiver REJECTS destroy substitution (proof for destroy A, different destroy B delivered)", async () => {
+    const { signPropagationChannelProof, verifyIncomingPropagationChannelProof } = await import("@reference/circuit/propagation");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    // Proof signed over destroy A's bytes.
+    const wireBytesA = new Uint8Array([1, 2, 3, 4, 5]);
+    const proofA = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitId, commitmentRoot, "FORWARD",
+      wireBytesA, senderKp.secretKey, senderKp.publicKey,
+    );
+
+    // But deliver destroy B's bytes → the destroyDigest check catches this.
+    const wireBytesB = new Uint8Array([9, 8, 7, 6, 5]);
+    const result = verifyIncomingPropagationChannelProof(proofA, {
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId, commitmentRoot,
+    }, wireBytesB); // DIFFERENT bytes → digest mismatch
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("destroy substitution detected");
+  });
+
+  test("receiver REJECTS destroy byte mutation (one byte flipped)", async () => {
+    const { signPropagationChannelProof, verifyIncomingPropagationChannelProof } = await import("@reference/circuit/propagation");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    const wireBytes = new Uint8Array([1, 2, 3, 4, 5]);
+    const proof = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitId, commitmentRoot, "FORWARD",
+      wireBytes, senderKp.secretKey, senderKp.publicKey,
+    );
+
+    // Flip one byte → the digest changes → mismatch.
+    const mutatedWireBytes = new Uint8Array([...wireBytes]);
+    mutatedWireBytes[0] ^= 0x01;
+    const result = verifyIncomingPropagationChannelProof(proof, {
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId, commitmentRoot,
+    }, mutatedWireBytes);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("destroy substitution detected");
+  });
+
+  test("receiver REJECTS destroyDigest mutation (proof's digest does not match the bytes)", async () => {
+    const { signPropagationChannelProof, verifyPropagationChannelProof, computeDestroyDigest } = await import("@reference/circuit/propagation");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    const wireBytes = new Uint8Array([1, 2, 3, 4, 5]);
+    const proof = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitId, commitmentRoot, "FORWARD",
+      wireBytes, senderKp.secretKey, senderKp.publicKey,
+    );
+
+    // Tamper the destroyDigest → the signature check catches this (the digest
+    // is covered by the signature).
+    const tamperedProof = { ...proof, destroyDigest: new Uint8Array(32).fill(0xff) };
+    const result = verifyPropagationChannelProof(tamperedProof);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("signature invalid");
+  });
+
+  test("receiver REJECTS proof signature mutation", async () => {
+    const { signPropagationChannelProof, verifyPropagationChannelProof } = await import("@reference/circuit/propagation");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+    const wireBytes = new Uint8Array([1, 2, 3, 4, 5]);
+    const proof = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitId, commitmentRoot, "FORWARD",
+      wireBytes, senderKp.secretKey, senderKp.publicKey,
+    );
+
+    // Flip a byte in the signature → invalid.
+    const tamperedProof = { ...proof, signature: new Uint8Array([...proof.signature]) };
+    tamperedProof.signature[0] ^= 0x01;
+    const result = verifyPropagationChannelProof(tamperedProof);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("signature invalid");
+  });
+
+  // ---- direction adversarial tests (Fix #2) ----
+
+  test("receiver REJECTS opposite proof direction (BACKWARD proof for FORWARD destroy)", async () => {
+    const { signPropagationChannelProof, verifyPropagationDirection } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, encodeCircuitDestroy, DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    // Sign an INITIATOR destroy (direction = FORWARD) + sign a BACKWARD proof.
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600,
+      senderKp.secretKey, senderKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+    const proof = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitId, commitmentRoot, "BACKWARD", // WRONG direction
+      wireBytes, senderKp.secretKey, senderKp.publicKey,
+    );
+
+    // The direction check: proof.direction (BACKWARD) !== derived (FORWARD).
+    const result = verifyPropagationDirection(proof, destroy);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("direction mismatch");
+  });
+
+  test("receiver ACCEPTS correct direction (FORWARD proof for FORWARD destroy)", async () => {
+    const { signPropagationChannelProof, verifyPropagationDirection } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, encodeCircuitDestroy, DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600,
+      senderKp.secretKey, senderKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+    const proof = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitId, commitmentRoot, "FORWARD", // CORRECT
+      wireBytes, senderKp.secretKey, senderKp.publicKey,
+    );
+    const result = verifyPropagationDirection(proof, destroy);
+    expect(result.ok).toBe(true);
+  });
+
+  test("receiver REJECTS mutated proof direction (FORWARD proof, BACKWARD destroy)", async () => {
+    const { signPropagationChannelProof, verifyPropagationDirection } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, DESTROYER_ROLE_GATEWAY, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    // Sign a GATEWAY destroy (direction = BACKWARD).
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_GATEWAY, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600,
+      senderKp.secretKey, senderKp.publicKey,
+    );
+
+    // Mutate the proof's direction to FORWARD (contradicts the signed destroy).
+    const proof = signPropagationChannelProof(
+      senderNodeId, "receiver", circuitId, commitmentRoot, "FORWARD", // WRONG
+      new Uint8Array([1, 2, 3]), senderKp.secretKey, senderKp.publicKey,
+    );
+
+    // The direction check: proof.direction (FORWARD) !== derived (BACKWARD).
+    const result = verifyPropagationDirection(proof, destroy);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("direction mismatch");
   });
 });

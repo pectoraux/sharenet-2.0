@@ -2796,3 +2796,39 @@ Verification (all five required suites):
 Stage Summary:
 - R-009 Stage 3 Phase 3 final transport hardening is complete: the transport is AUTHENTICATED END-TO-END. Every destroy hop traverses an authenticated peer/channel bound to the intended participant, circuit, route, and direction. The PropagationChannelProof is a REAL cryptographic proof (signed by the sender's Ed25519 node identity key, verified by the receiver) — not a forgeable plain object. The original signed destroy bytes remain unchanged. Each receiver validates the forwarding peer before teardown. Durable revoke/zeroize semantics remain intact.
 - Closure criterion satisfied: "Every CircuitDestroy hop traverses an authenticated peer/channel bound to the intended participant, circuit, route, and direction; the original signed destroy bytes remain unchanged; each receiver validates the forwarding peer before teardown; and durable revoke/zeroize semantics remain intact."
+
+---
+Task ID: R009-S3-P3-proof-hardening
+Agent: orchestrator
+Task: R-009 Stage 3 Phase 3 final transport-proof hardening — destroyDigest + direction enforcement.
+
+Work Log:
+- Audited actual GitHub HEAD (4828b5f): confirmed the PropagationChannelProof had NO destroyDigest binding + the verifyIncomingPropagationChannelProof explicitly SKIPPED direction verification ("The direction is NOT checked here").
+
+Fixes applied:
+- Fix #1 (destroyDigest): Added `destroyDigest: Uint8Array` (BLAKE3-256 of the EXACT CircuitDestroy wire bytes) to PropagationChannelProof. Updated propagationChannelProofSigningPayload to include destroyDigest. Updated signPropagationChannelProof to take `wireBytes` + hash it BEFORE any decoding. Updated verifyIncomingPropagationChannelProof to take `rawWireBytes` + compute BLAKE3 + compare with proof.destroyDigest. Updated encode/decode for the new field. The digest is covered by the Ed25519 signature, so tampering with the digest invalidates the signature.
+- Fix #2 (direction enforcement): Added `verifyPropagationDirection(proof, destroy)` — verifies proof.direction === propagationDirection(destroy.destroyerRole). The direction is derived from the SIGNED destroyerRole (NOT caller-supplied). Updated the PARTICIPANT_SCRIPT to call verifyPropagationDirection after receiving + decoding the destroy. Removed the "direction is NOT checked here" comment. The receive flow is now: receive (proof + digest verification) → decode → verifyPropagationDirection → processCircuitDestroy.
+- Fix #3 (ADR-0023): Updated ADR-0023 §3 (propagated artifact is now digest-bound), §3a (PropagationChannelProof = portable cryptographic channel authentication attesting sender+receiver+circuit+route+direction+EXACT destroy artifact; AuthenticatedLink is local-only topology), §3b (direction enforcement at the receive boundary — derived from the signed destroyerRole, NOT caller-supplied).
+
+Adversarial tests (+7, 15 total binding tests):
+- destroy substitution (proof for destroy A, different destroy B delivered) → REJECT (destroyDigest mismatch)
+- destroy byte mutation (one byte flipped) → REJECT (destroyDigest mismatch)
+- destroyDigest mutation (proof's digest tampered) → REJECT (signature invalid — digest is signed)
+- proof signature mutation → REJECT (signature invalid)
+- opposite proof direction (BACKWARD proof for FORWARD destroy) → REJECT (direction mismatch)
+- correct direction (FORWARD proof for FORWARD destroy) → ACCEPT
+- mutated proof direction (FORWARD proof for BACKWARD destroy) → REJECT (direction mismatch)
+
+Multi-process tests: all 4 pass (forward, backward, transport-failure, restart). The PARTICIPANT_SCRIPT now verifies the direction at the receive boundary (decode → verifyPropagationDirection → processCircuitDestroy).
+
+Root cause found + fixed: prisma generate was needed (the generated client was missing circuitRevocation + consumedCircuitDestroy models). Ran `bunx prisma generate`. Also fixed the child process PrismaClient construction (the "@/lib/db" alias does not resolve in bun -e — the PARTICIPANT_SCRIPT now constructs a PrismaClient directly + passes it to the DurableSqliteCircuitDestroyStore constructor).
+
+Verification (all five required suites):
+- Unit tests: 552 pass / 0 fail (was 545; +7 adversarial). 2034 expect() calls across 33 files.
+- Architecture tests: 24/24 pass.
+- TS conformance vectors: 41/41 pass.
+- Python conformance vectors: 41/41 pass.
+- Lint: clean (exit 0).
+
+Stage Summary:
+- The PropagationChannelProof now cryptographically authenticates: sender, receiver, circuit, route, direction, AND the EXACT CircuitDestroy event (via destroyDigest = BLAKE3(exact wire bytes)). An attacker cannot substitute a different destroy, mutate bytes, forge a proof, copy a proof from another circuit, or redirect propagation via direction tampering. The direction is derived from the signed destroyerRole — NOT caller-supplied.

@@ -71,7 +71,7 @@ it originated the message or to redirect propagation.
 There is NO caller-controlled `propagate: true` or `origin: "gateway"` boolean.
 The direction is protocol state.
 
-### 3. Propagated artifact (byte-for-byte unchanged)
+### 3. Propagated artifact (byte-for-byte unchanged + digest-bound)
 
 The destroy message MUST remain **byte-for-byte identical** across all hops:
 
@@ -83,21 +83,75 @@ verify
 forward unchanged
 ```
 
-A relay MUST NOT re-sign as itself. A relay MUST NOT re-encode the destroy
-(even though canonical CBOR is deterministic, the relay MUST forward the
-exact input bytes it received — this is the verifiable propagation
-invariant). `processCircuitDestroy` returns the original `wireBytes` in its
-result so the caller can forward them directly without re-encoding.
+A relay MUST NOT re-sign as itself. A relay MUST NOT re-encode the destroy.
+`processCircuitDestroy` returns the original `wireBytes` in its result so the
+caller can forward them directly without re-encoding.
+
+**The PropagationChannelProof is bound to the EXACT destroy bytes via
+`destroyDigest = BLAKE3(exact wire bytes)`** (R-009 Stage 3 Phase 3 final
+transport-proof hardening). The sender hashes the raw wireBytes BEFORE any
+decoding; the receiver hashes the raw received bytes + compares with
+`proof.destroyDigest`. A mismatch (destroy substitution, byte mutation) is
+REJECTED. The digest is covered by the proof's Ed25519 signature, so an
+attacker cannot tamper with the digest without invalidating the signature.
 
 If ANY field of the destroy is changed by a relay:
 - `destroyerNodeId`, `destroyerRole`, `destroyReason`, `destroyNonce`,
   `circuitId`, `commitmentRoot`, `issuedAt`, `expiry`,
   `destroyerEd25519PublicKey`, `signature`
 
-→ the signature verification at the next hop FAILS (the signature covers
-all binding fields except the signature itself). A relay that tampers with
-any field is caught by the downstream `verifyCircuitDestroy` signature
-check.
+→ the `destroyDigest` check catches the substitution (the received bytes'
+BLAKE3 digest will not match `proof.destroyDigest`), AND the signature
+verification at the next hop FAILS (the signature covers all binding fields).
+
+### 3a. PropagationChannelProof = portable cryptographic channel authentication
+
+The `PropagationChannelProof` is the **portable network credential** for
+destroy propagation. It attests:
+
+```
+sender      (senderNodeId + senderEd25519PublicKey + verifyNodeIdBinding)
+receiver    (receiverNodeId)
+circuit     (circuitId)
+route       (commitmentRoot)
+direction   (FORWARD or BACKWARD, derived from the signed destroyerRole)
+EXACT destroy artifact (destroyDigest = BLAKE3(exact wire bytes))
+```
+
+All six are covered by the sender's Ed25519 signature. The receiver verifies
+ALL six before delivering the destroy to `processCircuitDestroy()`.
+
+The `AuthenticatedLink` remains a **local-only topology/proof artifact**
+(WeakSet-registered, in-process). It MUST NOT be treated as the portable
+network credential. The `PropagationChannelProof` is the sole portable
+authentication for the transport hop — it crosses process/language boundaries
+as canonical CBOR + is independently verifiable by any implementation.
+
+### 3b. Direction enforcement at the receive boundary
+
+The proof's `direction` is verified at the receive boundary, AFTER decoding
+the destroy:
+
+```
+raw destroy
+  ↓
+decode
+  ↓
+verify CircuitDestroy (signature + routeId + role + semantic validity)
+  ↓
+propagationDirection(destroy.destroyerRole)  → derived direction
+  ↓
+verify proof.direction === derived direction
+  ↓
+verify destroyDigest
+  ↓
+processCircuitDestroy
+```
+
+The direction is NOT caller-supplied — it is derived from the signed
+`destroyerRole`. A proof with the wrong direction (e.g., a BACKWARD proof
+for a FORWARD destroy) is REJECTED. This prevents an attacker from
+redirecting propagation by tampering with the proof's direction field.
 
 ### 4. Local effect (processing order)
 
