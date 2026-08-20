@@ -2870,3 +2870,187 @@ Verification (all five required suites):
 
 Stage Summary:
 - The production receive path — receiveAuthenticatedCircuitDestroy() — now OWNS direction enforcement. A caller cannot obtain an authenticated destroy from the transport while direction remains unchecked. The direction is derived from the signed destroyerRole (NOT caller-supplied) + verified against the proof's direction inside the production function. The multi-process tests use this canonical function; the test no longer calls verifyPropagationDirection itself.
+---
+Task ID: P4-audit
+Agent: general-purpose
+Task: Audit ShareNet 2.0 repository for R-009 Stage 3 Phase 4 (Failure Detection + Durable Circuit Invalidation). Research only — NO file modifications.
+
+Scope: 8 files inspected for failure-detection + circuit-invalidation primitives already in place + the integration gaps Phase 4 must close. Reported findings per-file (interfaces, types, exported functions, state machines, constants, current failure-handling capabilities).
+
+Per-file findings:
+
+1. reference/link/link.ts (175 lines)
+   - LinkState type (string-literal union, NOT enum): `"LINK_PENDING" | "ADV_VERIFIED" | "LINK_UP" | "LINK_DOWN"`.
+   - LinkEvent is a discriminated union of 4 cases; the LINK_DOWN case is `{ type: "LINK_DOWN"; linkId: string; reason: string; at: number }` — there is NO separate `LinkDownEvent` type, the field is embedded in the LinkEvent union.
+   - NO `handleLinkEvent` function in this file — only the LinkEvent type is defined.
+   - NO explicit create/destroy link lifecycle functions. Exports: `deriveLinkId(localNodeId, remoteNodeId, localNonce, remoteNonce): string`; `generateLinkNonce(): Uint8Array`; `isValidLinkIdFormat(linkId): boolean`; `CREATE_LINK_FROM_ENDPOINT_FORBIDDEN(endpoint): never` (architecture guard that always throws — an advertised endpoint is NOT a usable link).
+   - Constants: `LINK_ID_DOMAIN = "SHARENET/LINK/ID/1"`, `LINK_ID_PREFIX = "link:"`, `LINK_ID_HASH_BYTES = 32`, `LINK_NONCE_BYTES = 16`.
+   - DirectedLink interface carries mutable `state: LinkState` + `stateChangedAt: number` + `createdAt: number`.
+   - File is identity/derivation only — there is NO link lifecycle manager, NO event emitter, NO listener registration. The LINK_DOWN case exists only as a type — nothing in this file emits it.
+
+2. reference/transport/link-auth-state.ts (361 lines)
+   - LinkAuthState type (7 states): `"AD_CREATED" | "AD_VERIFIED" | "HANDSHAKE_CHALLENGE" | "PROOF_OF_POSSESSION" | "TRANSCRIPT_VERIFIED" | "LINK_UP" | "LINK_DOWN"`.
+   - VALID_TRANSITIONS map: every non-LINK_DOWN state may transition to LINK_DOWN; LINK_DOWN's allowed-targets list is `[]` (terminal, no recovery). LINK_UP → LINK_DOWN only.
+   - `LinkAuthStateMachine` class — evidence-carrying. The generic `transition(newState, reason)` API is REMOVED for security-sensitive states. Methods:
+     * `advanceToAdVerified(verified: VerifiedNodeAdvertisement, now?): boolean`
+     * `advanceToHandshakeChallenge(challenge: Uint8Array, now?): boolean` (32-byte challenge; stored, bound to consumed challenge)
+     * `advanceToProofOfPossession(consumedChallenge: ConsumedChallenge, now?): boolean` — constant-time-equal check vs issuedChallenge
+     * `advanceToTranscriptVerified(transcript: VerifiedTranscript, now?): boolean`
+     * `advanceToLinkUp(link: AuthenticatedLink, now?): boolean` — ONLY way to reach LINK_UP
+     * `goToLinkDown(reason: string, now?): boolean` — the only LINK_DOWN path; takes a freeform `reason` string; always allowed from any non-terminal state; does NOT require a proof artifact
+     * `getState()`, `getAuthenticatedLink(): AuthenticatedLink | null`, `getVerifiedTranscript(): VerifiedTranscript | null`, `getTransitionLog(): readonly TransitionLogEntry[]`, `isLinkUp(): boolean`, `isAdvVerifiedOnly(): boolean`
+   - LINK_DOWN handling: `goToLinkDown(reason)` is the failure-signal entry. The reason is a freeform string. State is terminal.
+   - Failure signals: NO typed failure reason enum / code. NO event/callback/observer — caller must poll `getState()` or read the transition log. NO upward propagation to RecoveryManager.
+   - Architecture guards: `ADV_TO_LINK_UP_FORBIDDEN(adv): never`, `HINT_TO_LINK_UP_FORBIDDEN(hint): never`, `SKIP_HANDSHAKE_FORBIDDEN(from, to): never`.
+   - Does NOT import link/link.ts — the two LinkState / LinkAuthState machines are independent string-literal unions (different granularity: link.ts has 4 coarse states, link-auth-state.ts has 7 fine states). Phase 4 will need to bridge these.
+
+3. reference/routing/recovery.ts (379 lines) — RecoveryManager (in-memory protocol-core state machine)
+   - `HealthStatus` type = `"HEALTHY" | "DEGRADED" | "DOWN"` (3 states).
+   - `InvalidationReason` type = 8 string-literal values: `"LINK_DOWN"`, `"LINK_DEGRADED"`, `"GATEWAY_DISAPPEARED"`, `"CIRCUIT_EXPIRED"`, `"ROUTE_EXPIRED"`, `"PEER_REVOKED"`, `"MANUAL_INVALIDATION"`, `"RELAY_UNREACHABLE"`.
+   - `LinkHealthEvent` interface: `{ linkId; localNodeId; remoteNodeId; newStatus: HealthStatus; reason: InvalidationReason; observedAt }` — this is the receiver-side event shape that handleLinkEvent consumes.
+   - `RouteHealthRecord`, `CircuitHealthRecord` interfaces — both carry `status`, `invalidationReason?`, `invalidatedAt?`.
+   - `RecoveryManager` class — storage-agnostic + IN-MEMORY only (no DB, no network, no Prisma):
+     * 5 internal Maps: `linkHealth` (linkId→status), `routeHealth` (routeId→record), `circuitHealth` (circuitIdHex→record), `nodeLinks` (nodeId→Set<linkId>), `routeLinks` (routeId→Set<linkId>)
+     * `registerLink(linkId, localNodeId, remoteNodeId): void` — sets HEALTHY + indexes by remoteNodeId
+     * `registerRoute(route: CommittedRoute, circuitIdHex, linkIdsByHop: string[], establishedAt): void` — populates routeLinks + sets HEALTHY for route + circuit
+     * `handleLinkEvent(event: LinkHealthEvent): string[]` — the CALLABLE STATE MACHINE. On `newStatus === "DOWN"`: calls `invalidateRoutesUsingLink(linkId, reason, at)` → cascades to circuits via `invalidateRoute` → returns invalidated routeIds. On `"DEGRADED"`: `markRoutesDegraded(linkId)` (no invalidation). Returns the list of invalidated routeIds (caller's responsibility to act on them).
+     * `handleGatewayDisappearance(gatewayNodeId, observedAt): string[]` — invalidates all links to that gateway + any route with the gateway as a hop. Reason code = `"GATEWAY_DISAPPEARED"`.
+     * `getRouteHealth(routeId)`, `getCircuitHealth(circuitIdHex)`, `getHealthyRoutes()`, `getInvalidatedRoutes()`
+     * PRIVATE: `invalidateRoutesUsingLink`, `invalidateRoute` (cascades to circuit, idempotent — skips already-DOWN), `markRoutesDegraded`
+   - `GatewayCandidate` interface: `{ nodeId; capability; endpoint; linkUp; estimatedLatencyMs? }`.
+   - `discoverAlternativeGateways(availableNodes, requiredCapability, excludeNodeIds = []): GatewayCandidate[]` — filters by capability + linkUp + not excluded; sorts by latency.
+   - `RecoveryPlan` interface: `{ invalidatedRouteIds: string[]; reason: InvalidationReason; candidateGateways: GatewayCandidate[]; nextStep: "DISCOVER_NEW_GATEWAY" | "WAIT_FOR_LINK_RECOVERY" | "NO_RECOVERY_POSSIBLE"; recommendation: string }`.
+   - `createRecoveryPlan(invalidatedRouteIds, reason, availableNodes, requiredCapability, excludeNodeIds = []): RecoveryPlan` — DESCRIPTIVE ONLY; does NOT execute recovery; just identifies next steps.
+   - `TCP_MIGRATION_FORBIDDEN(circuitId): never` architecture guard — no transparent TCP migration; recovery must build NEW route + NEW circuit.
+
+   Production-integrated vs callable state machine (KEY distinction):
+   - This module is purely a callable state machine. NOT production-integrated into the destroy/teardown path:
+     * It does NOT call `processCircuitDestroy` / `propagateCircuitDestroy` when a route is invalidated — it only mutates in-memory `RouteHealthRecord.status = "DOWN"`.
+     * It does NOT emit a CircuitDestroy with `DESTROY_REASON_LINK_FAILURE` (0x03) or `DESTROY_REASON_GATEWAY_DISAPPEARANCE` (0x04).
+     * It does NOT subscribe to `LinkAuthStateMachine.goToLinkDown()` — there is NO bridge from transport LINK_DOWN → RecoveryManager.handleLinkEvent.
+     * It does NOT persist anything — all state is lost on process restart.
+     * It does NOT receive events automatically — a caller must invoke `handleLinkEvent(event)` with a hand-constructed LinkHealthEvent.
+   - The two integration gaps Phase 4 must close:
+     (a) transport/link-auth-state.goToLinkDown(reason) → RecoveryManager.handleLinkEvent({ newStatus: "DOWN", reason: "LINK_DOWN" | "RELAY_UNREACHABLE" | "GATEWAY_DISAPPEARED", ...})
+     (b) RecoveryManager.invalidateRoute(...) → propagateCircuitDestroy(...) with destroyReason ∈ { DESTROY_REASON_LINK_FAILURE, DESTROY_REASON_GATEWAY_DISAPPEARANCE }
+
+4. reference/circuit/propagation.ts exports list (1202 lines) — what is ALREADY available
+   - Constants: `PROPAGATION_CHANNEL_PROOF_DOMAIN = "SHARENET/CIRCUIT/PROPAGATION/CHANNEL/1"`.
+   - Re-exports: `propagationDirection` (re-exported from ./destroy).
+   - Types/interfaces: `PropagationChannelProof`, `VerifyPropagationChannelProofResult`, `DestroyPropagationContext` (carries authenticatedLink + localNodeId + nextHopNodeId + circuitId + commitmentRoot + direction + senderEd25519SecretKey + senderEd25519PublicKey), `AuthenticatedReceiveContext` (localNodeId + expectedRemoteNodeId + circuitId + commitmentRoot), `NextHopResult`, `NextHopResolver`, `TransportSendResult` (`{ ok: true } | { ok: false; reason: string }`), `CircuitDestroyTransport` (send + receive), `PropagateCircuitDestroyResult`, `ReceiveAuthenticatedCircuitDestroyResult`.
+   - Functions: `computeDestroyDigest(wireBytes)` (BLAKE3-256 of exact wire bytes), `propagationChannelProofSigningPayload(...)`, `signPropagationChannelProof(...)`, `verifyPropagationChannelProof(...)`, `encodePropagationChannelProof(proof)`, `decodePropagationChannelProof(bytes)`, `verifyIncomingPropagationChannelProof(proof, ctx)`, `verifyPropagationDirection(proof, destroy)`, `verifyAndProduceAuthenticatedDestroy(proof, ctx, wireBytes)` (full receive pipeline), `receiveAuthenticatedCircuitDestroy(transport, ctx)` (production receive entry — wraps transport.receive), `propagateCircuitDestroy(wireBytes, circuit, localNodeId, expectedInitiatorNodeId, expectedGatewayNodeId, destroyStore, now, resolver, transport, gatewayProofBytes?, senderEd25519SecretKey, senderEd25519PublicKey)` (production propagate entry — owns full pipeline: processCircuitDestroy → derive direction → resolve next hop → send over authenticated transport).
+   - Classes: `TopologyNextHopResolver` (implements NextHopResolver — constructor takes `localNodeId` + `initiatorNodeId` + topology; handles all 3 participant roles: initiator, relay, gateway, in both FORWARD + BACKWARD directions), `InProcessCircuitDestroyTransport` (implements CircuitDestroyTransport — signs/verifies proofs in-process; test transport).
+   - NO RecoveryManager-aware code here. NO handleLinkEvent. NO FailureDetector. Phase 4 will need to bridge RecoveryManager output (invalidated routeIds + reason) into a `propagateCircuitDestroy` call with the appropriate `destroyReason` from destroy.ts.
+
+5. reference/circuit/destroy.ts DESTROY_REASON_* constants (762 lines)
+   - `DESTROY_REASON_OPERATOR_INITIATED = 0x01 as const`
+   - `DESTROY_REASON_CIRCUIT_EXPIRED = 0x02 as const`
+   - `DESTROY_REASON_LINK_FAILURE = 0x03 as const` ← Phase 4 Failure-Detection reason (transport close, socket error)
+   - `DESTROY_REASON_GATEWAY_DISAPPEARANCE = 0x04 as const` ← Phase 4 Failure-Detection reason (gateway node offline)
+   - `DESTROY_REASON_PROTOCOL_VIOLATION = 0x05 as const`
+   - Related role/domain constants: `DESTROYER_ROLE_INITIATOR = 0x01`, `DESTROYER_ROLE_GATEWAY = 0x02`, `CIRCUIT_DESTROY_DOMAIN = "SHARENET/CIRCUIT/DESTROY/1"`, `CIRCUIT_DESTROY_MAX_CLOCK_SKEW_SECONDS = 300`.
+   - KEY: the 5 reason codes are FROZEN protocol-level enum values. Phase 4 has two ready-made reasons (`LINK_FAILURE`, `GATEWAY_DISAPPEARANCE`) for wiring transport/gateway-down → CircuitDestroy — NO new reason code needed. They already align 1:1 with `InvalidationReason` (`"LINK_DOWN"` → 0x03, `"GATEWAY_DISAPPEARED"` → 0x04, `"RELAY_UNREACHABLE"` → 0x03).
+
+6. reference/circuit/replay-stores.ts CircuitDestroyStore + CircuitRevocationStore interfaces (699 lines)
+   - `CircuitRevocationStore` interface (lines 425-446) — NON-atomic single-op tombstone store:
+     * `isRevoked(circuitId: Uint8Array, commitmentRoot: Uint8Array): Promise<boolean>` — checks if a durable revocation record exists.
+     * `revoke(circuitId, commitmentRoot, destroyerNodeId, destroyerRole, destroyReason, destroyNonce): Promise<boolean>` — writes a durable revocation record. Idempotent (returns true if already exists). Returns false on persistence failure (fail-closed). No nonce consumption — caller is responsible for replay protection separately.
+   - `CircuitDestroyStore` interface (lines 578-614) — ATOMIC consume-nonce + write-tombstone (superset, structurally compatible with CircuitRevocationStore):
+     * `isRevoked(circuitId, commitmentRoot): Promise<boolean>` — same as above.
+     * `consumeDestroyAndRevoke(commitmentRoot, circuitId, destroyNonce, destroyerNodeId, destroyerRole, destroyReason): Promise<ConsumeDestroyAndRevokeResult>` — SINGLE ATOMIC transaction: consume the destroy nonce AND write the tombstone. Both succeed or both fail (no split state). Idempotent (returns `{ ok: true, idempotent: true }` if tombstone already exists without re-consuming the nonce). Returns `{ ok: false, reason }` on persistence failure (fail-closed, safe to retry).
+   - `ConsumeDestroyAndRevokeResult` type (lines 539-541): `{ ok: true; idempotent: boolean } | { ok: false; reason: string }`.
+   - Plus legacy/secondary: `CircuitDestroyReplayStore` (lines 488-498, NON-atomic single `consume()` — kept for backward-compat two-store design). The atomic `CircuitDestroyStore` supersedes it for new code.
+   - KEY: the `destroyReason: number` parameter on both `revoke()` and `consumeDestroyAndRevoke()` accepts ANY of the 5 DESTROY_REASON_* constants from destroy.ts. A CircuitDestroy authored with `DESTROY_REASON_LINK_FAILURE` (0x03) will be durably tombstoned with that reason preserved in the evidence record. Phase 4 needs no schema change to persist failure-detection-originated destroys.
+
+7. src/lib/sharenet/durable-circuit-replay-stores.ts — DurableSqliteCircuitDestroyStore class (497 lines)
+   - Class: `DurableSqliteCircuitDestroyStore implements CircuitDestroyStore`.
+   - Constructor: `constructor(client?: PrismaClient)` — defaults to the app-global `db` if no client is provided. The optional client parameter was added in R-009 S3P3 to allow per-participant SQLite DBs in multi-process tests (each spawned process passes its own PrismaClient pointing at a per-participant SQLite file).
+   - `isRevoked(circuitId, commitmentRoot): Promise<boolean>` — `circuitRevocation.findUnique({ where: { circuitIdHex_commitmentRootHex: { circuitIdHex: toHex(circuitId), commitmentRootHex: toHex(commitmentRoot) } } })` → returns `row !== null`.
+   - `consumeDestroyAndRevoke(commitmentRoot, circuitId, destroyNonce, destroyerNodeId, destroyerRole, destroyReason): Promise<ConsumeDestroyAndRevokeResult>`:
+     * Pre-check idempotency: `if (await this.isRevoked(...)) return { ok: true, idempotent: true }` — short-circuits before entering the transaction.
+     * ATOMIC Prisma `$transaction([...])`: 2 operations — (1) `consumedCircuitDestroy.create({ data: { commitmentRootHex, circuitIdHex, destroyNonceHex } })` (unique constraint catches replays), (2) `circuitRevocation.create({ data: { circuitIdHex, commitmentRootHex, destroyerNodeId, destroyerRole, destroyReason, destroyNonceHex } })` (uses CREATE not UPSERT — the unique constraint on (circuitIdHex, commitmentRootHex) is the AUTHORITATIVE ACTIVE→REVOKED transition; concurrent transactions' creates fail → rollback → re-check → idempotent).
+     * On success: `return { ok: true, idempotent: false }` (this txn performed the terminal transition).
+     * On catch: re-checks `isRevoked(...)`. If now revoked → returns `{ ok: true, idempotent: true }` (another txn won the race). If still not revoked → returns `{ ok: false, reason: "atomic consumeDestroyAndRevoke transaction failed (persistence failure, fail-closed, no split state — safe to retry)" }`.
+   - Also implements `revoke(circuitId, commitmentRoot, destroyerNodeId, destroyerRole, destroyReason, destroyNonce): Promise<boolean>` via STRUCTURAL TYPING (so the same instance can be passed to both `processCircuitDestroy` (CircuitDestroyStore) AND `processCircuitWireFrame` (CircuitRevocationStore)). Uses `circuitRevocation.upsert({ where: {...}, update: {}, create: {...} })` (idempotent — does NOT overwrite). Returns false on catch (fail-closed).
+   - Related sibling classes also exported from this file (for completeness): `DurableSqliteCircuitSequenceFloorStore`, `DurableSqliteCircuitAckReplayStore`, `DurableSqliteGatewayAuthorizationReplayStore`, `DurableSqliteCircuitRevocationStore` (NON-atomic — separate nonce + tombstone writes, kept for backward compat), `DurableSqliteCircuitDestroyReplayStore` (NON-atomic single consume).
+   - KEY: this store is FULLY READY for Phase 4 — it can persist destroys authored with `DESTROY_REASON_LINK_FAILURE` or `DESTROY_REASON_GATEWAY_DISAPPEARANCE` without any schema/code change. The `destroyReason` is persisted into the `CircuitRevocation.destroyReason` Int column verbatim. No additional Phase-4 work needed at the persistence layer.
+
+8. src/lib/sharenet/circuit-destroy-transport.ts — TcpCircuitDestroyTransport class (283 lines) — socket error / disconnect handling
+   - Class: `TcpCircuitDestroyTransport implements CircuitDestroyTransport`.
+   - Constructor: `constructor(localNodeId: string, listenPort: number, peerPortRegistry: Map<string, number>)` — peerPortRegistry is a Map<NodeId, port> for sending.
+   - Internal state: `server: Server | null`, `pendingReceiver: { resolve, ctx } | null`, `receivedQueue: Array<{ proofBytes, wireBytes }>` (the queue was added in R-009 S3P3 to fix a race where destroys arriving before receive() was called were dropped).
+   - `start(): Promise<void>` — `createServer((socket) => this.handleIncoming(socket))`, listens on 127.0.0.1:listenPort, rejects on server error.
+   - `stop(): Promise<void>` — `server.close()`.
+   - `send(ctx, wireBytes): Promise<TransportSendResult>` — full pipeline:
+     1. Verify authenticated link binding: `ctx.authenticatedLink.localNodeId === ctx.localNodeId` + `ctx.authenticatedLink.remoteNodeId === ctx.nextHopNodeId`. Mismatch → `{ ok: false, reason: "transport binding failed: ..." }`.
+     2. Sign PropagationChannelProof (binds channel context + `destroyDigest = BLAKE3-256(exact wireBytes)`).
+     3. Look up next hop's port in `peerPortRegistry.get(ctx.nextHopNodeId)`. Missing → `{ ok: false, reason: "no known port for next-hop NodeId ... (peer not in registry)" }`.
+     4. `netConnect(port, "127.0.0.1", () => { ... })` — connect callback writes `[4 bytes proof len][proof bytes][4 bytes destroy len][destroy bytes]` (4 separate writes).
+     5. setTimeout(50ms) → `sock.end()` → `resolve({ ok: true })`.
+     6. SOCKET ERROR HANDLER: `sock.on("error", (err) => resolve({ ok: false, reason: "TCP send to ${ctx.nextHopNodeId}:${port} failed: ${err.message}" }))` — ECONNREFUSED, ECONNRESET, ETIMEDOUT, host unreachable, etc. all resolve to a fail-closed TransportSendResult. NO throw. NO retry. NO LINK_DOWN event emission to the link layer — the transport simply returns ok:false to propagateCircuitDestroy, which records `propagated: false` + `transportError` in the result; the local tombstone remains authoritative.
+   - `receive(ctx): Promise<ReceiveAuthenticatedCircuitDestroyResult>`:
+     * Verifies `ctx.localNodeId === this.localNodeId` (throws on mismatch).
+     * If `receivedQueue.length > 0`: shift an item, decode the proof, run `verifyAndProduceAuthenticatedDestroy(proof, ctx, wireBytes)` (the full verification pipeline owned by the transport — proof signature + identity + peer + circuit + route + destroyDigest + decode + verify + direction).
+     * Else: store `pendingReceiver = { resolve, ctx }` — BLOCKS forever until an incoming connection arrives.
+     * NO idle-timeout — if no destroy ever arrives, the caller blocks indefinitely (or until the process is killed).
+   - `handleIncoming(socket)` (private):
+     * `readProofAndWire(socket).then(({ proofBytes, wireBytes }) => { ... }).catch(() => { /* Ignore read errors (the connection was dropped) */ })` — read errors are silently swallowed.
+     * On success: if pendingReceiver → resolve it via `verifyAndProduceAuthenticatedDestroy`; else buffer to receivedQueue.
+     * `socket.end()` after handling — server closes the connection immediately after one destroy. No keepalive, no multiplexing.
+   - `readProofAndWire(socket)` (private helper):
+     * Length-prefixed framing state machine with 4 phases: `"proof-len" | "proof" | "destroy-len" | "destroy"`. Reads 4-byte big-endian lengths.
+     * `socket.on("data", (chunk) => { ... })` — accumulates buffers per phase.
+     * `socket.on("error", reject)` — read errors reject the readProofAndWire promise (caught in handleIncoming).
+   - KEY socket-handling gaps for Phase 4 failure detection:
+     (a) NO LINK_DOWN event emission — transport never tells the link-auth-state machine or RecoveryManager that a socket failed. A send failure returns `{ ok: false, reason }` to propagateCircuitDestroy, but does NOT cascade into a `LinkAuthStateMachine.goToLinkDown(reason)` or `RecoveryManager.handleLinkEvent({ newStatus: "DOWN", reason: "LINK_DOWN" })`. Phase 4 must bridge this.
+     (b) NO retry / reconnect logic — single attempt per send. A transient TCP error aborts propagation at this hop; the local tombstone remains, but the downstream participant never learns.
+     (c) The `receivedQueue` swallows read errors silently — if a peer connects but drops mid-read, no signal is emitted. The pendingReceiver promise is left unresolved.
+     (d) `receive(ctx)` has NO idle-timeout — a dead link (peer went away) is indistinguishable from a quiet link, so no LINK_DOWN can be inferred from a receive stall.
+     (e) NO peerPortRegistry eviction — if a peer's TCP server dies, the registry still maps its NodeId → port; subsequent sends will hit ECONNREFUSED (handled by the error handler), but the registry is never pruned.
+     (f) NO "transport healthy" probe — the only signal that a peer is alive is a successful `send()`. Phase 4 may need a periodic heartbeat or piggyback on circuit-frame acks to detect dead links proactively.
+
+Cross-file gap analysis for Phase 4 (Failure Detection + Durable Circuit Invalidation):
+
+GAP A — Transport → LinkAuthStateMachine → RecoveryManager bridge (DOES NOT EXIST):
+  Today: TcpCircuitDestroyTransport.send() resolves `{ ok: false, reason: "TCP send to ... failed: <err.message>" }` on a socket error. The result is consumed by propagateCircuitDestroy (returns `propagated: false, transportError`) and the caller is responsible for retry. Nothing tells the link-auth-state machine or the RecoveryManager that the underlying transport died.
+  Phase 4 needs: a transport-failure → LinkAuthStateMachine.goToLinkDown(reason="TCP send to <peer> failed: <err.message>") → RecoveryManager.handleLinkEvent({ newStatus: "DOWN", reason: "LINK_DOWN", linkId, localNodeId, remoteNodeId, observedAt }) cascade. The linkId + remoteNodeId are already in the AuthenticatedLink carried by DestroyPropagationContext.
+
+GAP B — RecoveryManager → CircuitDestroy authoring (DOES NOT EXIST):
+  Today: RecoveryManager.handleLinkEvent mutates in-memory RouteHealthRecord.status = "DOWN" and returns the list of invalidated routeIds. It does NOT construct a CircuitDestroy or call processCircuitDestroy / propagateCircuitDestroy. An invalidated circuit is therefore NOT durably revoked — only its in-memory health record is updated. Process restart loses the invalidation entirely.
+  Phase 4 needs: a hook from RecoveryManager.invalidateRoute(...) → construct a CircuitDestroy with `destroyReason = DESTROY_REASON_LINK_FAILURE (0x03)` (or `DESTROY_REASON_GATEWAY_DISAPPEARANCE (0x04)` for handleGatewayDisappearance), `destroyerRole = DESTROYER_ROLE_INITIATOR (0x01)` (the initiator is the natural originator of a failure-driven destroy), sign with the initiator's Ed25519 key, then call propagateCircuitDestroy(). The destroyStore (DurableSqliteCircuitDestroyStore) is already ready — no schema change needed.
+
+GAP C — LinkAuthState granularity bridge (POSSIBLY NEEDED):
+  link.ts's LinkState has 4 states (LINK_PENDING, ADV_VERIFIED, LINK_UP, LINK_DOWN). link-auth-state.ts's LinkAuthState has 7 states (AD_CREATED, AD_VERIFIED, HANDSHAKE_CHALLENGE, PROOF_OF_POSSESSION, TRANSCRIPT_VERIFIED, LINK_UP, LINK_DOWN). The two state machines are independent. There is no canonical mapping between them. If Phase 4 surfaces failure at the link-auth-state layer (e.g. a HandshakeChallenge timeout), it must decide which LinkState value to publish to the RecoveryManager (likely LINK_DOWN, since the only failure values match).
+
+GAP D — Gateway disappearance detection (DOES NOT EXIST):
+  RecoveryManager.handleGatewayDisappearance(gatewayNodeId, observedAt) exists, but NOTHING calls it. There is no gateway-liveness probe, no advertisement-TTL-based expiry feeding into it, no gossip-based "I haven't seen gateway X" signal. Phase 4 needs an input source — likely advertisement TTL expiry (spec/03) or link-liveness probe failures aggregated per-NodeId.
+
+GAP E — RecoveryPlan execution (DESCRIPTIVE ONLY):
+  createRecoveryPlan returns a RecoveryPlan with `nextStep` + `recommendation` + `candidateGateways`. Nothing executes the plan. Phase 4 may need to wire this into a recovery orchestrator that calls the RouteProposal → RouteAcceptance → RouteCommitment → CircuitSetup pipeline (the production circuit-setup path), but that is likely out of scope for "Failure Detection + Durable Circuit Invalidation" and a separate Phase 5 task.
+
+Inventory of what is already in place (no Phase-4 work needed):
+- 5 DESTROY_REASON_* constants incl. LINK_FAILURE (0x03) + GATEWAY_DISAPPEARANCE (0x04).
+- CircuitDestroyStore.consumeDestroyAndRevoke() — atomic + idempotent + fail-closed; accepts any of the 5 reason codes.
+- DurableSqliteCircuitDestroyStore — production-ready durable implementation; persists destroyReason verbatim into CircuitRevocation table.
+- RecoveryManager — callable state machine with handleLinkEvent + handleGatewayDisappearance + createRecoveryPlan.
+- InvalidationReason enum — already has the 8 failure-detection reasons (LINK_DOWN, LINK_DEGRADED, GATEWAY_DISAPPEARED, RELAY_UNREACHABLE, etc.).
+- LinkAuthStateMachine.goToLinkDown(reason) — the link-layer failure entry point.
+- propagateCircuitDestroy() — production propagation path; takes any signed CircuitDestroy (including one authored with a failure reason) and runs the full pipeline.
+- TcpCircuitDestroyTransport.send() — fail-closed TransportSendResult on socket error (already returns ok:false + reason string).
+
+Inventory of what Phase 4 must BUILD (not present today):
+- A FailureDetector (or similar) component that:
+  (i) listens to TcpCircuitDestroyTransport send/receive errors + link-auth-state goToLinkDown events,
+  (ii) translates them into LinkHealthEvent with newStatus="DOWN" + appropriate InvalidationReason,
+  (iii) calls RecoveryManager.handleLinkEvent(event).
+- A bridge from RecoveryManager.invalidateRoute → CircuitDestroy authoring (sign + propagate) with destroyReason ∈ { DESTROY_REASON_LINK_FAILURE, DESTROY_REASON_GATEWAY_DISAPPEARANCE }.
+- Possibly: a gateway-liveness probe feeding handleGatewayDisappearance.
+- Possibly: a timeout on TcpCircuitDestroyTransport.receive(ctx) so a dead-link stall surfaces as a LINK_DOWN (GAP C/F).
+- Tests proving: link-failure → durable circuit revocation (tombstone with destroyReason=0x03), gateway-disappearance → durable circuit revocation (tombstone with destroyReason=0x04), restart-survival of the failure-originated tombstone, no false-positive destroys on transient DEGRADED links.
+
+Next actions (recommended):
+1. Confirm with a Principal whether Phase 4 scope includes ONLY GAP A + GAP B (failure-detection → durable invalidation) or also GAP C/D/E (liveness probes + recovery execution).
+2. If GAP A+B only: build a FailureDetector component in src/lib/sharenet/ (or reference/routing/) that subscribes to TcpCircuitDestroyTransport send errors + LinkAuthStateMachine transitions, emits LinkHealthEvent into RecoveryManager, and on route invalidation authors a CircuitDestroy with the failure reason + calls propagateCircuitDestroy. Reuse the existing DurableSqliteCircuitDestroyStore + 5 DESTROY_REASON_* constants — no schema change.
+3. Add adversarial tests: link-failure cascades to durable tombstone with destroyReason=0x03; gateway-disappearance cascades to durable tombstone with destroyReason=0x04; restart preserves the tombstone; DEGRADED does NOT trigger a destroy.
+4. Update ADR-0022 + ADR-0023 to document the failure-detection → durable-invalidation path.
+5. Run all 5 required verification suites (unit + arch + TS vectors + Python vectors + lint).
