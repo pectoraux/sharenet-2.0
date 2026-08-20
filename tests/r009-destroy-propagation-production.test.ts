@@ -976,12 +976,20 @@ describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", 
 
   test("InProcessCircuitDestroyTransport sends exact bytes + receiver authenticates (correct peer + correct circuit)", async () => {
     const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, encodeCircuitDestroy, DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
     const transport = new InProcessCircuitDestroyTransport();
     const senderKp = await makeSenderKey();
     const senderNodeId = senderKp.nodeId;
 
     const circuitId = new Uint8Array(32).fill(0xab);
     const commitmentRoot = new Uint8Array(32).fill(0xcd);
+    // Sign a REAL CircuitDestroy (the transport now decodes + verifies it).
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600, senderKp.secretKey, senderKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
     const ctx = {
       localNodeId: senderNodeId,
       nextHopNodeId: "receiver",
@@ -991,12 +999,12 @@ describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", 
       senderEd25519SecretKey: senderKp.secretKey,
       senderEd25519PublicKey: senderKp.publicKey,
     };
-    const wireBytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
     const sendResult = await transport.send(ctx, wireBytes);
     expect(sendResult.ok).toBe(true);
 
-    // Receive — the receiver authenticates the sender via the
-    // PropagationChannelProof. Correct peer + correct circuit → ACCEPT.
+    // Receive — the transport OWNS the full verification (proof + digest +
+    // decode + verify + direction). Correct peer + correct circuit + correct
+    // direction → ACCEPT.
     const received = await transport.receive({
       localNodeId: "receiver",
       expectedRemoteNodeId: senderNodeId,
@@ -1005,6 +1013,7 @@ describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", 
     expect(received.ok).toBe(true);
     if (!received.ok) return;
     expect(toHex(received.wireBytes)).toBe(toHex(wireBytes)); // byte-for-byte identical
+    expect(received.direction).toBe("FORWARD");
   });
 
   test("receiver REJECTS wrong peer (senderNodeId !== expectedRemoteNodeId)", async () => {
@@ -1489,6 +1498,185 @@ describe("R-009 Stage 3 Phase 3 (production transport): authenticated binding", 
     // PRODUCTION receive rejects — same circuit, but the direction contradicts
     // the signed destroyerRole.
     const result = await receiveAuthenticatedCircuitDestroy(transport, {
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId, commitmentRoot,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("direction mismatch");
+  });
+
+  // ---- REGRESSION: transport.receive() DIRECTLY enforces direction ----
+  // These tests invoke transport.receive() DIRECTLY — NOT via
+  // receiveAuthenticatedCircuitDestroy(). They prove the LOWEST public
+  // production receive boundary itself rejects direction mismatch.
+
+  test("REGRESSION transport.receive() DIRECTLY ACCEPTS correct FORWARD direction", async () => {
+    const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, encodeCircuitDestroy, DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600, senderKp.secretKey, senderKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const transport = new InProcessCircuitDestroyTransport();
+    await transport.send({
+      localNodeId: senderNodeId, nextHopNodeId: "receiver",
+      circuitId, commitmentRoot, direction: "FORWARD",
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
+    }, wireBytes);
+
+    // Call transport.receive() DIRECTLY — NOT receiveAuthenticatedCircuitDestroy().
+    const result = await transport.receive({
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId, commitmentRoot,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.direction).toBe("FORWARD");
+  });
+
+  test("REGRESSION transport.receive() DIRECTLY REJECTS BACKWARD proof + FORWARD destroy", async () => {
+    const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, encodeCircuitDestroy, DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600, senderKp.secretKey, senderKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const transport = new InProcessCircuitDestroyTransport();
+    await transport.send({
+      localNodeId: senderNodeId, nextHopNodeId: "receiver",
+      circuitId, commitmentRoot, direction: "BACKWARD" as any, // WRONG
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
+    }, wireBytes);
+
+    // Call transport.receive() DIRECTLY — the direction mismatch is caught
+    // INSIDE receive(), not by a caller-side check.
+    const result = await transport.receive({
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId, commitmentRoot,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("direction mismatch");
+  });
+
+  test("REGRESSION transport.receive() DIRECTLY REJECTS FORWARD proof + BACKWARD destroy", async () => {
+    const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, encodeCircuitDestroy, DESTROYER_ROLE_GATEWAY, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_GATEWAY, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600, senderKp.secretKey, senderKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const transport = new InProcessCircuitDestroyTransport();
+    await transport.send({
+      localNodeId: senderNodeId, nextHopNodeId: "receiver",
+      circuitId, commitmentRoot, direction: "FORWARD" as any, // WRONG
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
+    }, wireBytes);
+
+    // Call transport.receive() DIRECTLY — direction mismatch caught inside.
+    const result = await transport.receive({
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId, commitmentRoot,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("direction mismatch");
+  });
+
+  test("REGRESSION transport.receive() DIRECTLY REJECTS same-circuit opposite direction", async () => {
+    const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, encodeCircuitDestroy, DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_INITIATOR, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600, senderKp.secretKey, senderKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const transport = new InProcessCircuitDestroyTransport();
+    await transport.send({
+      localNodeId: senderNodeId, nextHopNodeId: "receiver",
+      circuitId, commitmentRoot, direction: "BACKWARD" as any, // opposite
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
+    }, wireBytes);
+
+    // Call transport.receive() DIRECTLY.
+    const result = await transport.receive({
+      localNodeId: "receiver",
+      expectedRemoteNodeId: senderNodeId,
+      circuitId, commitmentRoot,
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain("direction mismatch");
+  });
+
+  test("REGRESSION transport.receive() DIRECTLY REJECTS mutated proof.direction", async () => {
+    const { InProcessCircuitDestroyTransport } = await import("@reference/circuit/propagation");
+    const { signCircuitDestroy, encodeCircuitDestroy, DESTROYER_ROLE_GATEWAY, DESTROY_REASON_OPERATOR_INITIATED } = await import("@reference/circuit/destroy");
+    const senderKp = await makeSenderKey();
+    const senderNodeId = senderKp.nodeId;
+    const circuitId = new Uint8Array(32).fill(0xab);
+    const commitmentRoot = new Uint8Array(32).fill(0xcd);
+
+    // GATEWAY destroy (direction = BACKWARD).
+    const destroy = signCircuitDestroy(
+      circuitId, commitmentRoot, senderNodeId,
+      DESTROYER_ROLE_GATEWAY, DESTROY_REASON_OPERATOR_INITIATED,
+      NOW, NOW + 3600, senderKp.secretKey, senderKp.publicKey,
+    );
+    const wireBytes = encodeCircuitDestroy(destroy);
+
+    const transport = new InProcessCircuitDestroyTransport();
+    // Send with FORWARD direction (mutated — contradicts the BACKWARD destroy).
+    await transport.send({
+      localNodeId: senderNodeId, nextHopNodeId: "receiver",
+      circuitId, commitmentRoot, direction: "FORWARD" as any, // mutated
+      authenticatedLink: fakeLink(senderNodeId, "receiver"),
+      senderEd25519SecretKey: senderKp.secretKey,
+      senderEd25519PublicKey: senderKp.publicKey,
+    }, wireBytes);
+
+    // Call transport.receive() DIRECTLY — catches the mutated direction.
+    const result = await transport.receive({
       localNodeId: "receiver",
       expectedRemoteNodeId: senderNodeId,
       circuitId, commitmentRoot,

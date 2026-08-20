@@ -36,10 +36,11 @@ import {
   signPropagationChannelProof,
   encodePropagationChannelProof,
   decodePropagationChannelProof,
-  verifyIncomingPropagationChannelProof,
+  verifyAndProduceAuthenticatedDestroy,
   type CircuitDestroyTransport,
   type DestroyPropagationContext,
   type AuthenticatedReceiveContext,
+  type ReceiveAuthenticatedCircuitDestroyResult,
   type TransportSendResult,
 } from "@reference/circuit/propagation";
 
@@ -57,7 +58,7 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
   // The pending receiver: its resolve callback + the context to verify
   // the incoming proof against. When a connection arrives, handleIncoming
   // verifies the proof against this context + resolves the promise.
-  private pendingReceiver: { resolve: (r: { ok: true; wireBytes: Uint8Array; proof: import("@reference/circuit/propagation").PropagationChannelProof } | { ok: false; reason: string }) => void; ctx: AuthenticatedReceiveContext } | null = null;
+  private pendingReceiver: { resolve: (r: ReceiveAuthenticatedCircuitDestroyResult) => void; ctx: AuthenticatedReceiveContext } | null = null;
   // Queue of received (proof, wireBytes) pairs (in case a destroy arrives
   // before receive() is called — the destroy is buffered until a receiver
   // waits). The receiver verifies the proof against its context on delivery.
@@ -170,25 +171,24 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
    * PropagationChannelProof against the receiver's context before delivering.
    * Blocks until a destroy arrives. The caller MUST have called `start()`.
    */
-  async receive(ctx: AuthenticatedReceiveContext): Promise<{ ok: true; wireBytes: Uint8Array; proof: import("@reference/circuit/propagation").PropagationChannelProof } | { ok: false; reason: string }> {
+  async receive(ctx: AuthenticatedReceiveContext): Promise<ReceiveAuthenticatedCircuitDestroyResult> {
     if (ctx.localNodeId !== this.localNodeId) {
       throw new Error(`receive() called with localNodeId "${ctx.localNodeId}" but transport is for "${this.localNodeId}"`);
     }
-    // If a destroy is already queued, verify its proof + deliver.
+    // If a destroy is already queued, run the full verification pipeline + deliver.
     if (this.receivedQueue.length > 0) {
       const item = this.receivedQueue.shift()!;
       const proofDecoded = decodePropagationChannelProof(item.proofBytes);
       if (!proofDecoded.ok) {
         return { ok: false, reason: `received proof decode failed: ${proofDecoded.reason}` };
       }
-      const verifyResult = verifyIncomingPropagationChannelProof(proofDecoded.proof, ctx, item.wireBytes);
-      if (!verifyResult.ok) {
-        return { ok: false, reason: verifyResult.reason };
-      }
-      return { ok: true, wireBytes: item.wireBytes, proof: proofDecoded.proof };
+      // The transport OWNS the full verification: proof + digest + decode +
+      // verify + direction. No public API returns {proof, wireBytes} before
+      // direction is checked.
+      return verifyAndProduceAuthenticatedDestroy(proofDecoded.proof, ctx, item.wireBytes);
     }
     // No queued destroy — wait for one. Store the ctx so handleIncoming
-    // can verify the incoming proof when it arrives.
+    // can run the full verification when it arrives.
     return new Promise((resolve) => {
       this.pendingReceiver = { resolve, ctx };
     });
@@ -196,25 +196,23 @@ export class TcpCircuitDestroyTransport implements CircuitDestroyTransport {
 
   /**
    * Handle an incoming TCP connection. Reads the proof + the wire bytes,
-   * verifies the proof against the pending receiver's context (if any), or
-   * buffers them for later.
+   * runs the FULL verification pipeline (proof + digest + decode + verify +
+   * direction), and resolves the pending receiver (if any), or buffers them
+   * for later.
    */
   private handleIncoming(socket: Socket): void {
     readProofAndWire(socket).then(({ proofBytes, wireBytes }) => {
       if (this.pendingReceiver) {
         const { resolve, ctx } = this.pendingReceiver;
         this.pendingReceiver = null;
-        // Decode + verify the proof against the receiver's context.
+        // Decode + run the FULL verification pipeline (proof + digest +
+        // decode + verify + direction). The transport OWNS this — no public
+        // API can bypass it.
         const proofDecoded = decodePropagationChannelProof(proofBytes);
         if (!proofDecoded.ok) {
           resolve({ ok: false, reason: `received proof decode failed: ${proofDecoded.reason}` });
         } else {
-          const verifyResult = verifyIncomingPropagationChannelProof(proofDecoded.proof, ctx, wireBytes);
-          if (!verifyResult.ok) {
-            resolve({ ok: false, reason: verifyResult.reason });
-          } else {
-            resolve({ ok: true, wireBytes, proof: proofDecoded.proof });
-          }
+          resolve(verifyAndProduceAuthenticatedDestroy(proofDecoded.proof, ctx, wireBytes));
         }
       } else {
         // No receiver waiting — buffer the proof + wire bytes.
