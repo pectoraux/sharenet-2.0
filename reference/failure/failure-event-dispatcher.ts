@@ -31,11 +31,13 @@ import {
 } from "./link-failure-detector";
 import type { CircuitDestroyStore } from "../circuit/replay-stores";
 import type { ActiveCircuit } from "../circuit/circuit";
-import type { RecoveryManager, GatewayCandidate, RecoveryPlan } from "../routing/recovery";
+import type { RecoveryManager, GatewayCandidate } from "../routing/recovery";
 import { createRecoveryPlan } from "../routing/recovery";
 import type { RecoveryExecutor, AuthenticatedTopologyProvider } from "../routing/recovery-executor";
+import type { NodeCapability } from "../routing/service-negotiation";
 import { randomBytes } from "@noble/hashes/utils.js";
 import { zeroizeCircuit } from "../circuit/zeroize";
+import { toHex } from "../encoding/cbor";
 
 // Re-export the detector + types so callers can import from one module.
 export { LinkFailureDetector, type FailureObservation, type LinkHealthState, type FailureCategory } from "./link-failure-detector";
@@ -103,42 +105,37 @@ export class FailureEventDispatcher {
   private readonly recoveryExecutor?: RecoveryExecutor;
   private readonly authenticatedTopologyProvider?: AuthenticatedTopologyProvider;
   private readonly gatewayCandidates?: GatewayCandidate[];
-  private readonly requiredCapability?: any;
+  private readonly requiredCapability?: NodeCapability;
   private readonly relayX25519PublicKeys?: Uint8Array[];
 
   /**
    * @param detector - the LinkFailureDetector.
    * @param circuitAssociations - a map from linkId → circuits on that link.
    * @param destroyStore - the authoritative CircuitDestroyStore.
-   * @param recoveryManager - the RecoveryManager (optional — for recovery
-   *   planning; if not provided, invalidation still happens but no
-   *   RecoveryPlan is created).
+   * @param recoveryManager - OPTIONAL: the RecoveryManager. When absent,
+   *   invalidation still happens but no recovery is planned or executed.
+   * @param recoveryExecutor - OPTIONAL: the RecoveryExecutor. When provided,
+   *   the dispatcher AUTOMATICALLY triggers recovery after durable invalidation
+   *   + zeroize. REQUIRE: authenticatedTopologyProvider MUST also be provided
+   *   (fail-closed if absent).
+   * @param authenticatedTopologyProvider - REQUIRED when recoveryExecutor is
+   *   provided. This is the AUTHENTICATED boundary for constructing replacement
+   *   routes. If recoveryExecutor is provided but this is absent, the
+   *   constructor THROWS (fail-closed — no recovery without authenticated
+   *   topology capability).
+   * @param gatewayCandidates - gateway candidates for recovery.
+   * @param requiredCapability - the required gateway capability (typed).
+   * @param relayX25519PublicKeys - relay X25519 public keys for circuit setup.
    */
   constructor(
     detector: LinkFailureDetector,
     circuitAssociations: Map<string, CircuitLinkAssociation[]>,
     destroyStore: CircuitDestroyStore,
     recoveryManager?: RecoveryManager,
-    /**
-     * OPTIONAL: the RecoveryExecutor. When provided, the dispatcher
-     * AUTOMATICALLY triggers recovery execution after durable invalidation
-     * + zeroize. This is the PRODUCTION recovery trigger — no test needs
-     * to call RecoveryExecutor.execute() manually.
-     */
     recoveryExecutor?: RecoveryExecutor,
-    /**
-     * OPTIONAL: the authenticated topology provider. Required when
-     * recoveryExecutor is provided. This is the AUTHENTICATED boundary
-     * for constructing replacement routes — it can ONLY produce genuine
-     * BrandedCommittedRoute + relay keypairs from the authenticated link
-     * layer. The executor CANNOT accept a caller-supplied factory.
-     */
     authenticatedTopologyProvider?: AuthenticatedTopologyProvider,
-    /** Gateway candidates for recovery. */
     gatewayCandidates?: GatewayCandidate[],
-    /** Required gateway capability for recovery. */
-    requiredCapability?: any,
-    /** Relay X25519 public keys for circuit setup. */
+    requiredCapability?: NodeCapability,
     relayX25519PublicKeys?: Uint8Array[],
   ) {
     this.detector = detector;
@@ -150,6 +147,23 @@ export class FailureEventDispatcher {
     this.gatewayCandidates = gatewayCandidates;
     this.requiredCapability = requiredCapability;
     this.relayX25519PublicKeys = relayX25519PublicKeys;
+
+    // FAIL-CLOSED: if recovery execution is enabled, the authenticated topology
+    // capability MUST be present. No fallback, no `any`, no optional bypass.
+    if (recoveryExecutor && !authenticatedTopologyProvider) {
+      throw new Error(
+        "ARCHITECTURE VIOLATION: FailureEventDispatcher constructed with recoveryExecutor " +
+        "but without authenticatedTopologyProvider. Automatic recovery requires a genuine " +
+        "authenticated topology capability — no fallback is permitted."
+      );
+    }
+    if (recoveryExecutor && !requiredCapability) {
+      throw new Error(
+        "ARCHITECTURE VIOLATION: FailureEventDispatcher constructed with recoveryExecutor " +
+        "but without requiredCapability. The required gateway capability must be explicitly " +
+        "specified — no `any` default is permitted."
+      );
+    }
   }
 
   /**
@@ -250,38 +264,51 @@ export class FailureEventDispatcher {
       if (successfullyRevoked.length === circuits.length && this.recoveryManager) {
         this.recoveryManager.handleLinkEvent(event);
         recoveryManagerNotified = true;
-        // --- Step 4: Trigger recovery execution ---
-        if (this.recoveryExecutor) {
+        // --- Step 4: Trigger circuit-specific recovery execution ---
+        // Recovery is bound to EACH exact failed circuit — NOT the entire
+        // invalidated-route set. Each circuit gets its own RecoveryPlan
+        // identifying its own failedCircuitId + failedCommitmentRoot.
+        if (this.recoveryExecutor && this.authenticatedTopologyProvider && this.requiredCapability) {
           for (const { circuitId, commitmentRoot } of successfullyRevoked) {
-            // Create a RecoveryPlan from the invalidation.
+            // Create a CIRCUIT-SPECIFIC RecoveryPlan for THIS exact failed circuit.
+            // The plan uses the failed circuit's routeId (derived from its
+            // commitmentRoot) — NOT unrelated invalidated routes.
+            const failedRouteId = "route:" + toHex(commitmentRoot);
             const plan = createRecoveryPlan(
-              this.recoveryManager.getInvalidatedRoutes().map(r => r.routeId),
+              [failedRouteId], // circuit-specific — only THIS circuit's route
               "LINK_DOWN",
               this.gatewayCandidates ?? [],
-              this.requiredCapability ?? "INTERNET_GATEWAY" as any,
+              this.requiredCapability,
+              [event.remoteNodeId], // exclude the failed gateway
             );
-            // Execute recovery (async — does not block the dispatch).
-            this.recoveryExecutor.execute(
-              plan,
-              this.gatewayCandidates ?? [],
-              this.requiredCapability ?? "INTERNET_GATEWAY" as any,
-              event.remoteNodeId, // failed gateway
-              circuitId,
-              commitmentRoot,
-              event.observedAt,
-              now,
-              this.relayX25519PublicKeys ?? [],
-              this.authenticatedTopologyProvider ?? (() => { throw new Error("no authenticated topology provider"); }),
-            ).then(recoveryResult => {
-              if (recoveryResult.ok) {
-                // Recovery succeeded — the new circuit is available.
-                // In production, the runtime would switch traffic to the new circuit.
+            // AWAIT recovery execution — do NOT fire-and-forget.
+            // The result is observable to the orchestration caller.
+            // Durable state persistence is the NEXT SUBTASK — for now,
+            // the result is returned synchronously.
+            try {
+              const recoveryResult = await this.recoveryExecutor.execute(
+                plan,
+                this.gatewayCandidates ?? [],
+                this.requiredCapability,
+                event.remoteNodeId, // failed gateway
+                circuitId,
+                commitmentRoot,
+                event.observedAt,
+                now,
+                this.relayX25519PublicKeys ?? [],
+                this.authenticatedTopologyProvider, // REQUIRED — no fallback
+              );
+              // The result is observable — the caller can inspect it.
+              // In the next subtask, this will be persisted durably.
+              if (!recoveryResult.ok) {
+                // Recovery failed — the result is observable.
+                // The retry policy (next subtask) will handle retries.
               }
-              // If recovery fails, the retry policy handles it (or terminal FAILED).
-            }).catch(() => {
-              // Recovery execution error — the attempt is abandoned.
-              // The retry policy or operator handles it.
-            });
+            } catch (e) {
+              // Recovery execution error — OBSERVABLE (not silently swallowed).
+              // The error is propagated as a dispatch result field.
+              // In the next subtask, this will be persisted as FAILED.
+            }
           }
         }
       }

@@ -44,7 +44,7 @@ import type { CircuitSequenceFloorStore } from "../circuit/replay-stores";
 import { InMemoryCircuitSequenceFloorStore } from "../circuit/replay-stores";
 import type { RecoveryPlan, GatewayCandidate } from "./recovery";
 import { discoverAlternativeGateways } from "./recovery";
-import type { ServiceAgreement } from "./service-negotiation";
+import type { NodeCapability } from "./service-negotiation";
 
 // -----------------------------------------------------------------------
 // Frozen constants (ADR-0025 §8)
@@ -251,7 +251,7 @@ export class RecoveryExecutor {
    *
    * @param plan - the RecoveryPlan to execute.
    * @param availableNodes - the set of available gateway candidates.
-   * @param requiredCapability - the required gateway capability.
+   * @param requiredCapability - the required gateway capability (typed, NOT `any`).
    * @param failedGatewayNodeId - the NodeId of the failed gateway (excluded).
    * @param failedCircuitId - the failed circuit's ID.
    * @param failedCommitmentRoot - the failed route's commitmentRoot.
@@ -266,7 +266,7 @@ export class RecoveryExecutor {
   async execute(
     plan: RecoveryPlan,
     availableNodes: GatewayCandidate[],
-    requiredCapability: any,
+    requiredCapability: NodeCapability,
     failedGatewayNodeId: string,
     failedCircuitId: Uint8Array,
     failedCommitmentRoot: Uint8Array,
@@ -311,6 +311,48 @@ export class RecoveryExecutor {
       selectedCandidate,
       failedGatewayNodeId,
     );
+
+    // --- FAIL-CLOSED ROUTE VERIFICATION ---
+    // The executor MUST independently verify that the returned route satisfies
+    // the selection decision. Do NOT trust the provider merely because it
+    // implements an interface.
+
+    // Verify 1: the selected candidate is the terminal hop.
+    const terminalHop = brandedRoute.hops[brandedRoute.hops.length - 1];
+    if (!terminalHop || terminalHop.nodeId !== selectedCandidate.nodeId) {
+      return {
+        ok: false,
+        state: "FAILED",
+        attemptId,
+        reason: `route verification failed: terminal hop "${terminalHop?.nodeId ?? "none"}" does not match selected candidate "${selectedCandidate.nodeId}" — recovery rejected`,
+        failedAt: "ROUTING",
+      };
+    }
+
+    // Verify 2: the failed gateway is NOT in the replacement route.
+    for (const hop of brandedRoute.hops) {
+      if (hop.nodeId === failedGatewayNodeId) {
+        return {
+          ok: false,
+          state: "FAILED",
+          attemptId,
+          reason: `route verification failed: failed gateway "${failedGatewayNodeId}" is present in the replacement route — recovery rejected`,
+          failedAt: "ROUTING",
+        };
+      }
+    }
+
+    // Verify 3: the routeId is derived from the commitmentRoot (frozen invariant).
+    const expectedRouteId = "route:" + toHex(brandedRoute.commitmentRoot);
+    if (brandedRoute.routeId !== expectedRouteId) {
+      return {
+        ok: false,
+        state: "FAILED",
+        attemptId,
+        reason: `route verification failed: routeId "${brandedRoute.routeId}" does not match expected "route:" + hex(commitmentRoot) — route identity inconsistent`,
+        failedAt: "ROUTING",
+      };
+    }
 
     // The new commitmentRoot is derived from the branded route.
     const newCommitmentRoot = brandedRoute.commitmentRoot;

@@ -27,6 +27,7 @@ import {
 import { InMemoryCircuitDestroyStore, InMemoryCircuitSequenceFloorStore } from "@reference/circuit/replay-stores";
 import { setupCircuit, type ActiveCircuit } from "@reference/circuit/circuit";
 import { invalidateCircuitOnFailure } from "@reference/failure/link-failure-detector";
+import { FailureEventDispatcher, LinkFailureDetector } from "@reference/failure/failure-event-dispatcher";
 import { DESTROYER_ROLE_INITIATOR, DESTROY_REASON_LINK_FAILURE } from "@reference/circuit/destroy";
 import { signCircuitDestroy, encodeCircuitDestroy, DESTROY_REASON_OPERATOR_INITIATED, processCircuitDestroy } from "@reference/circuit/destroy";
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests/helpers/branded-route-helper";
@@ -38,13 +39,43 @@ import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper2 } from "@test
 // genuine BrandedCommittedRoute + relay keypairs from the authenticated link
 // layer. In production, this would be the platform runtime's authenticated
 // topology capability.
+// The provider ensures the selected candidate IS the terminal hop by
+// constructing the route from the candidate's NodeId.
 function createTestTopologyProvider(): AuthenticatedTopologyProvider {
   return {
-    constructRecoveryRoute(selectedCandidate: any, failedGatewayNodeId: string) {
+    constructRecoveryRoute(selectedCandidate: GatewayCandidate, failedGatewayNodeId: string) {
+      // The test helper generates its own keypairs. We use the helper's
+      // branded route + keypairs — the terminal hop's NodeId is the
+      // last relay's NodeId. The test must construct candidates that
+      // match the provider's output.
+      // In a real production provider, the candidate's NodeId would be
+      // used to select the terminal relay. The test simulates this by
+      // having the test construct candidates from the provider's keypairs.
       const ctx = makeGenuineBrandedRouteHelper2(1, NOW);
       return { brandedRoute: ctx.branded, relayKeypairs: ctx.kps };
     },
   };
+}
+
+// Helper: create a topology provider + matching candidates from a single
+// route construction. This ensures the candidate's NodeId matches the
+// terminal hop (as the executor's route verification requires).
+function createTestRecoveryEnv() {
+  const ctx = makeGenuineBrandedRouteHelper2(1, NOW);
+  const terminalNodeId = ctx.branded.hops[ctx.branded.hops.length - 1]!.nodeId;
+  const candidates: GatewayCandidate[] = [{
+    nodeId: terminalNodeId,
+    capability: "INTERNET_GATEWAY" as const,
+    endpoint: "10.0.0.1:7788",
+    linkUp: true,
+  } as GatewayCandidate];
+  const provider: AuthenticatedTopologyProvider = {
+    constructRecoveryRoute(_selected: GatewayCandidate, _failed: string) {
+      return { brandedRoute: ctx.branded, relayKeypairs: ctx.kps };
+    },
+  };
+  const relayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
+  return { candidates, provider, relayX25519PublicKeys, ctx };
 }
 
 import { createRecoveryPlan, type GatewayCandidate } from "@reference/routing/recovery";
@@ -83,36 +114,27 @@ describe("R-009 Phase 5: RecoveryExecutor basic success", () => {
       [oldCircuit.routeId],
       "LINK_DOWN",
       [],
-      "INTERNET_GATEWAY" as any,
+      "INTERNET_GATEWAY" as const,
     );
 
     // Set up the recovery executor.
     const executor = new RecoveryExecutor(destroyStore);
 
-    // Generate fresh relay keypairs for the new route.
-    const newRelayKeypairs = [generateNodeKeypair()];
-    const newRelayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
-
-    // Available gateway candidates (excluding the failed gateway).
-    const candidates: GatewayCandidate[] = [{
-      nodeId: newRelayKeypairs[0]!.nodeId,
-      capability: "INTERNET_GATEWAY" as any,
-      endpoint: "10.0.0.1:7788",
-      linkUp: true,
-      expiry: NOW + 3600,
-    } as any];
+    // Use the test recovery env — candidates match the topology provider's
+    // terminal hop (required by the executor's route verification).
+    const { candidates, provider, relayX25519PublicKeys: newRelayX25519PublicKeys } = createTestRecoveryEnv();
 
     const result = await executor.execute(
       plan,
       candidates,
-      "INTERNET_GATEWAY" as any,
+      "INTERNET_GATEWAY" as const,
       "failed-gateway-node-id", // the failed gateway (excluded)
       oldCircuit.circuitId,
       oldCircuit.commitmentRoot,
       NOW,
       NOW,
       newRelayX25519PublicKeys,
-      createTestTopologyProvider(),
+      provider,
     );
 
     if (!result.ok) {
@@ -154,15 +176,13 @@ describe("R-009 Phase 5: old/new identity separation", () => {
     await invalidateCircuitOnFailure(destroyStore, oldCircuit.circuitId, oldCircuit.commitmentRoot, DESTROY_REASON_LINK_FAILURE, "system", DESTROYER_ROLE_INITIATOR, randomBytes(16));
 
     const executor = new RecoveryExecutor(destroyStore);
-    const newRelayKeypairs = [generateNodeKeypair()];
-    const newRelayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
-    const candidates: GatewayCandidate[] = [{ nodeId: newRelayKeypairs[0]!.nodeId, capability: "INTERNET_GATEWAY" as any, endpoint: "addr", linkUp: true, expiry: NOW + 3600 } as any];
+    const { candidates, provider, relayX25519PublicKeys: newRelayX25519PublicKeys } = createTestRecoveryEnv();
 
     const result = await executor.execute(
-      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
-      candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as const),
+      candidates, "INTERNET_GATEWAY" as const, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createTestTopologyProvider(),
+      provider,
     );
 
     expect(result.ok).toBe(true);
@@ -176,15 +196,13 @@ describe("R-009 Phase 5: old/new identity separation", () => {
     await invalidateCircuitOnFailure(destroyStore, oldCircuit.circuitId, oldCircuit.commitmentRoot, DESTROY_REASON_LINK_FAILURE, "system", DESTROYER_ROLE_INITIATOR, randomBytes(16));
 
     const executor = new RecoveryExecutor(destroyStore);
-    const newRelayKeypairs = [generateNodeKeypair()];
-    const newRelayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
-    const candidates: GatewayCandidate[] = [{ nodeId: newRelayKeypairs[0]!.nodeId, capability: "INTERNET_GATEWAY" as any, endpoint: "addr", linkUp: true, expiry: NOW + 3600 } as any];
+    const { candidates, provider, relayX25519PublicKeys: newRelayX25519PublicKeys } = createTestRecoveryEnv();
 
     const result = await executor.execute(
-      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
-      candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as const),
+      candidates, "INTERNET_GATEWAY" as const, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createTestTopologyProvider(),
+      provider,
     );
 
     expect(result.ok).toBe(true);
@@ -198,15 +216,13 @@ describe("R-009 Phase 5: old/new identity separation", () => {
     await invalidateCircuitOnFailure(destroyStore, oldCircuit.circuitId, oldCircuit.commitmentRoot, DESTROY_REASON_LINK_FAILURE, "system", DESTROYER_ROLE_INITIATOR, randomBytes(16));
 
     const executor = new RecoveryExecutor(destroyStore);
-    const newRelayKeypairs = [generateNodeKeypair()];
-    const newRelayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
-    const candidates: GatewayCandidate[] = [{ nodeId: newRelayKeypairs[0]!.nodeId, capability: "INTERNET_GATEWAY" as any, endpoint: "addr", linkUp: true, expiry: NOW + 3600 } as any];
+    const { candidates, provider, relayX25519PublicKeys: newRelayX25519PublicKeys } = createTestRecoveryEnv();
 
     const result = await executor.execute(
-      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
-      candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as const),
+      candidates, "INTERNET_GATEWAY" as const, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createTestTopologyProvider(),
+      provider,
     );
 
     expect(result.ok).toBe(true);
@@ -226,10 +242,11 @@ describe("R-009 Phase 5: recovery failure scenarios", () => {
     await invalidateCircuitOnFailure(destroyStore, oldCircuit.circuitId, oldCircuit.commitmentRoot, DESTROY_REASON_LINK_FAILURE, "system", DESTROYER_ROLE_INITIATOR, randomBytes(16));
 
     const executor = new RecoveryExecutor(destroyStore);
+    const { provider } = createTestRecoveryEnv();
     const result = await executor.execute(
-      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as const),
       [], // no candidates
-      "INTERNET_GATEWAY" as any,
+      "INTERNET_GATEWAY" as const,
       "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       [], [],
     );
@@ -247,15 +264,13 @@ describe("R-009 Phase 5: recovery failure scenarios", () => {
     // Don't revoke the old circuit — recovery should fail.
 
     const executor = new RecoveryExecutor(destroyStore);
-    const newRelayKeypairs = [generateNodeKeypair()];
-    const newRelayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
-    const candidates: GatewayCandidate[] = [{ nodeId: newRelayKeypairs[0]!.nodeId, capability: "INTERNET_GATEWAY" as any, endpoint: "addr", linkUp: true, expiry: NOW + 3600 } as any];
+    const { candidates, provider, relayX25519PublicKeys: newRelayX25519PublicKeys } = createTestRecoveryEnv();
 
     const result = await executor.execute(
-      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
-      candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as const),
+      candidates, "INTERNET_GATEWAY" as const, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createTestTopologyProvider(),
+      provider,
     );
 
     expect(result.ok).toBe(false);
@@ -271,20 +286,17 @@ describe("R-009 Phase 5: recovery failure scenarios", () => {
     await invalidateCircuitOnFailure(destroyStore, oldCircuit.circuitId, oldCircuit.commitmentRoot, DESTROY_REASON_LINK_FAILURE, "system", DESTROYER_ROLE_INITIATOR, randomBytes(16));
 
     const executor = new RecoveryExecutor(destroyStore);
-    const newRelayKeypairs = [generateNodeKeypair()];
-    const newRelayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
-
-    // The only candidate IS the failed gateway → should be excluded.
-    const failedGatewayNodeId = newRelayKeypairs[0]!.nodeId;
-    const candidates: GatewayCandidate[] = [{ nodeId: failedGatewayNodeId, capability: "INTERNET_GATEWAY" as any, endpoint: "addr", linkUp: true, expiry: NOW + 3600 } as any];
+    const { candidates, provider, relayX25519PublicKeys: newRelayX25519PublicKeys } = createTestRecoveryEnv();
+    // Use the provider's terminal node as the "failed gateway" — it will be excluded.
+    const failedGatewayNodeId = candidates[0]!.nodeId;
 
     const result = await executor.execute(
-      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
-      candidates, "INTERNET_GATEWAY" as any,
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as const),
+      candidates, "INTERNET_GATEWAY" as const,
       failedGatewayNodeId, // exclude this gateway
       oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createTestTopologyProvider(),
+      provider,
     );
 
     expect(result.ok).toBe(false);
@@ -333,15 +345,13 @@ describe("R-009 Phase 5: old circuit isolation", () => {
     await invalidateCircuitOnFailure(destroyStore, oldCircuit.circuitId, oldCircuit.commitmentRoot, DESTROY_REASON_LINK_FAILURE, "system", DESTROYER_ROLE_INITIATOR, randomBytes(16));
 
     const executor = new RecoveryExecutor(destroyStore);
-    const newRelayKeypairs = [generateNodeKeypair()];
-    const newRelayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
-    const candidates: GatewayCandidate[] = [{ nodeId: newRelayKeypairs[0]!.nodeId, capability: "INTERNET_GATEWAY" as any, endpoint: "addr", linkUp: true, expiry: NOW + 3600 } as any];
+    const { candidates, provider, relayX25519PublicKeys: newRelayX25519PublicKeys } = createTestRecoveryEnv();
 
     const result = await executor.execute(
-      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
-      candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as const),
+      candidates, "INTERNET_GATEWAY" as const, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createTestTopologyProvider(),
+      provider,
     );
 
     expect(result.ok).toBe(true);
@@ -391,5 +401,142 @@ describe("R-009 Phase 5: retry policy", () => {
       ids.add(id.idHex);
     }
     expect(ids.size).toBe(MAX_RECOVERY_ATTEMPTS); // all distinct
+  });
+});
+
+// =====================================================================
+// Adversarial: route verification + fail-closed topology boundary
+// =====================================================================
+
+describe("R-009 Phase 5: route verification + fail-closed topology", () => {
+  test("provider returns route whose terminal gateway != selected candidate → REJECT", async () => {
+    const { circuit: oldCircuit } = makeOldCircuit(1);
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    await invalidateCircuitOnFailure(destroyStore, oldCircuit.circuitId, oldCircuit.commitmentRoot, DESTROY_REASON_LINK_FAILURE, "system", DESTROYER_ROLE_INITIATOR, randomBytes(16));
+
+    const executor = new RecoveryExecutor(destroyStore);
+
+    // Construct a provider that returns a route whose terminal hop does NOT
+    // match the selected candidate.
+    const env = makeGenuineBrandedRouteHelper2(1, NOW);
+    const wrongProvider: AuthenticatedTopologyProvider = {
+      constructRecoveryRoute(_selected, _failed) {
+        // Return a route whose terminal hop is NOT the selected candidate.
+        return { brandedRoute: env.branded, relayKeypairs: env.kps };
+      },
+    };
+
+    // Candidates with a DIFFERENT NodeId than the provider's terminal hop.
+    const wrongCandidates: GatewayCandidate[] = [{
+      nodeId: "wrong-node-id-that-does-not-match-terminal",
+      capability: "INTERNET_GATEWAY" as const,
+      endpoint: "addr",
+      linkUp: true,
+    } as GatewayCandidate];
+
+    const result = await executor.execute(
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", wrongCandidates, "INTERNET_GATEWAY" as const),
+      wrongCandidates, "INTERNET_GATEWAY" as const, "failed-gw",
+      oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
+      [x25519.getPublicKey(randomBytes(32))],
+      wrongProvider,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.state).toBe("FAILED");
+      expect(result.reason).toContain("terminal hop");
+      expect(result.reason).toContain("does not match selected candidate");
+    }
+  });
+
+  test("provider returns route containing failed gateway → REJECT", async () => {
+    const { circuit: oldCircuit } = makeOldCircuit(1);
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    await invalidateCircuitOnFailure(destroyStore, oldCircuit.circuitId, oldCircuit.commitmentRoot, DESTROY_REASON_LINK_FAILURE, "system", DESTROYER_ROLE_INITIATOR, randomBytes(16));
+
+    const executor = new RecoveryExecutor(destroyStore);
+    const env = makeGenuineBrandedRouteHelper2(2, NOW); // 2 hops
+    const terminalNodeId = env.branded.hops[1]!.nodeId;
+    const relayNodeId = env.branded.hops[0]!.nodeId;
+
+    // Provider returns a route that contains the failed gateway (relay hop).
+    // The candidate is the terminal hop (correct), but the failed gateway
+    // appears as the relay hop in the route (malicious provider).
+    const maliciousProvider: AuthenticatedTopologyProvider = {
+      constructRecoveryRoute(_selected, _failed) {
+        return { brandedRoute: env.branded, relayKeypairs: env.kps };
+      },
+    };
+
+    // Candidate = terminal hop (so discovery succeeds).
+    // failedGateway = relay hop (but the provider's route contains it).
+    const result = await executor.execute(
+      createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [{
+        nodeId: terminalNodeId,
+        capability: "INTERNET_GATEWAY" as const,
+        endpoint: "addr",
+        linkUp: true,
+      } as GatewayCandidate], "INTERNET_GATEWAY" as const),
+      [{
+        nodeId: terminalNodeId,
+        capability: "INTERNET_GATEWAY" as const,
+        endpoint: "addr",
+        linkUp: true,
+      } as GatewayCandidate],
+      "INTERNET_GATEWAY" as const,
+      relayNodeId, // the failed gateway is the relay hop → should be in the route
+      oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
+      [x25519.getPublicKey(randomBytes(32)), x25519.getPublicKey(randomBytes(32))],
+      maliciousProvider,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).toContain("failed gateway");
+      expect(result.reason).toContain("present in the replacement route");
+    }
+  });
+
+  test("missing authenticated topology provider → constructor throws (fail-closed)", () => {
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const executor = new RecoveryExecutor(destroyStore);
+
+    // Constructing a FailureEventDispatcher with a recoveryExecutor but
+    // WITHOUT an authenticatedTopologyProvider MUST throw.
+    expect(() => {
+      new FailureEventDispatcher(
+        new LinkFailureDetector(),
+        new Map(),
+        destroyStore,
+        undefined, // recoveryManager
+        executor,  // recoveryExecutor present
+        undefined, // NO topology provider → MUST throw
+      );
+    }).toThrow();
+  });
+
+  test("recovery executor + topology provider but no requiredCapability → constructor throws", () => {
+    const destroyStore = new InMemoryCircuitDestroyStore();
+    const executor = new RecoveryExecutor(destroyStore);
+    const env = makeGenuineBrandedRouteHelper2(1, NOW);
+    const provider: AuthenticatedTopologyProvider = {
+      constructRecoveryRoute() {
+        return { brandedRoute: env.branded, relayKeypairs: env.kps };
+      },
+    };
+
+    expect(() => {
+      new FailureEventDispatcher(
+        new LinkFailureDetector(),
+        new Map(),
+        destroyStore,
+        undefined,
+        executor,
+        provider,
+        [],
+        undefined, // NO requiredCapability → MUST throw
+      );
+    }).toThrow();
   });
 });
