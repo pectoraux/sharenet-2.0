@@ -3054,3 +3054,287 @@ Next actions (recommended):
 3. Add adversarial tests: link-failure cascades to durable tombstone with destroyReason=0x03; gateway-disappearance cascades to durable tombstone with destroyReason=0x04; restart preserves the tombstone; DEGRADED does NOT trigger a destroy.
 4. Update ADR-0022 + ADR-0023 to document the failure-detection → durable-invalidation path.
 5. Run all 5 required verification suites (unit + arch + TS vectors + Python vectors + lint).
+
+---
+
+## Task ID: P5-audit
+**Agent**: general-purpose
+**Task**: Audit ShareNet 2.0 repository for R-009 Stage 3 Phase 5 (Automatic Circuit Recovery Execution). Research only — NO file modifications.
+**Date**: 2026-08-17 (sub-task audit preceding Phase 5 implementation)
+
+### Scope
+
+10 files inspected for recovery-execution primitives already in place + the integration gaps Phase 5 must close. Built on the P4-audit findings (Phase 4 = Failure Detection + Durable Circuit Invalidation, now production-wired via FailureEventDispatcher). Phase 5 is the GAP-E item the P4 audit explicitly punted: "RecoveryPlan execution (DESCRIPTIVE ONLY): createRecoveryPlan returns a RecoveryPlan with `nextStep` + `recommendation` + `candidateGateways`. Nothing executes the plan."
+
+### Per-file findings
+
+1. `reference/routing/recovery.ts` (380 lines) — RecoveryManager + recovery primitives
+   - **HealthStatus type**: `"HEALTHY" | "DEGRADED" | "DOWN"` (string-literal union).
+   - **InvalidationReason type** (8 values): `"LINK_DOWN"` (transport closed), `"LINK_DEGRADED"` (high latency/loss), `"GATEWAY_DISAPPEARED"` (gateway node offline), `"CIRCUIT_EXPIRED"`, `"ROUTE_EXPIRED"`, `"PEER_REVOKED"`, `"MANUAL_INVALIDATION"`, `"RELAY_UNREACHABLE"`.
+   - **LinkHealthEvent interface**: `{ linkId: string; localNodeId: string; remoteNodeId: string; newStatus: HealthStatus; reason: InvalidationReason; observedAt: number }`.
+   - **RouteHealthRecord interface**: `{ routeId: string; hops: RouteHop[]; status: HealthStatus; invalidationReason?: InvalidationReason; invalidatedAt?: number; circuitIdHex?: string; establishedAt: number }`.
+   - **CircuitHealthRecord interface** (also present, not asked but useful): `{ circuitIdHex, routeId, status, invalidationReason?, invalidatedAt?, establishedAt }`.
+   - **GatewayCandidate interface**: `{ nodeId: string; capability: NodeCapability; endpoint: string; linkUp: boolean; estimatedLatencyMs?: number }`.
+   - **RecoveryPlan interface** (all fields):
+     ```
+     { invalidatedRouteIds: string[]; reason: InvalidationReason;
+       candidateGateways: GatewayCandidate[];
+       nextStep: "DISCOVER_NEW_GATEWAY" | "WAIT_FOR_LINK_RECOVERY" | "NO_RECOVERY_POSSIBLE";
+       recommendation: string }
+     ```
+   - **RecoveryManager class** — public methods:
+     - `registerLink(linkId, localNodeId, remoteNodeId): void` — seeds HEALTHY link.
+     - `registerRoute(route: CommittedRoute, circuitIdHex, linkIdsByHop: string[], establishedAt): void` — seeds HEALTHY route + circuit + hop→link map.
+     - `handleLinkEvent(event: LinkHealthEvent): string[]` — on DOWN: invalidates all routes using that link (cascades to circuit). On DEGRADED: marks routes DEGRADED (no invalidation). Returns invalidated routeIds.
+     - `handleGatewayDisappearance(gatewayNodeId, observedAt): string[]` — sets all links to gateway = DOWN, invalidates all routes that use the gateway as a hop. Dedups. Returns invalidated routeIds.
+     - `getRouteHealth(routeId): RouteHealthRecord | undefined`.
+     - `getCircuitHealth(circuitIdHex): CircuitHealthRecord | undefined`.
+     - `getHealthyRoutes(): RouteHealthRecord[]`.
+     - `getInvalidatedRoutes(): RouteHealthRecord[]`.
+   - **discoverAlternativeGateways(availableNodes: GatewayCandidate[], requiredCapability: NodeCapability, excludeNodeIds: readonly string[] = []): GatewayCandidate[]** — pure filter+sort: filters by capability match + linkUp + not excluded, sorts by estimatedLatencyMs asc. Returns candidates (does NOT construct route/circuit).
+   - **createRecoveryPlan(invalidatedRouteIds, reason, availableNodes, requiredCapability, excludeNodeIds = []): RecoveryPlan** — calls discoverAlternativeGateways; if candidates → `nextStep = "DISCOVER_NEW_GATEWAY"` + recommendation "Initiate a NEW RouteProposal → RouteAcceptance → RouteCommitment → CircuitSetup pipeline through gateway X. Do NOT attempt TCP migration of the existing flow."; if reason=LINK_DEGRADED → `WAIT_FOR_LINK_RECOVERY`; else → `NO_RECOVERY_POSSIBLE`. DESCRIPTIVE ONLY — does not execute.
+   - **`TCP_MIGRATION_FORBIDDEN(circuitId): never`** — architecture guard per GATE-08.
+   - **Production-integrated vs callable state machine**:
+     - *Production-integrated* (called today by `src/lib/sharenet/circuit-destroy-transport.ts` via `FailureEventDispatcher`): only `RecoveryManager.handleLinkEvent(event)` — invoked from `FailureEventDispatcher.drainAndDispatch()` to mutate in-memory route/circuit health records. **The invalidated routeIds returned by handleLinkEvent are DISCARDED by the dispatcher** — no caller acts on them.
+     - *Callable but NOT production-integrated*: `handleGatewayDisappearance`, `getInvalidatedRoutes`, `getHealthyRoutes`, `createRecoveryPlan`, `discoverAlternativeGateways`, `registerLink`, `registerRoute`. These exist with full unit-test coverage but ZERO production callers wire them into a recovery-execution pipeline. The entire "discover new gateway → build new route → establish new circuit" pipeline is dead code in production.
+   - **Stale import bug (not blocking, but worth noting)**: line 35 imports `NodeCapability` from `"../identity/keys"`, but `keys.ts` does NOT export `NodeCapability`. The actual definition lives in `reference/routing/service-negotiation.ts:31` and `reference/advertisement/advertisement.ts:56`. This is a TypeScript type-only import that compiles only because the symbol is erased; at runtime it is undefined behavior if any code path tried to use it as a value. Phase 5 should fix the import path.
+
+2. `reference/routing/route.ts` (990 lines) — complete crypto-bound route pipeline
+   - **RouteHop interface**: `{ nodeId: string; capability: NodeCapability; endpoint: string; linkUp: boolean; serviceAgreement?: ServiceAgreement }`.
+   - **RouteProposal interface** (all fields): `{ hops: RouteHop[]; requirementDigest: string; expiry: number; initiatorNodeId: string; agreementDigest: string }`. NO `routeId` field — per R-003/R-004 reconciliation, the only route identity is the `commitmentRoot` (Merkle root) derived from proposal+acceptances+nonce.
+   - **SignedRouteProposal interface**: `{ proposal: RouteProposal; signature: Uint8Array }` (signature is Ed25519 by initiator).
+   - **RouteAcceptance interface** (all fields, R-003C fully bound):
+     ```
+     { proposalDigestHex: string;       // BLAKE3-256 of canonical RouteProposal
+       hopIndex: number;
+       hopDigestHex: string;            // BLAKE3-256 of canonical HopDescriptor
+       serviceDigestHex: string;         // BLAKE3-256 of canonical ServiceAgreement
+       acceptorNodeId: string;
+       acceptanceNonce: Uint8Array;     // 16 random bytes (fresh per acceptance)
+       expiry: number;                  // unix seconds
+       signature: Uint8Array }          // Ed25519 by acceptor over payload
+     ```
+   - **RouteCommitment interface** (all fields): `{ routeId: string (DERIVED = "route:" + hex(commitmentRoot)); proposal: RouteProposal; acceptances: RouteAcceptance[]; commitmentRoot: Uint8Array (32); commitmentNonce: Uint8Array (16); committerSignature: Uint8Array; committedAt: number }`.
+   - **CommittedRoute interface** (downstream consumer): `{ routeId, hops: RouteHop[], expiry, initiatorNodeId, agreementDigest, committedAt, commitmentRoot }`.
+   - **signRouteAcceptance(proposal, hopIndex, hop, serviceAgreement, acceptorNodeId, acceptorSecretKey, expiry): RouteAcceptance** — computes proposalDigest + hopDigest + serviceDigest via `./digests`, generates 16-byte acceptanceNonce, signs the canonical payload, returns RouteAcceptance.
+   - **verifyRouteAcceptance(acceptance, acceptorPublicKey): boolean** — uses CARRIED digests (no TOCTOU).
+   - **verifyAcceptanceBinding(acceptance, proposal, hopIndex, hop, serviceAgreement): { ok: true } | { ok: false; reason }** — compares carried digests against freshly-computed ones from immutable canonical objects.
+   - **Merkle commitment_root derivation (FROZEN per spec/07 §5.3.1)**:
+     - `MERKLE_COMMITMENT_DOMAIN = "SHARENET/ROUTE/COMMITMENT/MERKLE/1"`.
+     - `computeCommitmentRoot(proposal, acceptances): Uint8Array` — leaves = [proposal_leaf, acceptance_leaf_0, ...]; proposal_leaf = BLAKE3-256(domain || 0x00 || canonicalEncode(proposal)); acceptance_leaf_i = BLAKE3-256(domain || 0x01 || u32be(i) || canonicalEncode(acceptance_i)); parent = BLAKE3-256(domain || 0x02 || left || right); odd-node handling = duplicate last; single leaf = root.
+     - `generateMerkleInclusionProof(proposal, acceptances, hopIndex): { proof: MerkleProofElement[]; commitmentRoot: Uint8Array }` — for gateway authorization (R-009 Stage 2).
+     - `verifyMerkleInclusionProof(leaf, proof, expectedCommitmentRoot): boolean` — constant-time comparison.
+     - `computeAcceptanceLeafForVerification(acceptance, hopIndex): Uint8Array` — exported helper for gateway verifier.
+     - `deriveRouteId(commitmentRoot): string` — `"route:" + toHex(commitmentRoot)`.
+   - **routeAcceptanceSigningPayload(proposalDigestBytes, hopIndex, hopDigestBytes, serviceDigestBytes, acceptorNodeId, acceptanceNonce, expiry): Uint8Array** — payload = domain || proposal_digest(32) || hop_index(4 BE) || hop_digest(32) || service_digest(32) || acceptor_node_id(utf8) || nonce(16) || expiry(8 BE).
+   - **createRouteCommitment(proposal, acceptances, hopPublicKeys: Map<nodeId, Uint8Array>, serviceAgreements: Map<hopIndex, ServiceAgreement>, committerSecretKey, now): { ok: true; commitment: RouteCommitment; verificationResults } | { ok: false; reason; verificationResults }** — verifies every acceptance (hopIndex, acceptorNodeId match, expiry>now, signature valid, binding valid, hop.linkUp). Computes commitmentRoot via Merkle, generates commitmentNonce, signs source payload, deep-freezes the commitment, registers in `routeCommitmentRegistry` WeakSet via `registerRouteCommitment()`. R-004 mandatory verification.
+   - **verifyRouteCommitment(commitment, sourcePublicKey, hopPublicKeys, serviceAgreements, now): { ok: true } | { ok: false; reason }** — language-independent verification (no WeakSet); recomputes root + verifies source signature + every acceptance.
+   - **routeCommitmentSigningPayload(commitmentRoot, commitmentNonce): Uint8Array** — payload = domain || commitment_root(32) || commitment_nonce(16).
+   - **createCommittedRoute(commitment): CommittedRoute** — narrow view for downstream (carries routeId, hops, expiry, initiatorNodeId, agreementDigest, committedAt, commitmentRoot).
+   - **Architecture guards**: `TOPOLOGY_TO_ROUTE_FORBIDDEN(topologyData): never`, `PROPOSAL_TO_CIRCUIT_FORBIDDEN(proposal): never`.
+   - Constants: `ROUTE_PROPOSAL_DOMAIN = "SHARENET/ROUTE/PROPOSAL/1"`, `ROUTE_ACCEPTANCE_DOMAIN = "SHARENET/ROUTE/ACCEPTANCE/1"`, `ROUTE_COMMITMENT_DOMAIN = "SHARENET/ROUTE/COMMITMENT/1"`.
+   - Re-exports `ServiceAgreement` from `./service-negotiation` for convenience.
+
+3. `reference/circuit/circuit.ts` (772 lines) — circuit core + single-process setup
+   - **setupCircuit(route: BrandedCommittedRoute, relayX25519PublicKeys: Array<{ hopIndex; nodeId; x25519PublicKey }>, now: number, floorStore: CircuitSequenceFloorStore, initialFloor?: bigint): ActiveCircuit** — the ONLY single-process ActiveCircuit constructor. Verifies route is genuine BrandedCommittedRoute (WeakSet), generates initiator X25519 ephemeral keypair, derives circuitId + noncePrefix, performs ECDH with each relay's X25519 public key, derives per-hop forwardingKey + returnKey via HKDF (commitment_root as salt). Returns ActiveCircuit.
+   - **ActiveCircuit interface** (all key fields):
+     ```
+     { circuitId: Uint8Array; circuitIdHex: string; routeId: string;
+       hops: HopKeyMaterial[];   // { hopIndex, nodeId, forwardingKey, returnKey, relayX25519PublicKey }
+       initiatorX25519PublicKey: Uint8Array;
+       initiatorX25519SecretKey: Uint8Array;     // kept for re-key / decrypt of return traffic
+       expiry: number; establishedAt: number;
+       replayGuard: CircuitReplayGuard;            // in-memory fast-path cache
+       noncePrefix: Uint8Array;                    // 8 bytes — bound to circuit INSTANCE per ADR-0020
+       commitmentRoot: Uint8Array;                 // 32 bytes — carried for AD construction
+       floorStore: CircuitSequenceFloorStore }     // REQUIRED durable substrate (R-008 hardening)
+     ```
+   - **deriveCircuitId(commitmentRoot: Uint8Array, initiatorX25519PublicKey: Uint8Array): Uint8Array** — BLAKE3-256(utf8("SHARENET/CIRCUIT/ID/1") || commitment_root || initiator_x25519_pub). Binds circuit to a specific committed route + initiator ephemeral key.
+   - **deriveNoncePrefix(commitmentRoot: Uint8Array, initiatorX25519PublicKey: Uint8Array): Uint8Array** — first 8 bytes of HKDF-SHA256(salt=commitment_root, ikm=initiator_x25519_pub, info="SHARENET/CIRCUIT/NONCE/1"). Per ADR-0020: bound to circuit INSTANCE (not just route) — a re-key on the same route produces a fresh nonce prefix.
+   - Other key exports: `deriveHopKeys(sharedSecret, hopIndex, commitmentRoot): { forwardingKey: Uint8Array; returnKey: Uint8Array }` (HKDF with commitment_root as salt, info = domain || u8(hop_index), 64-byte output split 32+32); `buildNonce(noncePrefix, frameSequence): Uint8Array` (8-byte prefix || 4-byte BE sequence); `buildCircuitFrameAD(commitmentRoot, frameSequence, direction: 0x01|0x02): Uint8Array`; `CircuitReplayGuard` class (ORDERED_STREAM, `checkAndRecord(seq)` rejects seq ≤ floor); `SequenceFloorStore` class (in-memory floor by commitmentRootHex); `processCircuitFrame(circuit, hopIndex, frameSequence, direction, ciphertext): Promise<ProcessCircuitFrameResult>` (frozen ordering: AEAD authenticate+decrypt → atomic durable floor commit via `floorStore.checkAndAdvance` → accept); `loadCircuitFloor(floorStore, commitmentRoot, hopIndex, direction): Promise<bigint>` (re-key continuation helper).
+   - Constants: `CIRCUIT_KEY_DOMAIN = "SHARENET/CIRCUIT/KEY/1"`, `CIRCUIT_POSSESSION_DOMAIN = "SHARENET/CIRCUIT/POSSESSION/1"`, `CIRCUIT_ID_DOMAIN = "SHARENET/CIRCUIT/ID/1"`, `CIRCUIT_REPLAY_MODEL = "ORDERED_STREAM"`, `AEAD_KEY_BYTES=32`, `AEAD_NONCE_BYTES=12`, `AEAD_TAG_BYTES=16`, `X25519_PUBLIC_KEY_BYTES=32`, `X25519_SECRET_KEY_BYTES=32`, `CIRCUIT_EXPIRY_SECONDS=3600`.
+   - **Architecture guards**: `UNCOMMITTED_ROUTE_TO_CIRCUIT_FORBIDDEN(route): never`.
+   - NOTE: setupCircuit is NOT called by any production runtime path today — only by unit/integration tests.
+
+4. `reference/circuit/distributed-setup.ts` (793 lines) — distributed circuit establishment (the PRODUCTION path Phase 5 will use)
+   - **CircuitSetupRequest interface**: `{ route: BrandedCommittedRoute; hopIndex: number; initiatorX25519PublicKey: Uint8Array; setupNonce: Uint8Array (16) }`.
+   - **CircuitSetupAck interface** (all fields):
+     ```
+     { routeId: string;
+       routeCommitmentDigestHex: string;            // BLAKE3-256 of canonical BrandedCommittedRoute
+       hopIndex: number;
+       relayX25519PublicKey: Uint8Array;
+       initiatorX25519PublicKey: Uint8Array;        // transcript binding
+       relaySignature: Uint8Array;                   // Ed25519 by relay
+       possessionProofCiphertext: Uint8Array;        // AEAD-encrypted challenge — proves key possession
+       possessionChallenge: Uint8Array;             // the plaintext challenge that was encrypted
+       ackNonce: Uint8Array;                         // 16 bytes, fresh per ack
+       ackTimestamp: number; ackExpiry: number }
+     ```
+   - **handleCircuitSetup(req: CircuitSetupRequest, relayEd25519SecretKey, commitmentRoot, now?, ackNonceForTest?): { ok: true; ack: CircuitSetupAck; state: RelaySetupState } | { ok: false; reason }** — RELAY-side handler. Verifies BrandedCommittedRoute WeakSet, validates hopIndex range, generates ephemeral X25519 keypair, computes ECDH shared secret, derives forwarding+return keys via HKDF, generates AEAD possession proof (encrypts 32-byte challenge using forwardingKey), computes routeCommitmentDigest, signs ack via Ed25519, installs forwarding state (lifecycle="INSTALLED", expiresAt=ackExpiry). Returns ack + RelaySetupState (carries relayX25519SecretKey for return traffic decryption). Test-only hook `ackNonceForTest` for hop-isolation tests.
+   - **processCircuitSetupAck(ack, expectedRouteId, expectedRouteCommitmentDigestHex, expectedHopIndex, expectedInitiatorX25519PublicKey, relayEd25519PublicKey, initiatorX25519SecretKey, commitmentRoot, now?, ackStore: CircuitAckReplayStore): Promise<{ ok: true; hopKey: HopKeyMaterial } | { ok: false; reason }>** — INITIATOR-side ack verifier. Checks routeId + routeCommitmentDigest + hopIndex + initiator pubkey + ack freshness (ackExpiry>now, ackExpiry>ackTimestamp, ackTimestamp≤now+60s skew, now-ackTimestamp≤120s age), verifies relay Ed25519 signature, ECDHs, derives keys, verifies AEAD possession proof (decrypts ciphertext, compares to expectedChallenge constant-time), atomically consumes (commitmentRoot, hopIndex, ackNonce) via ackStore (fail-closed). Returns HopKeyMaterial.
+   - **establishDistributedCircuit(route: BrandedCommittedRoute, initiatorX25519SecretKey, initiatorX25519PublicKey, acks: CircuitSetupAck[], relayPublicKeys: Map<nodeId, Uint8Array>, now, ackStore: CircuitAckReplayStore, floorStore: CircuitSequenceFloorStore, initiatorEd25519SecretKey, initiatorEd25519PublicKey): Promise<{ ok: true; circuit: ActiveCircuit; returnTemplate: ReturnOnionTemplate; gatewayReturnTemplate: GatewayReturnTemplate } | { ok: false; reason }>** — the FULL production entry point. Verifies BrandedCommittedRoute WeakSet, verifies all acks present, derives circuitId + noncePrefix, processes each ack via processCircuitSetupAck (atomic consumption), assembles ActiveCircuit, constructs ReturnOnionTemplate (layered K_ret envelope) + signs GatewayReturnTemplate (authenticated transfer to terminal gateway via initiator Ed25519 keypair). Returns ActiveCircuit + returnTemplate + gatewayReturnTemplate.
+   - Other exports: `ForwardingLifecycle` type (`"INSTALLED" | "ACTIVE" | "EXPIRED" | "CLOSED"`), `transitionForwardingLifecycle(from, to)`, `isTerminalForwardingLifecycle(s)`, `encodeCircuitSetupRequest`, `circuitSetupSigningPayload`, `circuitAckSigningPayload`, `generatePossessionProof(forwardingKey, noncePrefix, commitmentRoot, hopIndex): { ciphertext; challenge }`, `verifyPossessionProof(forwardingKey, noncePrefix, commitmentRoot, ciphertext, expectedChallenge): boolean`, `routeCommitmentDigest(route): Uint8Array`, `RelaySetupState` interface, `LEGAL_LIFECYCLE_TRANSITIONS` map.
+   - Constants: `CIRCUIT_SETUP_DOMAIN = "SHARENET/CIRCUIT/SETUP/1"`, `CIRCUIT_ACK_DOMAIN = "SHARENET/CIRCUIT/ACK/1"`, `ACK_MAX_AGE_SECONDS = 120` (2 min), `ACK_MAX_CLOCK_SKEW_SECONDS = 60` (1 min), `CIRCUIT_EXPIRY_SECONDS = 3600`.
+   - NOTE: establishDistributedCircuit is NOT called by any production runtime path today — only by `tests/r008-distributed-circuit.test.ts` and related. `src/lib/sharenet/circuit-persistence.ts` mentions it in a docstring comment but does NOT call it.
+
+5. `reference/failure/failure-event-dispatcher.ts` (213 lines) — exports list
+   - Re-exports from `./link-failure-detector`: `LinkFailureDetector`, `FailureObservation`, `LinkHealthState`, `FailureCategory`, `PROTOCOL_FAILURE_THRESHOLD`, `PROTOCOL_FAILURE_WINDOW_SECONDS`, `invalidateCircuitOnFailure`, `CircuitInvalidationResult`.
+   - **CircuitLinkAssociation interface**: `{ readonly circuitId: Uint8Array; readonly commitmentRoot: Uint8Array; readonly circuitObj?: ActiveCircuit }`.
+   - **DispatchResult interface**: `{ readonly state: LinkHealthState; readonly invalidatedCircuits: Array<{ circuitId: Uint8Array; reason: number }>; readonly recoveryManagerNotified: boolean }`.
+   - **FailureEventDispatcher class** — constructor `(detector, circuitAssociations: Map<linkId, CircuitLinkAssociation[]>, destroyStore, recoveryManager?: RecoveryManager)`. Methods: `recordObservation(observation): Promise<DispatchResult>`, `recordSuccess(linkId, now): Promise<DispatchResult>`, `getState(linkId): LinkHealthState`, private `drainAndDispatch(now)`.
+   - **CRITICAL DETAIL for Phase 5**: `drainAndDispatch` calls `recoveryManager.handleLinkEvent(event)` for ALL events (DEGRADED + DOWN), but the returned `invalidatedRoutes` array is **DISCARDED**. The dispatcher only persists the circuit tombstone (via invalidateCircuitOnFailure) — it does NOT call createRecoveryPlan or trigger recovery execution.
+
+6. `reference/failure/link-failure-detector.ts` (489 lines) — exports list
+   - **Constants (FROZEN per ADR-0024)**: `PROTOCOL_FAILURE_THRESHOLD = 3 as const`, `PROTOCOL_FAILURE_WINDOW_SECONDS = 60 as const`.
+   - **Types**: `FailureCategory = "TRANSPORT_CONFIRMED" | "PROTOCOL_AUTHENTICATION"`; `FailureObservation` interface (linkId, localNodeId, remoteNodeId, circuitId?, category, reason, observedAt); `LinkHealthState = "HEALTHY" | "DEGRADED" | "LINK_DOWN"`; `CircuitInvalidationResult` union (`{ ok: true; action: "REVOKED" } | { ok: true; action: "ALREADY_REVOKED" } | { ok: false; reason }`).
+   - **LinkFailureDetector class**: `recordObservation(observation): LinkHealthState`, `recordSuccess(linkId, now): LinkHealthState`, `getState(linkId): LinkHealthState`, `drainEvents(): LinkHealthEvent[]`, `getEvents(): LinkHealthEvent[]`. State machine: HEALTHY → (TRANSPORT_CONFIRMED) → LINK_DOWN (immediate); HEALTHY → (single PROTOCOL_AUTHENTICATION) → DEGRADED; DEGRADED → (3 within 60s) → LINK_DOWN; DEGRADED → (recordSuccess) → HEALTHY. LINK_DOWN is terminal/idempotent.
+   - **invalidateCircuitOnFailure(destroyStore, circuitId, commitmentRoot, reason: number, destroyerNodeId, destroyerRole, destroyNonce): Promise<CircuitInvalidationResult>** — atomic consumeDestroyAndRevoke bridge. Pre-checks isRevoked; on success returns REVOKED or ALREADY_REVOKED; on persistence failure returns ok:false (fail-closed).
+   - **dispatchFailureEvents(detector, circuitAssociations, destroyStore, recoveryManager?): Promise<{ invalidatedCircuits; recoveryPlans: any[] }>`** — LEGACY module-level function. Superseded by `FailureEventDispatcher` class. Has the same gap: drains events → invalidates circuits → forwards to RecoveryManager, but recoveryPlans array is always empty (`recoveryManager.handleLinkEvent` is called but its return value is NOT captured into recoveryPlans).
+
+7. `reference/routing/service-negotiation.ts` (312 lines) — ServiceAgreement interface + negotiation primitives
+   - **NodeCapability type** (10 values): `"MESH_RELAY" | "INTERNET_GATEWAY" | "CONTENT_SEED" | "STORAGE" | "DISCOVERY" | "SYNC" | "COMPUTE" | "CRYPTO_RELAY" | "CRYPTO_GATEWAY" | "PAYMENT_RELAY"`.
+   - **ServiceAgreement interface** (all fields):
+     ```
+     { nodeId: string; capability: NodeCapability;
+       requirementDigest: string;             // SHA-256 of the ServiceRequirement
+       allocatedBandwidthBps: number;
+       expiry: number;                         // unix seconds
+       policyVersion: number }
+     ```
+   - Also exports: `ServiceRequirement` (requiredCapability, destination?, maxHops, bandwidthBps?, expiry), `CapabilityOffer` (nodeId, capability, endpoints, linkUp, advVerifiedOnly), `PolicyCheckResult`, `PolicyRejectionReason` (10 values: DESTINATION_NOT_ALLOWED, DESTINATION_BLOCKED_SSRF, ...), `checkPolicy(requirement, offer, now, allowedDestinations?, revokedPeers?)`, `CapacityInfo`, `CapacityCheckResult`, `CapacityRejectionReason`, `checkCapacity(requirement, capacity)`, `createServiceAgreement(offer, requirement, capacityResult, policyResult): ServiceAgreement | null`.
+
+8. `reference/transport/validated-types.ts` (390 lines) — proof-carrying validated types (WeakSet-backed)
+   - **ValidatedHop interface** (all fields):
+     ```
+     { readonly nodeId: string; readonly capability: string;
+       readonly endpoint: string;
+       readonly authenticatedNode: AuthenticatedNodeRecord;
+       readonly linkUp: true;                  // always true — only constructible when LINK_UP
+       readonly serviceAgreementDigest: string }
+     ```
+   - **BrandedCommittedRoute interface** (all fields):
+     ```
+     { readonly routeId: string;
+       readonly hops: readonly ValidatedHop[];
+       readonly expiry: number;
+       readonly initiatorNodeId: string;
+       readonly agreementDigest: string;
+       readonly committedAt: number;
+       readonly commitmentRoot: Uint8Array }   // 32 bytes — the cryptographic anchor
+     ```
+   - **createBrandedCommittedRoute(commitment: RouteCommitment, validatedHops: ValidatedHop[]): BrandedCommittedRoute** — verifies BOTH (a) genuine RouteCommitment via WeakSet `routeCommitmentRegistry`, (b) every validatedHop is genuine via `validatedHopRegistry` WeakSet, (c) count match, (d) per-hop nodeId/endpoint/capability match against commitment.proposal.hops. Then deep-freezes the result + registers in `brandedRouteRegistry` WeakSet. This is the unforgeable artifact that `setupCircuit` and `establishDistributedCircuit` require.
+   - Also exports: `AuthenticatedNodeRecord` interface, `createAuthenticatedNodeRecord(verified: VerifiedNodeAdvertisement)`, `isAuthenticatedNodeRecord`, `createValidatedHop(link: AuthenticatedLink, endpoint, capability, serviceAgreementDigest, now)` — enforces use-time freshness (link.expiresAt>now), `isValidatedHop`, `isRouteCommitment`, `registerRouteCommitment`, `isBrandedCommittedRoute`, `HINT_TO_VALIDATED_HOP_FORBIDDEN`, `UNBRANDED_ROUTE_FORBIDDEN`.
+
+9. `reference/identity/keys.ts` (300 lines) — Ed25519 + canonical NodeId
+   - **NodeKeypair interface** (all fields):
+     ```
+     { secretKey: Uint8Array;     // 32 bytes — Ed25519 seed, NEVER leaves the node
+       publicKey: Uint8Array;     // 32 bytes — raw Ed25519 public key
+       nodeId: string }           // canonical NodeId text — 52 lowercase base32 chars [a-z2-7]
+     ```
+   - **generateNodeKeypair(): NodeKeypair** — `randomBytes(32)` → secretKey; `ed25519.getPublicKey(secretKey)` → publicKey; `deriveNodeId(publicKey)` → nodeId.
+   - Also exports: `deriveNodeId(publicKey): string` (BLAKE3-256(utf8("SHARENET/NODEID/1") || publicKey) → 32 bytes → lowercase unpadded RFC 4648 base32 = 52 chars), `verifyNodeIdBinding(claimedNodeId, publicKey): boolean` (constant-time), `isValidNodeIdFormat(nodeId): boolean` (52 chars [a-z2-7] + trailing 4 bits zero), `keypairFromSecretKey(secretKey): NodeKeypair`, `signMessage(secretKey, message): Uint8Array` (Ed25519), `verifySignature(publicKey, message, signature): boolean` (constant-time), `bytesToHex`, `hexToBytes`, `bytesToBase32`, `base32ToBytes`, `constantTimeEqual`.
+   - Constants: `NODE_ID_DOMAIN_TAG = "SHARENET/NODEID/1"`, `NODE_ID_BYTES = 32`, `NODE_ID_TEXT_LENGTH = 52`, `ED25519_PUBLIC_KEY_BYTES = 32`, `ED25519_SECRET_KEY_BYTES = 32`, `ED25519_SIGNATURE_BYTES = 64`.
+   - Re-exports `randomBytes` from `@noble/hashes/utils.js`.
+   - **NOTE**: `reference/routing/recovery.ts:35` imports `NodeCapability` from `"../identity/keys"` but keys.ts does NOT export this type — it lives in `reference/routing/service-negotiation.ts:31` and `reference/advertisement/advertisement.ts:56`. This is a stale/wrong import path. Phase 5 should fix it (either re-export from keys.ts or fix the import in recovery.ts).
+
+10. `prisma/schema.prisma` (499 lines) — NO recovery-related models exist
+    - Searched for `recovery`, `RecoveryAttempt`, `RouteInvalidation`, `RouteHealthRecord`, `CircuitHealthRecord`, `GatewayCandidate`, `LinkHealthEvent` — **NO MATCHES**.
+    - Existing circuit-related models (for context):
+      - `NodeRecord` (node identity + capabilities, ADR-0011).
+      - `CircuitSequenceFloor` (durable replay floor, keyed by commitmentRootHex + hopIndex + direction).
+      - `ConsumedCircuitAck` (single-use ack replay protection, keyed by commitmentRootHex + hopIndex + ackNonceHex).
+      - `ConsumedGatewayAuthorization` (single-use gateway return authorization, keyed by circuitIdHex).
+      - `CircuitRevocation` (durable tombstone — `destroyerNodeId`, `destroyerRole`, `destroyReason` Int, `destroyNonceHex`, unique on (circuitIdHex, commitmentRootHex)).
+      - `ConsumedCircuitDestroy` (atomic destroy nonce consumption, keyed by commitmentRootHex + circuitIdHex + destroyNonceHex).
+      - `GatewayPolicy` + `GatewayPolicyDecision` (stub per ADR-0011).
+      - Legacy: `SequenceFloor` (pre-R-009 route-keyed floor, superseded by CircuitSequenceFloor).
+    - **GAP**: `RecoveryManager` + `LinkFailureDetector` are PURELY in-memory. Process restart loses ALL route health + circuit health + link health state. There is NO durable record of "this route was invalidated because of LINK_DOWN at T" — only the terminal CircuitRevocation tombstone persists (with destroyReason=0x03/0x04). Phase 5 may need a `RecoveryAttempt` or `RouteHealthRecord` model if recovery decisions must survive restart, OR may rely on the existing CircuitRevocation tombstone as the only durable signal (re-derive route health on startup from active revocations).
+
+### Cross-file gap analysis for Phase 5 (Automatic Circuit Recovery Execution)
+
+**The recovery-execution pipeline is COMPLETELY ABSENT in production**. Every primitive exists with unit-test coverage; none is wired into a production orchestrator.
+
+GAP P5-A — `FailureEventDispatcher.drainAndDispatch` discards `RecoveryManager.handleLinkEvent` return value (lines 176-179 of failure-event-dispatcher.ts):
+```ts
+if (this.recoveryManager) {
+  this.recoveryManager.handleLinkEvent(event);   // returns invalidatedRouteIds[]
+  recoveryManagerNotified = true;
+}
+```
+The `invalidatedRoutes` array is captured into a local variable nowhere; it's discarded. There is no callback, no event emitter, no out-parameter. Phase 5 needs either (a) a hook/callback the dispatcher invokes with the invalidated routeIds, or (b) an out-parameter on DispatchResult, or (c) the RecoveryManager itself to invoke an orchestrator on invalidation (push model).
+
+GAP P5-B — `createRecoveryPlan` is never called in production code. Only tests call it (`tests/r009-phase4-production-integration.test.ts:133`). The orchestrator that takes (invalidatedRoutes, reason, availableNodes, requiredCapability) → RecoveryPlan does NOT exist.
+
+GAP P5-C — When `RecoveryPlan.nextStep === "DISCOVER_NEW_GATEWAY"`, NO code executes the recommended pipeline:
+```
+RouteProposal → signRouteAcceptance (per hop) → createRouteCommitment
+              → createBrandedCommittedRoute → establishDistributedCircuit
+```
+Every primitive in this chain is implemented + unit-tested. None is orchestrated. The orchestrator needs:
+- A registry of available GatewayCandidates (NOT in the codebase — the `availableNodes` parameter of createRecoveryPlan is currently always test-supplied).
+- A way to obtain each candidate's AuthenticatedNodeRecord (for createValidatedHop) + Ed25519 public key (for signRouteAcceptance verification via hopPublicKeys Map in createRouteCommitment) + X25519 public key (for establishDistributedCircuit's relayPublicKeys Map).
+- A way to drive the per-hop `handleCircuitSetup` request over the wire to each relay + collect acks (NO production CircuitSetupTransport exists today — only an in-process mock transport in tests).
+- A ServiceAgreement per hop (the `serviceAgreements: Map<hopIndex, ServiceAgreement>` parameter of createRouteCommitment is test-supplied).
+
+GAP P5-D — `handleGatewayDisappearance` is NEVER called in production (still — flagged in P4-audit GAP D, not closed). No gateway-liveness probe feeds it. Without this signal source, Phase 5's recovery trigger is currently limited to LINK_DOWN from transport errors (the FailureEventDispatcher's only input).
+
+GAP P5-E — Durable recovery state (P5-audit point 10): if Phase 5 must survive process restart mid-recovery (e.g. dispatcher invalidated a route, then process crashed before recovery completed), there is NO durable record of "recovery pending for route X". A restart would re-establish the same invalid route from in-memory state (which is gone) OR rely on the CircuitRevocation tombstone. The decision to add a `RecoveryAttempt` Prisma model depends on the Phase 5 scope — if recovery is best-effort + idempotent (re-running it on restart produces the same new circuit, or no-op if already recovered), no new model is needed.
+
+### Inventory of what is already in place (no Phase-5 work needed)
+
+- Full crypto-bound route construction pipeline (route.ts): RouteProposal → RouteAcceptance (with carried digests — no TOCTOU) → Merkle commitmentRoot → RouteCommitment (verifies all signatures + bindings) → CommittedRoute → BrandedCommittedRoute (WeakSet-verified, deep-frozen).
+- Full distributed circuit establishment (distributed-setup.ts): CircuitSetupRequest → handleCircuitSetup (relay-side, installs forwarding state) → CircuitSetupAck (with AEAD possession proof) → processCircuitSetupAck (atomic consume via ackStore) → establishDistributedCircuit (assembles ActiveCircuit + returnTemplate + gatewayReturnTemplate).
+- Full circuit data-plane (circuit.ts): setupCircuit + ActiveCircuit + deriveCircuitId + deriveNoncePrefix + HKDF key schedule + ChaCha20-Poly1305 AEAD + ORDERED_STREAM replay guard + atomic durable floor commit via floorStore.
+- Full failure-detection → durable invalidation pipeline (Phase 4, production-wired): FailureEventDispatcher.recordObservation → LinkFailureDetector → drainAndDispatch → invalidateCircuitOnFailure (atomic consumeDestroyAndRevoke with DESTROY_REASON_LINK_FAILURE 0x03) → zeroize → RecoveryManager.handleLinkEvent.
+- Full key infrastructure (keys.ts): generateNodeKeypair + NodeKeypair + signMessage + verifySignature + canonical NodeId derivation.
+- Full proof-carrying validated types (validated-types.ts): AuthenticatedNodeRecord + ValidatedHop + BrandedCommittedRoute, all WeakSet-verified + deep-frozen.
+- Recovery primitives (recovery.ts): RecoveryManager + createRecoveryPlan + discoverAlternativeGateways. All callable, all unit-tested, all waiting for a Phase-5 orchestrator.
+
+### Inventory of what Phase 5 must BUILD (not present today)
+
+1. **A recovery orchestrator** (likely `src/lib/sharenet/recovery-orchestrator.ts` or `reference/routing/recovery-executor.ts`) that:
+   - Subscribes to invalidation events from the FailureEventDispatcher (P5-A hook).
+   - On invalidation: calls `createRecoveryPlan(invalidatedRouteIds, reason, availableNodes, requiredCapability, excludeNodeIds)`.
+   - If `nextStep === "DISCOVER_NEW_GATEWAY"`: executes the full pipeline:
+     * Discover candidate gateway (already done by createRecoveryPlan).
+     * Construct RouteProposal through the candidate + relays.
+     * Per hop: sign RouteAcceptance (the relay signs — needs the relay's Ed25519 secret key OR a wire protocol where the relay receives the proposal + signs + returns).
+     * Verify + createRouteCommitment.
+     * createBrandedCommittedRoute (consumes RouteCommitment + ValidatedHop[]).
+     * Per relay: drive handleCircuitSetup over the wire, collect acks.
+     * establishDistributedCircuit — produces new ActiveCircuit.
+     * Register the new circuit in the dispatcher's circuitAssociations (so future failure on the new route triggers recovery again).
+   - If `nextStep === "WAIT_FOR_LINK_RECOVERY"`: emit a "recovery deferred" signal (no new circuit).
+   - If `nextStep === "NO_RECOVERY_POSSIBLE"`: emit a "recovery impossible" signal.
+
+2. **A CircuitSetup wire transport** (the analog of `TcpCircuitDestroyTransport` for CircuitSetupRequest/ack). Today NO transport exists — only in-process mock in tests. This is the largest missing piece: the orchestrator cannot drive `handleCircuitSetup` on a remote relay without a transport.
+
+3. **A GatewayCandidate registry / discovery source** for `availableNodes`. The `discoverAlternativeGateways` function takes a list of candidates as input — it does NOT discover them. Production needs a source (likely the existing `NodeRecord` Prisma table filtered by capability + linkUp, OR an advertisement-gossip-based discovery).
+
+4. **A ServiceAgreement negotiation wire protocol** (or a default policy). The orchestrator needs a `serviceAgreements: Map<hopIndex, ServiceAgreement>` to call createRouteCommitment. Today ServiceAgreement is constructed via createServiceAgreement (in-process) in tests; production needs a per-hop negotiation protocol OR a default "best-effort" agreement.
+
+5. **A gateway-liveness probe** feeding `handleGatewayDisappearance` (P4-audit GAP D, still open) — without this, the only recovery trigger is LINK_DOWN from transport errors.
+
+6. **(Possibly) a `RecoveryAttempt` Prisma model** if recovery decisions must survive process restart (P5-E). If the orchestrator is idempotent + best-effort, this can be skipped.
+
+### Recommended Phase-5 scope decision (for Principal review)
+
+The minimum viable Phase 5 (matches the P4-audit's GAP-E punt + the spec/00 §9 Recovery diagram) is:
+- Wire P5-A (invalidation hook from FailureEventDispatcher).
+- Wire P5-B (createRecoveryPlan call on invalidation).
+- Wire P5-C (the full RouteProposal → establishDistributedCircuit pipeline) — but only in the IN-PROCESS / single-process form for now (no new wire transport): the orchestrator directly calls handleCircuitSetup + establishDistributedCircuit with in-memory objects. This proves the recovery-execution path end-to-end. The CircuitSetup wire transport can be a separate Phase 5b.
+
+If Phase 5 = in-process orchestration only: ~1 orchestrator module + 1 test + 1 ADR. If Phase 5 includes the wire transport: ~2 modules + 1 transport + multi-process tests + 1 ADR. Recommend confirming scope with Principal before implementation.
+
+### Next actions
+
+1. Confirm with Principal: Phase 5 scope = (a) in-process orchestrator only, OR (b) in-process + wire transport, OR (c) full P5-A through P5-E including gateway-liveness probe + durable RecoveryAttempt model.
+2. Build the recovery orchestrator in `src/lib/sharenet/recovery-orchestrator.ts` (platform layer — may import Prisma). It subscribes to FailureEventDispatcher invalidation events, calls createRecoveryPlan, and on `DISCOVER_NEW_GATEWAY` runs the in-process pipeline. It does NOT live in `reference/` (which must remain platform-independent).
+3. Add a hook to FailureEventDispatcher.DispatchResult: `invalidatedRoutes: string[]` (the return value of RecoveryManager.handleLinkEvent) so the orchestrator can pick it up. This is a minimal API surface change.
+4. Add an integration test: link-failure → durable invalidation → recovery orchestrator → new ActiveCircuit established on a different gateway → traffic resumes on the new circuit.
+5. Update ADR-0024 + add ADR-0025 documenting the recovery-execution path + the in-process vs wire-transport boundary.
+6. Run all 5 required verification suites (unit + arch + TS vectors + Python vectors + lint).
+7. (Optional, separate task) Fix the stale `import type { NodeCapability } from "../identity/keys"` in recovery.ts — should be `"../routing/service-negotiation"` (or `./service-negotiation` since recovery.ts is in routing/).
+
