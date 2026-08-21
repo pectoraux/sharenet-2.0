@@ -164,19 +164,35 @@ export class FailureEventDispatcher {
   private readonly relayX25519PublicKeys?: Uint8Array[];
 
   /**
-   * Re-entrancy guard. While `drainAndDispatch()` is executing, any new
-   * observations recorded (e.g. by a recovery execution that triggers a
-   * transport failure) are buffered into `pendingObservations` instead of
-   * being recursively dispatched. This prevents unbounded nested dispatch
-   * + transport-path deadlock. The buffered observations are drained at
-   * the end of the current dispatch cycle (single re-dispatch pass).
+   * Re-entrancy guard. While the dispatch loop is running, any new
+   * observations (e.g. from a recovery execution that triggers a transport
+   * failure) are ENQUEUED into `pendingObservations`. The dispatch loop
+   * drains the queue iteratively — NOT recursively. There is exactly ONE
+   * dispatch owner at a time; when it finishes, if the queue is non-empty,
+   * it continues draining in the same call stack (no new stack frame per
+   * queued observation).
    *
-   * Per Subtask 1 §8: the frozen ordering (invalidation → zeroize → recovery
-   * signal) is preserved. Recovery execution is awaited (observable, not
-   * fire-and-forget), but re-entrant observations are queued — not nested.
+   * This is a BOUNDED queue/drain mechanism:
+   *   - No recursive `drainAndDispatch()` calls (the prior implementation
+   *     recursively called itself in the finally block — unbounded).
+   *   - No `setTimeout` polling, no interval polling.
+   *   - No unbounded promise chaining.
+   *   - No fire-and-forget recovery (recovery execution is awaited).
+   *   - No swallowed errors.
+   *
+   * Per Subtask 1 §8: the frozen ordering (invalidation → zeroize →
+   * recovery signal) is preserved. Re-entrant observations are queued —
+   * not nested.
    */
   private dispatching = false;
   private readonly pendingObservations: FailureObservation[] = [];
+  /**
+   * BOUND on the number of queued re-entrant observations. If exceeded,
+   * further re-entrant observations are REJECTED (the dispatcher is
+   * overloaded — fail-closed to prevent unbounded queue growth). This is
+   * a defensive DoS guard, not a protocol limit.
+   */
+  private static readonly MAX_QUEUED_OBSERVATIONS = 256;
 
   /**
    * @param detector - the LinkFailureDetector.
@@ -248,9 +264,27 @@ export class FailureEventDispatcher {
     const state = this.detector.recordObservation(observation);
 
     // 2. If we are already dispatching (re-entrant call from inside a recovery
-    //    execution), BUFFER the observation. It will be drained at the end of
-    //    the current dispatch cycle. This prevents unbounded nested dispatch.
+    //    execution), ENQUEUE the observation. The current dispatch owner will
+    //    drain it iteratively — NOT recursively. The caller gets a minimal
+    //    DispatchResult (the observation was accepted; its effects will be
+    //    processed by the current dispatch cycle).
     if (this.dispatching) {
+      if (this.pendingObservations.length >= FailureEventDispatcher.MAX_QUEUED_OBSERVATIONS) {
+        // Fail-closed: the queue is full. The dispatcher is overloaded.
+        // Drop the observation + return a result indicating overload.
+        // (This is a defensive DoS guard; in normal operation the queue
+        // never exceeds a handful of entries.)
+        return {
+          state,
+          invalidatedCircuits: [],
+          recoveryManagerNotified: false,
+          recoveryOutcomes: [{
+            kind: "EXECUTION_ERROR",
+            failedCircuitId: observation.circuitId ?? new Uint8Array(0),
+            errorMessage: "dispatcher queue full — re-entrant observation dropped (MAX_QUEUED_OBSERVATIONS exceeded)",
+          }],
+        };
+      }
       this.pendingObservations.push(observation);
       return {
         state,
@@ -260,8 +294,10 @@ export class FailureEventDispatcher {
       };
     }
 
-    // 3. Drain + dispatch any events (INLINE — no polling).
-    const dispatch = await this.drainAndDispatch(observation.observedAt);
+    // 3. This caller is the dispatch owner. Run the bounded drain loop.
+    //    The loop processes the current events + any re-entrant observations
+    //    enqueued during processing — iteratively, not recursively.
+    const dispatch = await this.runDispatchLoop(observation.observedAt);
 
     return { state, ...dispatch };
   }
@@ -285,7 +321,7 @@ export class FailureEventDispatcher {
         recoveryOutcomes: [],
       };
     }
-    const dispatch = await this.drainAndDispatch(now);
+    const dispatch = await this.runDispatchLoop(now);
     return { state, ...dispatch };
   }
 
@@ -297,11 +333,21 @@ export class FailureEventDispatcher {
   }
 
   /**
-   * Drain events from the detector + dispatch them. For each LINK_DOWN:
-   *   1. Resolve affected circuits (via circuit-link associations).
-   *   2. Durably invalidate each circuit (via invalidateCircuitOnFailure).
-   *   3. Zeroize (if the circuit object is available).
-   *   4. ONLY THEN forward the event to the RecoveryManager + trigger recovery.
+   * The BOUNDED dispatch loop. This is the SOLE dispatch owner. It:
+   *   1. Sets the `dispatching` guard.
+   *   2. Processes the current batch of detector events.
+   *   3. Drains the `pendingObservations` queue ITERATIVELY (NOT recursively):
+   *      while the queue is non-empty, feed each queued observation to the
+   *      detector + process the resulting events. This is a `while` loop,
+   *      not a recursive call.
+   *   4. Clears the `dispatching` guard + returns.
+   *
+   * This is BOUNDED: the loop terminates when the queue is empty. Each
+   * iteration processes exactly one observation's worth of events. The
+   * queue cannot grow unboundedly because:
+   *   - Each re-entrant observation is one queue entry.
+   *   - `recordObservation()` enqueues at most one entry per call.
+   *   - The MAX_QUEUED_OBSERVATIONS guard rejects excess entries.
    *
    * Ordering is CRITICAL (ADR-0025 §6):
    *   durable invalidation → zeroize → recovery signal.
@@ -309,122 +355,145 @@ export class FailureEventDispatcher {
    * before the old circuit has durably entered terminal state + its secrets
    * have been zeroized. Persistence failure → fail-closed (no recovery).
    */
-  private async drainAndDispatch(now: number): Promise<{ invalidatedCircuits: Array<{ circuitId: Uint8Array; reason: number }>; recoveryManagerNotified: boolean; recoveryOutcomes: RecoveryOutcome[] }> {
-    // Set the re-entrancy guard. Any observation recorded during dispatch
-    // (e.g. by a recovery execution that triggers a transport failure) is
-    // buffered into `pendingObservations` and drained at the end of this
-    // cycle — NOT recursively dispatched.
+  private async runDispatchLoop(now: number): Promise<{ invalidatedCircuits: Array<{ circuitId: Uint8Array; reason: number }>; recoveryManagerNotified: boolean; recoveryOutcomes: RecoveryOutcome[] }> {
     this.dispatching = true;
     const recoveryOutcomes: RecoveryOutcome[] = [];
-    let invalidatedCircuits: Array<{ circuitId: Uint8Array; reason: number }> = [];
+    const invalidatedCircuits: Array<{ circuitId: Uint8Array; reason: number }> = [];
     let recoveryManagerNotified = false;
 
     try {
-      const events = this.detector.drainEvents();
+      // Process the initial batch of detector events (from the observation
+      // that triggered this dispatch cycle).
+      await this.processEventsBatch(now, invalidatedCircuits, recoveryOutcomes, () => recoveryManagerNotified, (v: boolean) => { recoveryManagerNotified = recoveryManagerNotified || v; });
 
-      for (const event of events) {
-        // Only LINK_DOWN triggers circuit invalidation + recovery.
-        if (event.newStatus !== "DOWN") {
-          // Forward DEGRADED events to RecoveryManager (no invalidation).
-          if (this.recoveryManager) {
-            this.recoveryManager.handleLinkEvent(event);
-            recoveryManagerNotified = true;
-          }
-          continue;
+      // Iteratively drain the re-entrant observation queue. NO RECURSION.
+      // Each iteration: take one observation from the queue, feed it to the
+      // detector, process the resulting events. Continue until the queue
+      // is empty. This is a `while` loop — the dispatch owner remains the
+      // same call stack frame throughout.
+      let safetyCounter = 0;
+      while (this.pendingObservations.length > 0) {
+        // Defensive bound: if we've processed more iterations than
+        // MAX_QUEUED_OBSERVATIONS, something is generating observations
+        // faster than we can drain them. Break to prevent an infinite loop.
+        // (The MAX_QUEUED_OBSERVATIONS cap on enqueue also bounds this.)
+        if (safetyCounter++ > FailureEventDispatcher.MAX_QUEUED_OBSERVATIONS) {
+          break;
         }
-
-        // --- Step 1: Durable invalidation ---
-        const circuits = this.circuitAssociations.get(event.linkId) ?? [];
-        const successfullyRevoked: Array<{ circuitId: Uint8Array; commitmentRoot: Uint8Array }> = [];
-        for (const { circuitId, commitmentRoot, circuitObj } of circuits) {
-          const result = await invalidateCircuitOnFailure(
-            this.destroyStore,
-            circuitId,
-            commitmentRoot,
-            0x03, // DESTROY_REASON_LINK_FAILURE
-            "system",
-            0x01, // DESTROYER_ROLE_INITIATOR
-            randomBytes(16),
-          );
-          if (result.ok && (result.action === "REVOKED" || result.action === "ALREADY_REVOKED")) {
-            successfullyRevoked.push({ circuitId, commitmentRoot });
-            // --- Step 2: Zeroize (AFTER durable tombstone confirmed) ---
-            if (circuitObj) {
-              zeroizeCircuit(circuitObj);
-            }
-            if (result.action === "REVOKED") {
-              invalidatedCircuits.push({ circuitId, reason: 0x03 });
-            }
-          }
-          // Persistence failure → fail closed. Do NOT claim REVOKED. Do NOT zeroize.
-          // Do NOT emit recovery signal for this circuit.
-        }
-
-        // --- Step 3: Recovery signal (AFTER durable invalidation + zeroize) ---
-        // Only notify RecoveryManager if ALL affected circuits were durably revoked.
-        if (successfullyRevoked.length === circuits.length && this.recoveryManager) {
-          this.recoveryManager.handleLinkEvent(event);
-          recoveryManagerNotified = true;
-          // --- Step 4: Trigger circuit-specific recovery execution ---
-          // Recovery is bound to EACH exact failed circuit — NOT the entire
-          // invalidated-route set. Each circuit gets its own RecoveryPlan
-          // identifying its own failedCircuitId + failedCommitmentRoot.
-          if (this.recoveryExecutor && this.authenticatedTopologyProvider && this.requiredCapability) {
-            for (const { circuitId, commitmentRoot } of successfullyRevoked) {
-              // Create a CIRCUIT-SPECIFIC RecoveryPlan for THIS exact failed circuit.
-              // The plan uses the failed circuit's routeId — derived via the
-              // CANONICAL deriveRouteId(commitmentRoot) function. NOT an inline
-              // string reconstruction (avoids drift from the frozen derivation).
-              const failedRouteId = deriveRouteId(commitmentRoot);
-              const plan = createRecoveryPlan(
-                [failedRouteId], // circuit-specific — only THIS circuit's route
-                "LINK_DOWN",
-                this.gatewayCandidates ?? [],
-                this.requiredCapability,
-                [event.remoteNodeId], // exclude the failed gateway
-              );
-              // AWAIT recovery execution — do NOT fire-and-forget.
-              // The result is OBSERVABLE via recoveryOutcomes (not swallowed).
-              // Durable state persistence is Subtask 2; for now, the outcome
-              // is returned synchronously in the DispatchResult.
-              const outcome = await this.executeRecoverySafely(
-                plan,
-                circuitId,
-                commitmentRoot,
-                event,
-                now,
-              );
-              recoveryOutcomes.push(outcome);
-            }
-          }
-        }
+        const obs = this.pendingObservations.shift()!;
+        this.detector.recordObservation(obs);
+        await this.processEventsBatch(
+          now,
+          invalidatedCircuits,
+          recoveryOutcomes,
+          () => recoveryManagerNotified,
+          (v: boolean) => { recoveryManagerNotified = recoveryManagerNotified || v; },
+        );
       }
     } finally {
-      // Clear the re-entrancy guard. Drain any observations that were
-      // buffered during dispatch (single re-dispatch pass — no unbounded
-      // recursion). If draining produces new events, they are dispatched
-      // in this same pass (the detector's drainEvents() is called once
-      // per drainAndDispatch invocation).
       this.dispatching = false;
-      // Re-feed buffered observations to the detector so the NEXT
-      // drainAndDispatch (if any) picks them up. We do NOT recursively
-      // call drainAndDispatch here — the caller decides when to drain.
-      // However, if there are buffered observations, we perform ONE
-      // additional drain pass to ensure they are not lost.
-      if (this.pendingObservations.length > 0) {
-        const buffered = this.pendingObservations.splice(0);
-        for (const obs of buffered) {
-          this.detector.recordObservation(obs);
-        }
-        // Single re-dispatch pass for the buffered observations.
-        const redispatch = await this.drainAndDispatch(now);
-        invalidatedCircuits = invalidatedCircuits.concat(redispatch.invalidatedCircuits);
-        recoveryManagerNotified = recoveryManagerNotified || redispatch.recoveryManagerNotified;
-        recoveryOutcomes.push(...redispatch.recoveryOutcomes);
-      }
     }
 
     return { invalidatedCircuits, recoveryManagerNotified, recoveryOutcomes };
+  }
+
+  /**
+   * Process one batch of detector events. For each LINK_DOWN:
+   *   1. Resolve affected circuits (via circuit-link associations).
+   *   2. Durably invalidate each circuit (via invalidateCircuitOnFailure).
+   *   3. Zeroize (if the circuit object is available).
+   *   4. ONLY THEN forward the event to the RecoveryManager + trigger recovery.
+   *
+   * This method does NOT loop. It processes exactly the events currently
+   * in the detector's drain queue. Re-entrant observations enqueued during
+   * processing are handled by the caller's `while` loop in `runDispatchLoop`.
+   */
+  private async processEventsBatch(
+    now: number,
+    invalidatedCircuits: Array<{ circuitId: Uint8Array; reason: number }>,
+    recoveryOutcomes: RecoveryOutcome[],
+    getNotified: () => boolean,
+    setNotified: (v: boolean) => void,
+  ): Promise<void> {
+    const events = this.detector.drainEvents();
+
+    for (const event of events) {
+      // Only LINK_DOWN triggers circuit invalidation + recovery.
+      if (event.newStatus !== "DOWN") {
+        // Forward DEGRADED events to RecoveryManager (no invalidation).
+        if (this.recoveryManager) {
+          this.recoveryManager.handleLinkEvent(event);
+          setNotified(true);
+        }
+        continue;
+      }
+
+      // --- Step 1: Durable invalidation ---
+      const circuits = this.circuitAssociations.get(event.linkId) ?? [];
+      const successfullyRevoked: Array<{ circuitId: Uint8Array; commitmentRoot: Uint8Array }> = [];
+      for (const { circuitId, commitmentRoot, circuitObj } of circuits) {
+        const result = await invalidateCircuitOnFailure(
+          this.destroyStore,
+          circuitId,
+          commitmentRoot,
+          0x03, // DESTROY_REASON_LINK_FAILURE
+          "system",
+          0x01, // DESTROYER_ROLE_INITIATOR
+          randomBytes(16),
+        );
+        if (result.ok && (result.action === "REVOKED" || result.action === "ALREADY_REVOKED")) {
+          successfullyRevoked.push({ circuitId, commitmentRoot });
+          // --- Step 2: Zeroize (AFTER durable tombstone confirmed) ---
+          if (circuitObj) {
+            zeroizeCircuit(circuitObj);
+          }
+          if (result.action === "REVOKED") {
+            invalidatedCircuits.push({ circuitId, reason: 0x03 });
+          }
+        }
+        // Persistence failure → fail closed. Do NOT claim REVOKED. Do NOT zeroize.
+        // Do NOT emit recovery signal for this circuit.
+      }
+
+      // --- Step 3: Recovery signal (AFTER durable invalidation + zeroize) ---
+      // Only notify RecoveryManager if ALL affected circuits were durably revoked.
+      if (successfullyRevoked.length === circuits.length && this.recoveryManager) {
+        this.recoveryManager.handleLinkEvent(event);
+        setNotified(true);
+        // --- Step 4: Trigger circuit-specific recovery execution ---
+        // Recovery is bound to EACH exact failed circuit — NOT the entire
+        // invalidated-route set. Each circuit gets its own RecoveryPlan
+        // identifying its own failedCircuitId + failedCommitmentRoot.
+        if (this.recoveryExecutor && this.authenticatedTopologyProvider && this.requiredCapability) {
+          for (const { circuitId, commitmentRoot } of successfullyRevoked) {
+            // Create a CIRCUIT-SPECIFIC RecoveryPlan for THIS exact failed circuit.
+            // The plan uses the failed circuit's routeId — derived via the
+            // CANONICAL deriveRouteId(commitmentRoot) function. NOT an inline
+            // string reconstruction (avoids drift from the frozen derivation).
+            const failedRouteId = deriveRouteId(commitmentRoot);
+            const plan = createRecoveryPlan(
+              [failedRouteId], // circuit-specific — only THIS circuit's route
+              "LINK_DOWN",
+              this.gatewayCandidates ?? [],
+              this.requiredCapability,
+              [event.remoteNodeId], // exclude the failed gateway
+            );
+            // AWAIT recovery execution — do NOT fire-and-forget.
+            // The result is OBSERVABLE via recoveryOutcomes (not swallowed).
+            // Durable state persistence is Subtask 2; for now, the outcome
+            // is returned synchronously in the DispatchResult.
+            const outcome = await this.executeRecoverySafely(
+              plan,
+              circuitId,
+              commitmentRoot,
+              event,
+              now,
+            );
+            recoveryOutcomes.push(outcome);
+          }
+        }
+      }
+    }
   }
 
   /**
