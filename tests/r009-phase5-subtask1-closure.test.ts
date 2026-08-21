@@ -42,6 +42,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
+import * as fs from "node:fs";
 import { randomBytes, generateNodeKeypair, type NodeKeypair } from "@reference/identity/keys";
 import { x25519 } from "@noble/curves/ed25519.js";
 import { toHex } from "@reference/encoding/cbor";
@@ -476,7 +477,6 @@ describe("R-009 Phase 5 Subtask 1 Closure: canonical deriveRouteId", () => {
     // This is a STATIC guard: read the dispatcher + executor source and
     // assert they import + use deriveRouteId, NOT inline "route:" + toHex.
     // (If a future change reintroduces inline duplication, this test fails.)
-    const fs = require("fs");
     const dispatcherSrc = fs.readFileSync(
       "reference/failure/failure-event-dispatcher.ts", "utf8",
     );
