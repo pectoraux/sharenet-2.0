@@ -45,6 +45,7 @@ import { InMemoryCircuitSequenceFloorStore } from "../circuit/replay-stores";
 import type { RecoveryPlan, GatewayCandidate } from "./recovery";
 import { discoverAlternativeGateways } from "./recovery";
 import type { NodeCapability } from "./service-negotiation";
+import { deriveRouteId } from "./route";
 
 // -----------------------------------------------------------------------
 // Frozen constants (ADR-0025 §8)
@@ -204,12 +205,22 @@ export interface AuthenticatedTopologyProvider {
    * @param failedGatewayNodeId - the failed gateway's NodeId (excluded
    *   from the new route — the provider MUST NOT include it).
    * @returns a genuine BrandedCommittedRoute + the relay keypairs
-   *   used to construct it.
+   *   used to construct it + the X25519 public keys for each hop (for
+   *   circuit setup ECDH). The hopX25519PublicKeys MUST be in the SAME
+   *   ORDER as the route's hops (brandedRoute.hops). The executor uses
+   *   these keys to derive the circuit's per-hop ECDH shared secrets.
+   *   The keys are part of the AUTHENTICATED topology — the provider
+   *   knows each hop's X25519 public key because it has the hop's
+   *   identity (from the authenticated link layer).
    */
   constructRecoveryRoute(
     selectedCandidate: GatewayCandidate,
     failedGatewayNodeId: string,
-  ): { brandedRoute: BrandedCommittedRoute; relayKeypairs: NodeKeypair[] };
+  ): {
+    brandedRoute: BrandedCommittedRoute;
+    relayKeypairs: NodeKeypair[];
+    hopX25519PublicKeys: Uint8Array[];
+  };
 }
 
 // -----------------------------------------------------------------------
@@ -307,7 +318,12 @@ export class RecoveryExecutor {
     // the selected candidate as the terminal hop + MUST construct genuine
     // ValidatedHops from the authenticated link layer. The executor CANNOT
     // accept a caller-supplied route.
-    const { brandedRoute, relayKeypairs } = topologyProvider.constructRecoveryRoute(
+    // The provider ALSO returns the hopX25519PublicKeys — these are the
+    // AUTHENTICATED X25519 public keys for each hop, in route order. The
+    // executor uses THESE keys (not the separately-passed relayX25519PublicKeys)
+    // for circuit setup ECDH, because only the provider knows which hops
+    // are in the route + their matching X25519 keys.
+    const { brandedRoute, relayKeypairs, hopX25519PublicKeys } = topologyProvider.constructRecoveryRoute(
       selectedCandidate,
       failedGatewayNodeId,
     );
@@ -342,8 +358,11 @@ export class RecoveryExecutor {
       }
     }
 
-    // Verify 3: the routeId is derived from the commitmentRoot (frozen invariant).
-    const expectedRouteId = "route:" + toHex(brandedRoute.commitmentRoot);
+    // Verify 3: the routeId is the CANONICAL derivation from commitmentRoot.
+    // Uses deriveRouteId() (route.ts:558) — NOT an inline string reconstruction.
+    // This is the single authoritative route-identity derivation; the executor
+    // verifies the branded route's routeId matches the canonical function output.
+    const expectedRouteId = deriveRouteId(brandedRoute.commitmentRoot);
     if (brandedRoute.routeId !== expectedRouteId) {
       return {
         ok: false,
@@ -379,10 +398,24 @@ export class RecoveryExecutor {
     const initiatorX25519SecretKey = randomBytes(32);
     const initiatorX25519PublicKey = x25519.getPublicKey(initiatorX25519SecretKey);
 
-    // Use the existing setupCircuit (single-process — in production, this
-    // would be establishDistributedCircuit with real transport).
+    // Verify: the provider returned exactly one X25519 public key per hop.
+    // This is a fail-closed check — a misaligned key count indicates a
+    // provider bug or a route/key mismatch.
+    if (hopX25519PublicKeys.length !== brandedRoute.hops.length) {
+      return {
+        ok: false,
+        state: "FAILED",
+        attemptId,
+        reason: `hopX25519PublicKeys count (${hopX25519PublicKeys.length}) does not match route hops (${brandedRoute.hops.length}) — provider returned misaligned keys`,
+        failedAt: "ESTABLISHING_CIRCUIT",
+      };
+    }
+
+    // Use the provider-returned hopX25519PublicKeys (AUTHENTICATED, in route
+    // order) — NOT the separately-passed relayX25519PublicKeys. The provider
+    // is the authoritative source of which hops are in the route + their keys.
     const floorStore = this.floorStoreFactory();
-    const relayKeys = relayX25519PublicKeys.map((pk, i) => ({
+    const relayKeys = hopX25519PublicKeys.map((pk, i) => ({
       hopIndex: i,
       nodeId: relayKeypairs[i]!.nodeId,
       x25519PublicKey: pk,

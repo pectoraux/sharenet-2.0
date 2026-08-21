@@ -52,7 +52,7 @@ function createTestTopologyProvider(): AuthenticatedTopologyProvider {
       // used to select the terminal relay. The test simulates this by
       // having the test construct candidates from the provider's keypairs.
       const ctx = makeGenuineBrandedRouteHelper2(1, NOW);
-      return { brandedRoute: ctx.branded, relayKeypairs: ctx.kps };
+      return { brandedRoute: ctx.branded, relayKeypairs: ctx.kps, hopX25519PublicKeys: ctx.kps.map(() => x25519.getPublicKey(randomBytes(32))) };
     },
   };
 }
@@ -71,7 +71,7 @@ function createTestRecoveryEnv() {
   } as GatewayCandidate];
   const provider: AuthenticatedTopologyProvider = {
     constructRecoveryRoute(_selected: GatewayCandidate, _failed: string) {
-      return { brandedRoute: ctx.branded, relayKeypairs: ctx.kps };
+      return { brandedRoute: ctx.branded, relayKeypairs: ctx.kps, hopX25519PublicKeys: ctx.kps.map(() => x25519.getPublicKey(randomBytes(32))) };
     },
   };
   const relayX25519PublicKeys = [x25519.getPublicKey(randomBytes(32))];
@@ -422,7 +422,7 @@ describe("R-009 Phase 5: route verification + fail-closed topology", () => {
     const wrongProvider: AuthenticatedTopologyProvider = {
       constructRecoveryRoute(_selected, _failed) {
         // Return a route whose terminal hop is NOT the selected candidate.
-        return { brandedRoute: env.branded, relayKeypairs: env.kps };
+        return { brandedRoute: env.branded, relayKeypairs: env.kps, hopX25519PublicKeys: env.kps.map(() => x25519.getPublicKey(randomBytes(32))) };
       },
     };
 
@@ -465,7 +465,7 @@ describe("R-009 Phase 5: route verification + fail-closed topology", () => {
     // appears as the relay hop in the route (malicious provider).
     const maliciousProvider: AuthenticatedTopologyProvider = {
       constructRecoveryRoute(_selected, _failed) {
-        return { brandedRoute: env.branded, relayKeypairs: env.kps };
+        return { brandedRoute: env.branded, relayKeypairs: env.kps, hopX25519PublicKeys: env.kps.map(() => x25519.getPublicKey(randomBytes(32))) };
       },
     };
 
@@ -522,7 +522,7 @@ describe("R-009 Phase 5: route verification + fail-closed topology", () => {
     const env = makeGenuineBrandedRouteHelper2(1, NOW);
     const provider: AuthenticatedTopologyProvider = {
       constructRecoveryRoute() {
-        return { brandedRoute: env.branded, relayKeypairs: env.kps };
+        return { brandedRoute: env.branded, relayKeypairs: env.kps, hopX25519PublicKeys: env.kps.map(() => x25519.getPublicKey(randomBytes(32))) };
       },
     };
 

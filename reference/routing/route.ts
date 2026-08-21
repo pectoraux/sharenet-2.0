@@ -608,9 +608,10 @@ function deepFreeze<T>(obj: T): T {
 export interface RouteCommitment {
   /**
    * The canonical route identity — DERIVED from commitmentRoot.
-   * Per R-003/R-004: route_id = toHex(commitment_root).
+   * Per R-003/R-004 (FROZEN, spec/07 §5.4): route_id = "route:" + lowercase_hex(commitment_root).
    * This is NOT the proposal's routeId; it is the cryptographic commitment
-   * to the exact accepted route.
+   * to the exact accepted route. The canonical derivation is `deriveRouteId()`
+   * (this file, below) — the SOLE authoritative implementation.
    */
   routeId: string;
   proposal: RouteProposal;
