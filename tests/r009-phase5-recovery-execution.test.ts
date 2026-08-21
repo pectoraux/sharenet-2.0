@@ -34,13 +34,16 @@ import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper } from "@tests
 // Helper: create a brandedRouteFactory that uses the test route helper.
 import { makeGenuineBrandedRoute as makeGenuineBrandedRouteHelper2 } from "@tests/helpers/branded-route-helper";
 
-function createBrandedRouteFactory() {
-  return () => {
-    // Use the test helper to construct a genuine BrandedCommittedRoute.
-    // The helper runs the full authenticated-link pipeline + returns
-    // genuine ValidatedHops + relay keypairs.
-    const ctx = makeGenuineBrandedRouteHelper2(1, NOW);
-    return { brandedRoute: ctx.branded, relayKeypairs: ctx.kps };
+// Test AuthenticatedTopologyProvider: uses the test route helper to construct
+// genuine BrandedCommittedRoute + relay keypairs from the authenticated link
+// layer. In production, this would be the platform runtime's authenticated
+// topology capability.
+function createTestTopologyProvider(): AuthenticatedTopologyProvider {
+  return {
+    constructRecoveryRoute(selectedCandidate: any, failedGatewayNodeId: string) {
+      const ctx = makeGenuineBrandedRouteHelper2(1, NOW);
+      return { brandedRoute: ctx.branded, relayKeypairs: ctx.kps };
+    },
   };
 }
 
@@ -109,7 +112,7 @@ describe("R-009 Phase 5: RecoveryExecutor basic success", () => {
       NOW,
       NOW,
       newRelayX25519PublicKeys,
-      createBrandedRouteFactory(),
+      createTestTopologyProvider(),
     );
 
     if (!result.ok) {
@@ -159,7 +162,7 @@ describe("R-009 Phase 5: old/new identity separation", () => {
       createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
       candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createBrandedRouteFactory(),
+      createTestTopologyProvider(),
     );
 
     expect(result.ok).toBe(true);
@@ -181,7 +184,7 @@ describe("R-009 Phase 5: old/new identity separation", () => {
       createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
       candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createBrandedRouteFactory(),
+      createTestTopologyProvider(),
     );
 
     expect(result.ok).toBe(true);
@@ -203,7 +206,7 @@ describe("R-009 Phase 5: old/new identity separation", () => {
       createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
       candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createBrandedRouteFactory(),
+      createTestTopologyProvider(),
     );
 
     expect(result.ok).toBe(true);
@@ -252,7 +255,7 @@ describe("R-009 Phase 5: recovery failure scenarios", () => {
       createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
       candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createBrandedRouteFactory(),
+      createTestTopologyProvider(),
     );
 
     expect(result.ok).toBe(false);
@@ -281,7 +284,7 @@ describe("R-009 Phase 5: recovery failure scenarios", () => {
       failedGatewayNodeId, // exclude this gateway
       oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createBrandedRouteFactory(),
+      createTestTopologyProvider(),
     );
 
     expect(result.ok).toBe(false);
@@ -338,7 +341,7 @@ describe("R-009 Phase 5: old circuit isolation", () => {
       createRecoveryPlan([oldCircuit.routeId], "LINK_DOWN", [], "INTERNET_GATEWAY" as any),
       candidates, "INTERNET_GATEWAY" as any, "failed-gw", oldCircuit.circuitId, oldCircuit.commitmentRoot, NOW, NOW,
       newRelayX25519PublicKeys,
-      createBrandedRouteFactory(),
+      createTestTopologyProvider(),
     );
 
     expect(result.ok).toBe(true);

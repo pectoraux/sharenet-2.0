@@ -294,7 +294,7 @@ export function discoverAlternativeGateways(
     .filter((n) => n.capability === requiredCapability)
     .filter((n) => n.linkUp)
     .filter((n) => !excludeNodeIds.includes(n.nodeId))
-    .sort((a, b) => (a.estimatedLatencyMs ?? Infinity) - (b.estimatedLatencyMs ?? Infinity));
+    .sort((a, b) => a.nodeId.localeCompare(b.nodeId));
 }
 
 // -----------------------------------------------------------------------

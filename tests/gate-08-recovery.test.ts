@@ -152,8 +152,8 @@ describe("GATE-08: Recovery", () => {
     ];
     const result = discoverAlternativeGateways(candidates, "INTERNET_GATEWAY");
     expect(result.length).toBe(2); // gwB + gwC (gwA has linkUp=false, relay1 wrong capability)
-    expect(result[0]!.nodeId).toBe("gwC"); // sorted by latency (20 < 50)
-    expect(result[1]!.nodeId).toBe("gwB");
+    expect(result[0]!.nodeId).toBe("gwB"); // sorted by NodeId lexicographic (gwB < gwC)
+    expect(result[1]!.nodeId).toBe("gwC");
   });
 
   test("discoverAlternativeGateways excludes specified nodeIds", () => {

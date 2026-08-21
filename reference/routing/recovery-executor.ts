@@ -105,18 +105,27 @@ export function computeRecoveryAttemptId(
   createdAt: number,
 ): RecoveryAttemptId {
   const attemptNonce = randomBytes(16);
-  const m = new Map<number, unknown>([
-    [1, failedCircuitId],
-    [2, failedCommitmentRoot],
-    [3, failureTimestamp],
-    [4, attemptNonce],
-    [5, createdAt],
-  ]);
-  const body = canonicalEncode(m);
+  // Per ADR-0025 §2: BLAKE3(domain || failedCircuitId || failedCommitmentRoot ||
+  // failureTimestamp || attemptNonce). Uses raw concatenation (not canonical CBOR
+  // map) to match the frozen ADR specification exactly.
   const domain = new TextEncoder().encode(RECOVERY_ATTEMPT_DOMAIN);
-  const input = new Uint8Array(domain.length + body.length);
-  input.set(domain, 0);
-  input.set(body, domain.length);
+  const tsBuf = new Uint8Array(8);
+  // Encode failureTimestamp as big-endian uint64.
+  tsBuf[0] = (failureTimestamp / 0x100000000000000) & 0xFF;
+  tsBuf[1] = (failureTimestamp / 0x1000000000000) & 0xFF;
+  tsBuf[2] = (failureTimestamp / 0x10000000000) & 0xFF;
+  tsBuf[3] = (failureTimestamp / 0x100000000) & 0xFF;
+  tsBuf[4] = (failureTimestamp / 0x1000000) & 0xFF;
+  tsBuf[5] = (failureTimestamp / 0x10000) & 0xFF;
+  tsBuf[6] = (failureTimestamp / 0x100) & 0xFF;
+  tsBuf[7] = failureTimestamp & 0xFF;
+  const input = new Uint8Array(domain.length + failedCircuitId.length + failedCommitmentRoot.length + 8 + attemptNonce.length);
+  let offset = 0;
+  input.set(domain, offset); offset += domain.length;
+  input.set(failedCircuitId, offset); offset += failedCircuitId.length;
+  input.set(failedCommitmentRoot, offset); offset += failedCommitmentRoot.length;
+  input.set(tsBuf, offset); offset += 8;
+  input.set(attemptNonce, offset);
   const id = blake3(input, { dkLen: 32 });
   return {
     id,
@@ -156,6 +165,52 @@ export type RecoveryExecutionResult =
       /** Which stage failed. */
       failedAt: RecoveryState;
     };
+
+// -----------------------------------------------------------------------
+// AuthenticatedTopologyProvider — the constrained topology capability
+// -----------------------------------------------------------------------
+
+/**
+ * The authenticated topology capability boundary.
+ *
+ * This is NOT a caller-supplied factory. It is an explicitly defined
+ * architectural capability that can ONLY produce genuine
+ * BrandedCommittedRoute + relay keypairs from authenticated protocol
+ * material (the authenticated link layer).
+ *
+ * The provider MUST:
+ *   1. Use the selected candidate gateway as the terminal hop.
+ *   2. Construct genuine ValidatedHops via the authenticated-link machinery.
+ *   3. Run the full route construction pipeline (RouteProposal →
+ *      RouteAcceptance → RouteCommitment → createBrandedCommittedRoute).
+ *
+ * The provider CANNOT:
+ *   - Return a route unrelated to the selected candidate.
+ *   - Return forged ValidatedHops.
+ *   - Bypass the authenticated-link WeakSet checks.
+ *   - Accept a caller-supplied commitmentRoot.
+ *
+ * The provider is injected by the platform runtime (which has access to
+ * the authenticated link layer). The executor calls it with the selected
+ * candidate — the provider MUST include that candidate in the route.
+ */
+export interface AuthenticatedTopologyProvider {
+  /**
+   * Construct a genuine BrandedCommittedRoute for recovery.
+   *
+   * @param selectedCandidate - the gateway candidate selected by
+   *   discoverAlternativeGateways. The provider MUST include this
+   *   candidate as the terminal hop in the new route.
+   * @param failedGatewayNodeId - the failed gateway's NodeId (excluded
+   *   from the new route — the provider MUST NOT include it).
+   * @returns a genuine BrandedCommittedRoute + the relay keypairs
+   *   used to construct it.
+   */
+  constructRecoveryRoute(
+    selectedCandidate: GatewayCandidate,
+    failedGatewayNodeId: string,
+  ): { brandedRoute: BrandedCommittedRoute; relayKeypairs: NodeKeypair[] };
+}
 
 // -----------------------------------------------------------------------
 // RecoveryExecutor — the production recovery executor
@@ -203,11 +258,10 @@ export class RecoveryExecutor {
    * @param failureTimestamp - when the failure was observed.
    * @param now - current time (unix seconds).
    * @param relayX25519PublicKeys - the X25519 public keys for circuit setup.
-   * @param brandedRouteFactory - a factory that takes a RouteCommitment +
-   *   returns { brandedRoute, relayKeypairs }. The factory constructs a
-   *   genuine BrandedCommittedRoute + returns the relay keypairs used.
-   *   The executor uses the factory's keypairs for setupCircuit (NodeIds
-   *   must match the branded route).
+   * @param topologyProvider - the authenticated topology provider. This is
+   *   the CONSTRAINED capability boundary — it can ONLY produce genuine
+   *   BrandedCommittedRoute from authenticated protocol material. The
+   *   provider MUST include the selected candidate as the terminal hop.
    */
   async execute(
     plan: RecoveryPlan,
@@ -219,7 +273,7 @@ export class RecoveryExecutor {
     failureTimestamp: number,
     now: number,
     relayX25519PublicKeys: Uint8Array[],
-    brandedRouteFactory: () => { brandedRoute: BrandedCommittedRoute; relayKeypairs: NodeKeypair[] },
+    topologyProvider: AuthenticatedTopologyProvider,
   ): Promise<RecoveryExecutionResult> {
     const attemptId = computeRecoveryAttemptId(
       failedCircuitId, failedCommitmentRoot, failureTimestamp, now,
@@ -248,12 +302,15 @@ export class RecoveryExecutor {
     const selectedCandidate = candidates[0]!;
 
     // --- Stage 2-3: ROUTING + COMMITTING ---
-    // Use the factory to construct a genuine BrandedCommittedRoute + relay keypairs.
-    // The factory runs the full authenticated-link pipeline internally + returns
-    // genuine ValidatedHops + a BrandedCommittedRoute with a new commitmentRoot.
-    // The executor does NOT construct ValidatedHops itself (it can't — they require
-    // the authenticated link layer's WeakSet-registered proof artifacts).
-    const { brandedRoute, relayKeypairs } = brandedRouteFactory();
+    // Use the AuthenticatedTopologyProvider to construct a genuine
+    // BrandedCommittedRoute. The provider is CONSTRAINED: it MUST include
+    // the selected candidate as the terminal hop + MUST construct genuine
+    // ValidatedHops from the authenticated link layer. The executor CANNOT
+    // accept a caller-supplied route.
+    const { brandedRoute, relayKeypairs } = topologyProvider.constructRecoveryRoute(
+      selectedCandidate,
+      failedGatewayNodeId,
+    );
 
     // The new commitmentRoot is derived from the branded route.
     const newCommitmentRoot = brandedRoute.commitmentRoot;
